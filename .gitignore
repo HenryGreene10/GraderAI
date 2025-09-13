@@ -1,0 +1,13 @@
+# Frontend (React)
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# Backend (Python)
+backend/.venv/
+backend/__pycache__/
+backend/.env
+
+# OS cruft
+.DS_Store
+Thumbs.db
