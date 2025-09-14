@@ -145,6 +145,22 @@ export default function AssignmentsPage() {
     await loadFiles();
   }
 
+  // inline per-item delete (Storage -> DB)
+  async function deleteOne(upload) {
+    const storagePath = upload.storage_path;
+    const res = await supabase.storage.from("submissions").remove([storagePath]);
+    console.log("Storage remove →", { storagePath, res });
+    if (res?.error && !/Not Found|not exist/i.test(res.error.message)) {
+      throw new Error(`Storage delete failed: ${res.error.message}`);
+    }
+
+    const { error: dbErr } = await supabase
+      .from("uploads")
+      .delete()
+      .eq("id", upload.id);
+    if (dbErr) throw new Error(`DB delete failed: ${dbErr.message}`);
+  }
+
   async function renameOne(fileId, newName) {
     const clean = newName.trim();
     if (!clean) return;
@@ -159,21 +175,26 @@ export default function AssignmentsPage() {
 
   async function deleteSelected() {
     if (selectedIds.length === 0) return;
-    // fetch the rows to know storage_path
     const { data, error } = await supabase
       .from("uploads")
       .select("id,storage_path")
       .in("id", selectedIds);
     if (error) { console.error(error); return; }
 
-    // delete from storage first
-    const paths = (data || []).map(r => r.storage_path);
-    const { error: delErr } = await supabase.storage.from("submissions").remove(paths);
-    if (delErr) { console.error(delErr); return; }
+    const rows = data || [];
+    const results = await Promise.allSettled(rows.map(deleteOne));
 
-    // then delete DB rows
-    const { error: dbErr } = await supabase.from("uploads").delete().in("id", selectedIds);
-    if (dbErr) { console.error(dbErr); return; }
+    const failures = results
+      .map((r, i) => (r.status === "rejected" ? { row: rows[i], reason: r.reason } : null))
+      .filter(Boolean);
+
+    if (failures.length > 0) {
+      const msg = failures
+        .map((f) => `${f.row.id}: ${f.reason?.message || String(f.reason)}`)
+        .join("\n");
+      // Replace with your toast lib if available
+      alert(`Some items failed to delete:\n${msg}`);
+    }
 
     await loadFiles();
   }
