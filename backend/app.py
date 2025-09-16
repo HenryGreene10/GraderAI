@@ -1,36 +1,48 @@
-import os, json, asyncio
+# backend/app.py
+import os, json, asyncio, base64
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-
+from pydantic import BaseModel
 from supabase import create_client, Client
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
+# ----- Config (Render env) -----
+SUPABASE_URL = os.environ["SUPABASE_URL"]                       # https://<project-ref>.supabase.co
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "submissions")
-HANDWRITINGOCR_API_KEY = os.environ["HANDWRITINGOCR_API_KEY"]
-OWNER_COLUMN = os.environ.get("OWNER_COLUMN", "user_id")  # set to your column name if different
+OWNER_COLUMN = os.environ.get("OWNER_COLUMN", "owner_id")
+
+HANDWRITINGOCR_API_KEY = os.environ.get("HANDWRITINGOCR_API_KEY", "")
+HANDWRITINGOCR_ENDPOINT = os.environ.get("HANDWRITINGOCR_ENDPOINT", "https://www.handwritingocr.com/api/v3/ocr")
+HANDWRITINGOCR_FILE_FIELD = os.environ.get("HANDWRITINGOCR_FILE_FIELD", "file")
+HANDWRITINGOCR_URL_FIELD  = os.environ.get("HANDWRITINGOCR_URL_FIELD",  "url")
+HANDWRITINGOCR_B64_FIELD  = os.environ.get("HANDWRITINGOCR_B64_FIELD",  "image_base64")
 MAX_RETRIES = int(os.environ.get("OCR_MAX_RETRIES", "3"))
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 app = FastAPI()
-# Allow your local dev and your deployed frontend
+
+# CORS: allow your frontend (or * when testing)
+origins_env = os.environ.get("CORS_ALLOW_ORIGINS", "*")
+origins = [o.strip() for o in origins_env.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ALLOW_ORIGINS", "http://localhost:5173").split(","),
-    allow_credentials=True,
+    allow_origins=origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+print("[boot] SUPABASE_URL =", SUPABASE_URL)
 
 @app.get("/health")
 def health():
     return {"ok": True, "service": "graderai-ocr"}
 
-# ---------- Helpers ----------
+# ----- Helpers -----
 def _owner_matches(row: dict, user_id: str):
     val = row.get(OWNER_COLUMN)
     return bool(user_id and val and val == user_id)
@@ -41,12 +53,25 @@ def _mark_status(upload_id: str, status: str, fields: dict | None = None):
         payload.update(fields)
     supabase.table("uploads").update(payload).eq("id", upload_id).execute()
 
-def _get_signed_url(path: str, expires_in: int = 900):
-    resp = supabase.storage.from_(SUPABASE_BUCKET).create_signed_url(path, expires_in)
-    url = resp.get("signedURL") or resp.get("signed_url") or resp
-    if not url:
-        raise HTTPException(500, "Could not sign storage URL")
-    return url if str(url).startswith("http") else f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{path}?{url}"
+def _get_signed_url(path: str, expires_in: int = 900) -> str:
+    # Normalize to bucket-relative key (no leading slash, no bucket prefix)
+    key = (path or "").lstrip("/")
+    if key.startswith(f"{SUPABASE_BUCKET}/"):
+        key = key[len(f"{SUPABASE_BUCKET}/"):]
+    print(f"[signing] project={SUPABASE_URL} bucket={SUPABASE_BUCKET} key={key}")
+
+    resp = supabase.storage.from_(SUPABASE_BUCKET).create_signed_url(key, expires_in)
+
+    signed = None
+    if isinstance(resp, dict):
+        signed = resp.get("signedURL") or resp.get("signed_url")
+    if not signed:
+        # Show a clear error in logs instead of generic 404 later
+        raise HTTPException(404, f"Object not found for key={key}")
+
+    # Some SDKs return a querystring; handle both
+    return signed if signed.startswith("http") \
+        else f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{key}?{signed}"
 
 async def _download_bytes(url: str) -> bytes:
     async with httpx.AsyncClient(timeout=60) as client:
@@ -54,14 +79,43 @@ async def _download_bytes(url: str) -> bytes:
         r.raise_for_status()
         return r.content
 
-async def _call_handwritingocr(image_bytes: bytes) -> dict:
-    endpoint = "https://www.handwritingocr.com/api/v3/ocr"  # adjust if needed
-    headers = {"x-api-key": HANDWRITINGOCR_API_KEY}
-    files = {"file": ("upload", image_bytes)}
+async def _call_handwritingocr(image_bytes: bytes, signed_url: str) -> dict:
+    """Try multiple request shapes; log failures for debugging."""
+    headers = {
+        "x-api-key": HANDWRITINGOCR_API_KEY,
+        "X-API-KEY": HANDWRITINGOCR_API_KEY,
+    }
+    attempts = []
     async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(endpoint, headers=headers, files=files)
-        r.raise_for_status()
-        return r.json()
+        # (1) multipart file
+        try:
+            files = {HANDWRITINGOCR_FILE_FIELD: ("upload.jpg", image_bytes, "image/jpeg")}
+            r = await client.post(HANDWRITINGOCR_ENDPOINT, headers=headers, files=files)
+            if r.status_code == 200:
+                return r.json()
+            attempts.append(("multipart", r.status_code, r.text[:500]))
+        except Exception as e:
+            attempts.append(("multipart-exc", None, str(e)))
+        # (2) JSON by URL
+        try:
+            r = await client.post(HANDWRITINGOCR_ENDPOINT, headers=headers, json={HANDWRITINGOCR_URL_FIELD: signed_url})
+            if r.status_code == 200:
+                return r.json()
+            attempts.append(("json-url", r.status_code, r.text[:500]))
+        except Exception as e:
+            attempts.append(("json-url-exc", None, str(e)))
+        # (3) JSON base64
+        try:
+            b64 = base64.b64encode(image_bytes).decode("ascii")
+            r = await client.post(HANDWRITINGOCR_ENDPOINT, headers=headers, json={HANDWRITINGOCR_B64_FIELD: b64})
+            if r.status_code == 200:
+                return r.json()
+            attempts.append(("json-b64", r.status_code, r.text[:500]))
+        except Exception as e:
+            attempts.append(("json-b64-exc", None, str(e)))
+
+    print("OCR attempts:", json.dumps(attempts, ensure_ascii=False))
+    raise RuntimeError(f"OCR provider rejected all shapes; first={attempts[0] if attempts else 'n/a'}")
 
 def _parse_text(api_json: dict) -> tuple[str, dict]:
     text = ""
@@ -72,8 +126,7 @@ def _parse_text(api_json: dict) -> tuple[str, dict]:
             text = "\n".join(p.get("text", "") for p in api_json["pages"])
     return text.strip(), api_json
 
-# ---------- API ----------
-from pydantic import BaseModel
+# ----- API -----
 class StartOCRBody(BaseModel):
     upload_id: str
 
@@ -89,10 +142,18 @@ async def start_ocr(body: StartOCRBody, x_user_id: str = Header(None)):
 
     storage_path = row.get("storage_path")
     if not storage_path:
-        raise HTTPException(400, "Missing storage_path for upload")
+        raise HTTPException(400, "Missing storage_path")
 
-    _mark_status(row["id"], "processing",
-                 {"ocr_started_at": datetime.now(timezone.utc).isoformat(), "ocr_error": None})
+    # optimistic transition
+    _mark_status(row["id"], "processing", {
+        "ocr_started_at": datetime.now(timezone.utc).isoformat(),
+        "ocr_error": None
+    })
+
+    # Uncomment ONLY if you ever need a quick fake end-to-end check:
+    # if os.environ.get("FAKE_OCR") == "1":
+    #     _mark_status(row["id"], "done", {"extracted_text": "Test OCR: detected sample text"})
+    #     return {"ok": True, "status": "done", "upload_id": row["id"]}
 
     try:
         signed = _get_signed_url(storage_path)
@@ -101,7 +162,7 @@ async def start_ocr(body: StartOCRBody, x_user_id: str = Header(None)):
         last_err = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                ocr_json = await _call_handwritingocr(blob)
+                ocr_json = await _call_handwritingocr(blob, signed)
                 text, meta = _parse_text(ocr_json)
                 if not text:
                     raise ValueError("OCR returned empty text")
@@ -117,7 +178,7 @@ async def start_ocr(body: StartOCRBody, x_user_id: str = Header(None)):
                 await asyncio.sleep(1.5 * attempt)
 
         _mark_status(row["id"], "failed", {"ocr_error": last_err})
-        raise HTTPException(502, f"OCR failed after retries: {last_err}")
+        raise HTTPException(502, f"OCR failed: {last_err}")
 
     except HTTPException:
         raise

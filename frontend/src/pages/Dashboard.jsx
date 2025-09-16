@@ -319,7 +319,7 @@ async function handleUploadToSupabase(files, setProgress) {
     // Do NOT double-append .ext — clean already contains it
     const objectKey = `${userId}/${unique}-${clean}`;
 
-    const { error } = await supabase.storage
+    const { data: upData, error } = await supabase.storage
       .from(BUCKET)
       .upload(objectKey, f, {
         contentType: f.type || "application/octet-stream",
@@ -330,8 +330,19 @@ async function handleUploadToSupabase(files, setProgress) {
       throw new Error(`Failed to upload ${orig}: ${error.message}`);
     }
 
+    // use the canonical path Supabase returns (never recompute yourself)
+    const savedKey = upData?.path || objectKey;
+
+    // Optional quick check, verify the object is reachable
+    try {
+      const { data: signed } = await supabase.storage
+        .from(BUCKET)
+        .createSignedUrl(savedKey, 60);
+      console.log("preview url ok?", !!signed?.signedUrl, savedKey);
+    } catch {}
+
     uploaded.push({
-      path: objectKey,
+      path: savedKey,
       originalName: orig,
       size: f.size,
       type: f.type,
@@ -507,6 +518,7 @@ export default function Dashboard() {
                 original_name: u.originalName,
                 mime_type: u.type || null,
                 size_bytes: u.size ?? null,
+                status: "pending",
               }));
               const { error } = await supabase.from("uploads").insert(rows);
               if (error) console.error(error);

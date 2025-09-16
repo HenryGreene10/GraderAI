@@ -1,5 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
+import FileRow from "../components/FileRow.jsx";
+
+const BUCKET = "submissions";
 
 export default function AssignmentsPage() {
   const [email, setEmail] = useState(null);
@@ -75,7 +78,7 @@ export default function AssignmentsPage() {
 
       let query = supabase
         .from("uploads")
-        .select("id,storage_path,original_name,mime_type,size_bytes,uploaded_at,assignment_id")
+        .select("id,storage_path,original_name,mime_type,size_bytes,uploaded_at,assignment_id,status,extracted_text,ocr_error")
         .eq("owner_id", userId)
         .order("uploaded_at", { ascending: false });
 
@@ -87,14 +90,20 @@ export default function AssignmentsPage() {
 
       const withUrls = await Promise.all(
         (data || []).map(async (row) => {
-          const { data: urlData } = await supabase.storage
-            .from("submissions")
+          const { data: urlData, error: signErr } = await supabase.storage
+            .from(BUCKET)
             .createSignedUrl(row.storage_path, 60 * 60);
+
           return {
-            ...row,
-            signedUrl: urlData?.signedUrl || null,
+            id: row.id,
+            storage_path: row.storage_path,
+            name: row.original_name || row.storage_path.split("/").pop(),
+            signedUrl: signErr ? null : (urlData?.signedUrl || null),
             isImage: /\.(png|jpe?g|gif|webp)$/i.test(row.original_name || ""),
             isPDF: /\.pdf$/i.test(row.original_name || ""),
+            status: row.status || "pending",
+            extracted_text: row.extracted_text || "",
+            ocr_error: row.ocr_error || null,
           };
         })
       );
@@ -293,48 +302,14 @@ export default function AssignmentsPage() {
         {!loadingFiles && files.length === 0 && <div>No files yet.</div>}
 
         {!loadingFiles && files.length > 0 && (
-          <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "grid", gap: 12 }}>
+          <div style={{ display: "grid", gap: 12 }}>
             {files.map((f) => (
-              <li key={f.id} style={{ border: "1px solid #e4e7ec", borderRadius: 12, padding: 12 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                    <input
-                      type="checkbox"
-                      checked={!!checked[f.id]}
-                      onChange={(e) => setChecked((prev) => ({ ...prev, [f.id]: e.target.checked }))}
-                    />
-                    <div>
-                      <div style={{ fontWeight: 600 }}>{f.original_name}</div>
-                      <div style={{ fontSize: 12, color: "#667085" }}>
-                        {(f.size_bytes / 1024).toFixed(1)} KB
-                      </div>
-                      {f.isImage && f.signedUrl && (
-                        <img src={f.signedUrl} alt={f.original_name} style={{ marginTop: 8, maxWidth: "100%", borderRadius: 8 }} />
-                      )}
-                      {f.isPDF && f.signedUrl && (
-                        <div style={{ marginTop: 8 }}>
-                          <a href={f.signedUrl} target="_blank" rel="noreferrer">Preview PDF</a>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                    <a href={f.signedUrl || "#"} target="_blank" rel="noreferrer" className="btn btn-ghost">Open</a>
-                    <button
-                      className="btn btn-ghost"
-                      onClick={() => {
-                        const nn = prompt("Rename file to:", f.original_name);
-                        if (nn != null) renameOne(f.id, nn);
-                      }}
-                    >
-                      Rename
-                    </button>
-                  </div>
-                </div>
-              </li>
+              <FileRow
+                key={f.id}
+                file={f}
+              />
             ))}
-          </ul>
+          </div>
         )}
       </section>
     </div>
