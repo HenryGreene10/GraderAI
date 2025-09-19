@@ -112,10 +112,6 @@
 .actions .btn { padding:6px 10px; border-radius:8px; border:1px solid #ddd; background:#fff; cursor:pointer; }
 .actions .btn:disabled { opacity:.6; cursor:not-allowed; }
 
-/* Global background */
-body {
-  background: yellow;
-}
 .actions .btn + .btn { margin-left:8px; }
 
 /* === Compact FileRow overrides === */

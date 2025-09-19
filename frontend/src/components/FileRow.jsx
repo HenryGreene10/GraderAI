@@ -83,9 +83,9 @@ export default function FileRow({ file }) {
           </div>
         )}
 
-        {status !== "processing" && (
-          <button onClick={handleRetry} disabled={busy} className="btn btn-ghost" style={{ marginTop: 8 }}>
-            {busy ? "Starting…" : "Retry"}
+        {(status === "error" || status === "ocr_error" || status === "failed") && !busy && (
+          <button onClick={handleRetry} className="btn btn-ghost" aria-label="Retry">
+            Retry
           </button>
         )}
       </div>

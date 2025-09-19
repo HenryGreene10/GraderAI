@@ -1,0 +1,35 @@
+# Ignore dependency folders
+node_modules/
+__pycache__/
+*.egg-info/
+
+# Ignore build outputs
+dist/
+build/
+*.log
+
+# Ignore public assets (static)
+public/
+frontend/public/
+
+# Ignore environment/config secrets
+.env
+*.local
+
+# Ignore lockfiles (Codex doesn’t need them)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Ignore misc tooling
+coverage/
+.DS_Store
+.vscode/
+.idea/
+
+# PDFs, images, binary assets (OCR can handle separately if needed)
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.svg

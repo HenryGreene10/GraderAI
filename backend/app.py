@@ -315,72 +315,81 @@ async def start_ocr(
         "ocr_started_at": datetime.now(timezone.utc).isoformat(),
         "ocr_error": None,
     })
+    # reflect locally for tests using in-memory rows
+    row["status"] = "processing"
+    row["ocr_started_at"] = row.get("ocr_started_at") or datetime.now(timezone.utc).isoformat()
+    row["ocr_error"] = None
 
-    try:
-        # 3) Download and send to OCR via provider-agnostic service
-        signed = _get_signed_url(storage_path)
-        blob = await _download_bytes(signed)
+    # 3) Download and send to OCR via provider-agnostic service
+    signed = _get_signed_url(storage_path)
+    attempts_log: list = []
+    last_err: str | None = None
 
-        last_err = None
-        attempts_log: list = []
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                result = await ocr_extract_text(image_bytes=blob)
-                text = (result.get("text") or "").strip()
-                meta = result
-                if not text:
-                    raise ValueError("OCR returned empty text")
-                attempts_log.append(200)
-                # Persist OCR result record
-                try:
-                    supabase.table("ocr_results").insert({
-                        "upload_id": row["id"],
-                        "text": text,
-                        "status": "OCR_DONE",
-                        "provider": os.environ.get("OCR_PROVIDER", "hf"),
-                        "attempts_log": json.dumps(attempts_log),
-                    }).execute()
-                except Exception as e:
-                    logger.warning("failed to insert ocr_results: %s", e)
-
-                _mark_status(row["id"], "OCR_DONE", {
-                    "extracted_text": text,
-                    "ocr_completed_at": datetime.now(timezone.utc).isoformat(),
-                    "ocr_meta": json.dumps(meta),
-                })
-                return {"ok": True, "status": "done", "upload_id": row["id"]}
-            except Exception as e:
-                last_err = str(e)
-                # Track attempt outcome
-                code = getattr(getattr(e, "response", None), "status_code", None)
-                if isinstance(e, httpx.ReadTimeout):
-                    attempts_log.append("timeout")
-                elif code is not None:
-                    attempts_log.append(code)
-                else:
-                    attempts_log.append("error")
-                await asyncio.sleep(1.5 * attempt)  # simple backoff
-
-        # Persist error result and mark upload as OCR_ERROR
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            supabase.table("ocr_results").insert({
-                "upload_id": row["id"],
-                "text": None,
-                "status": "OCR_ERROR",
-                "provider": os.environ.get("OCR_PROVIDER", "hf"),
-                "attempts_log": json.dumps(attempts_log),
-            }).execute()
+            blob = b"" if os.getenv("OCR_MOCK") == "1" else await _download_bytes(signed)
+            result = await ocr_extract_text(image_bytes=blob)
+
+            text = (result.get("text") or "").strip()
+            meta = result
+            if not text:
+                raise ValueError("OCR returned empty text")
+
+            attempts_log.append(200)  # success
+
+            # Persist OCR result record
+            try:
+                supabase.table("ocr_results").insert({
+                    "upload_id": row["id"],
+                    "text": text,
+                    "status": "OCR_DONE",
+                    "provider": os.environ.get("OCR_PROVIDER", "mock"),
+                    "attempts_log": json.dumps(attempts_log),
+                }).execute()
+            except Exception as e:
+                logger.warning("failed to insert ocr_results: %s", e)
+
+            # Mark upload as done
+            _mark_status(row["id"], "OCR_DONE", {
+                "extracted_text": text,
+                "ocr_completed_at": datetime.now(timezone.utc).isoformat(),
+                "ocr_meta": json.dumps(meta),
+            })
+            row["status"] = "OCR_DONE"
+            row["extracted_text"] = text
+            row["ocr_completed_at"] = row.get("ocr_completed_at") or datetime.now(timezone.utc).isoformat()
+            row["ocr_meta"] = json.dumps(meta)
+            return {"ok": True, "status": "done", "upload_id": row["id"]}
+
+        except httpx.ReadTimeout:
+            last_err = "timeout"
+            attempts_log.append("timeout")
+            await asyncio.sleep(1.5)  # backoff
+        except httpx.HTTPStatusError as e:
+            last_err = f"http {getattr(e.response, 'status_code', 500)}"
+            attempts_log.append(getattr(e.response, "status_code", 500))
+            await asyncio.sleep(1.5)  # backoff
         except Exception as e:
-            logger.warning("failed to insert error ocr_results: %s", e)
+            last_err = str(e)
+            attempts_log.append("error")
+            await asyncio.sleep(1.5)
 
-        _mark_status(row["id"], "OCR_ERROR", {"ocr_error": last_err})
-        raise HTTPException(502, f"OCR failed: {last_err}")
-
-    except HTTPException:
-        raise
+    # Persist error result and mark upload as OCR_ERROR
+    try:
+        supabase.table("ocr_results").insert({
+            "upload_id": row["id"],
+            "text": None,
+            "status": "OCR_ERROR",
+            "provider": os.environ.get("OCR_PROVIDER", "mock"),
+            "attempts_log": json.dumps(attempts_log),
+        }).execute()
     except Exception as e:
-        _mark_status(row["id"], "failed", {"ocr_error": str(e)})
-        raise HTTPException(500, f"OCR pipeline error: {e}")
+        logger.warning("failed to insert error ocr_results: %s", e)
+
+    _mark_status(row["id"], "OCR_ERROR", {"ocr_error": last_err})
+    row["status"] = "OCR_ERROR"
+    row["ocr_error"] = last_err
+    raise HTTPException(status_code=500, detail=f"OCR pipeline error: {last_err or 'unknown'}")
 
 @app.get("/api/ocr/status/{upload_id}")
 async def ocr_status(
@@ -443,21 +452,30 @@ async def start_grade(
         storage_path = row.get("storage_path")
         if not storage_path:
             raise HTTPException(400, "Missing storage_path")
+
+        _mark_status(row["id"], "processing", {"ocr_error": None})
+        row["status"] = "processing"
+        row["ocr_error"] = None
+        signed = _get_signed_url(storage_path)
+
+        attempts_log: list = []
         try:
-            _mark_status(row["id"], "processing", {"ocr_error": None})
-            signed = _get_signed_url(storage_path)
-            blob = await _download_bytes(signed)
+            blob = b"" if os.getenv("OCR_MOCK") == "1" else await _download_bytes(signed)
             result = await ocr_extract_text(image_bytes=blob)
             text = (result.get("text") or "").strip()
             meta = result
             if not text:
                 raise ValueError("OCR returned empty text")
+
+            attempts_log.append(200)
+
             try:
                 supabase.table("ocr_results").insert({
                     "upload_id": row["id"],
                     "text": text,
                     "status": "OCR_DONE",
-                    "provider": os.environ.get("OCR_PROVIDER", "hf"),
+                    "provider": os.environ.get("OCR_PROVIDER", "mock"),
+                    "attempts_log": json.dumps(attempts_log),
                 }).execute()
             except Exception as e:
                 logger.warning("failed to insert ocr_results: %s", e)
@@ -467,9 +485,62 @@ async def start_grade(
                 "ocr_completed_at": datetime.now(timezone.utc).isoformat(),
                 "ocr_meta": json.dumps(meta),
             })
+            row["status"] = "OCR_DONE"
+            row["extracted_text"] = text
+            row["ocr_completed_at"] = row.get("ocr_completed_at") or datetime.now(timezone.utc).isoformat()
+            row["ocr_meta"] = json.dumps(meta)
+
+        except httpx.ReadTimeout:
+            attempts_log.append("timeout")
+            try:
+                supabase.table("ocr_results").insert({
+                    "upload_id": row["id"],
+                    "text": None,
+                    "status": "OCR_ERROR",
+                    "provider": os.environ.get("OCR_PROVIDER", "mock"),
+                    "attempts_log": json.dumps(attempts_log),
+                }).execute()
+            except Exception as e:
+                logger.warning("failed to insert ocr_results: %s", e)
+            _mark_status(row["id"], "OCR_ERROR", {"ocr_error": "timeout"})
+            row["status"] = "OCR_ERROR"
+            row["ocr_error"] = "timeout"
+            raise HTTPException(status_code=502, detail="OCR failed: timeout")
+
+        except httpx.HTTPStatusError as e:
+            code = getattr(e.response, "status_code", 500)
+            attempts_log.append(code)
+            try:
+                supabase.table("ocr_results").insert({
+                    "upload_id": row["id"],
+                    "text": None,
+                    "status": "OCR_ERROR",
+                    "provider": os.environ.get("OCR_PROVIDER", "mock"),
+                    "attempts_log": json.dumps(attempts_log),
+                }).execute()
+            except Exception as e2:
+                logger.warning("failed to insert ocr_results: %s", e2)
+            _mark_status(row["id"], "OCR_ERROR", {"ocr_error": f"http {code}"})
+            row["status"] = "OCR_ERROR"
+            row["ocr_error"] = f"http {code}"
+            raise HTTPException(status_code=500, detail=f"OCR failed: http {code}")
+
         except Exception as e:
-            _mark_status(row["id"], "failed", {"ocr_error": str(e)})
-            raise HTTPException(502, f"OCR failed: {e}")
+            attempts_log.append("error")
+            try:
+                supabase.table("ocr_results").insert({
+                    "upload_id": row["id"],
+                    "text": None,
+                    "status": "OCR_ERROR",
+                    "provider": os.environ.get("OCR_PROVIDER", "mock"),
+                    "attempts_log": json.dumps(attempts_log),
+                }).execute()
+            except Exception as e3:
+                logger.warning("failed to insert ocr_results: %s", e3)
+            _mark_status(row["id"], "OCR_ERROR", {"ocr_error": str(e)})
+            row["status"] = "OCR_ERROR"
+            row["ocr_error"] = str(e)
+            raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
 
     # 3) Parse -> autokey -> grade
     questions = parse_questions(text)
