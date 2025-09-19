@@ -24,66 +24,60 @@ class HFInferenceOCRProvider(BaseOCRProvider):
         self.api_url = api_url
         self.token = token
 
-    def _headers(self, content_type: Optional[str] = None) -> dict:
-        h = {}
-        if self.token:
-            h["Authorization"] = f"Bearer {self.token}"
-        if content_type:
-            h["Content-Type"] = content_type
-        return h
-
     async def extract_text(self, image_bytes: Optional[bytes] = None, image_url: Optional[str] = None) -> dict:
         if not self.api_url:
             raise RuntimeError("HF_API_URL not configured")
 
+        # Read token from environment (required)
+        try:
+            token = os.environ["HF_TOKEN"]
+        except KeyError:
+            msg = "HF_TOKEN environment variable is required for HF provider"
+            logger.error(msg)
+            raise KeyError(msg)
+
+        headers = {"Authorization": f"Bearer {token}"}
+
         async with httpx.AsyncClient(timeout=60) as client:
             try:
-                # Prefer bytes if provided; else try URL via inputs
-                if image_bytes is not None:
-                    r = await client.post(self.api_url, headers=self._headers("application/octet-stream"), content=image_bytes)
-                elif image_url:
-                    r = await client.post(self.api_url, headers=self._headers("application/json"), json={"inputs": image_url})
+                if image_url:
+                    resp = await client.post(self.api_url, headers=headers, json={"inputs": image_url})
+                elif image_bytes is not None:
+                    resp = await client.post(self.api_url, headers=headers, content=image_bytes)
                 else:
                     raise ValueError("Either image_bytes or image_url must be provided")
 
-                r.raise_for_status()
-                data = r.json()
+                resp.raise_for_status()
+                data = resp.json()
             except httpx.HTTPStatusError as e:
-                msg = f"HF API HTTP error: {e.response.status_code} {e.response.text[:200]}"
-                logger.error(msg)
-                raise RuntimeError(msg)
-            except Exception as e:
+                logger.error("HF API HTTP error %s: %s", getattr(e.response, "status_code", "?"), getattr(e.response, "text", "")[:200])
+                raise
+            except Exception:
                 logger.exception("HF API request failed")
                 raise
 
-        # Normalize possible response shapes
-        text = ""
-        pages: Any | None = None
-        confidence: float | None = None
+        text = _normalize_hf(data)
+        return {"text": text, "pages": data, "confidence": None}
 
-        try:
-            if isinstance(data, dict):
-                # Common shapes: {"text": "..."} or {"generated_text": "..."}
-                text = data.get("text") or data.get("generated_text") or ""
-            elif isinstance(data, list):
-                # Some HF pipelines return a list of {"text": "..."} or {"generated_text": "..."}
-                parts = []
-                for item in data:
-                    if isinstance(item, dict):
-                        t = item.get("text") or item.get("generated_text")
-                        if t:
-                            parts.append(str(t))
-                    elif isinstance(item, str):
-                        parts.append(item)
-                text = "\n".join(parts)
-            else:
-                text = str(data)
-        except Exception:
-            # Best-effort fallback
-            text = str(data)
 
-        text = (text or "").strip()
-        return {"text": text, "pages": pages, "confidence": confidence}
+def _normalize_hf(json_obj: Any) -> str:
+    try:
+        if isinstance(json_obj, dict):
+            t = json_obj.get("text")
+            if isinstance(t, str):
+                return t.strip()
+            return ""
+        if isinstance(json_obj, list):
+            parts = []
+            for item in json_obj:
+                if isinstance(item, dict):
+                    t = item.get("text")
+                    if isinstance(t, str):
+                        parts.append(t)
+            return "\n".join(parts).strip()
+    except Exception:
+        logger.exception("Failed to normalize HF response")
+    return ""
 
 
 def _provider() -> BaseOCRProvider:
@@ -102,4 +96,3 @@ def _provider() -> BaseOCRProvider:
 async def extract_text(image_bytes: Optional[bytes] = None, image_url: Optional[str] = None) -> dict:
     prov = _provider()
     return await prov.extract_text(image_bytes=image_bytes, image_url=image_url)
-
