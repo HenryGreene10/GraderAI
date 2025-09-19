@@ -6,6 +6,7 @@ export default function FileRow({ file }) {
   const [status, setStatus] = useState(file.status || "pending");
   const [text, setText] = useState(file.extracted_text || "");
   const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
   const startedRef = useRef(false);
 
   // auto-start once for "pending"
@@ -42,6 +43,21 @@ export default function FileRow({ file }) {
     startedRef.current = false;
   };
 
+  async function handleRetry() {
+    try {
+      setBusy(true);
+      setErr("");
+      await startOCR(file.id);
+      setStatus("processing");
+    } catch (e) {
+      setErr(e.message || "Failed to start");
+      setStatus("failed");
+      console.error(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div style={{ display:"flex", gap:12, alignItems:"flex-start", padding:"10px 0" }}>
       {file.signedUrl ? (
@@ -67,9 +83,9 @@ export default function FileRow({ file }) {
           </div>
         )}
 
-        {status === "failed" && (
-          <button onClick={retry} className="btn btn-primary" style={{ marginTop: 8 }}>
-            Retry
+        {status !== "processing" && (
+          <button onClick={handleRetry} disabled={busy} className="btn btn-ghost" style={{ marginTop: 8 }}>
+            {busy ? "Starting…" : "Retry"}
           </button>
         )}
       </div>
