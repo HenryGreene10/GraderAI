@@ -1,8 +1,6 @@
 // frontend/src/lib/ocr.js
 import { supabase } from "./supabaseClient";
-
-const API_BASE = import.meta.env.VITE_BACKEND_URL; // e.g. https://graderai-hs7d.onrender.com
-if (!API_BASE) console.error("VITE_BACKEND_URL is missing");
+import { API_BASE } from "./apiBase";
 
 /** Fetch current user's id (ownerId) */
 async function getOwnerId() {

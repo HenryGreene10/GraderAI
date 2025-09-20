@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { supabase } from "../lib/supabaseClient";
+﻿import React, { useEffect, useMemo, useState } from "react";
+import { supa, previewUrl } from "../lib/supa";
+  import { API_BASE } from "../lib/apiBase";
 import FileRow from "../components/FileRow.jsx";
 
 const BUCKET = "submissions";
@@ -35,18 +36,18 @@ export default function AssignmentsPage() {
   );
 
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => setEmail(data.user?.email ?? null));
+    supa.auth.getUser().then(({ data }) => setEmail(data.user?.email ?? null));
   }, []);
 
   // load folders
   async function loadAssignments() {
     setLoadingAssignments(true);
     try {
-      const { data: userData } = await supabase.auth.getUser();
+      const { data: userData } = await supa.auth.getUser();
       const userId = userData?.user?.id;
       if (!userId) { setAssignments([]); return; }
 
-      const { data, error } = await supabase
+      const { data, error } = await supa
         .from("assignments")
         .select("id,title,due_date,created_at")
         .eq("owner_id", userId)
@@ -72,11 +73,11 @@ export default function AssignmentsPage() {
     setLoadingFiles(true);
     setChecked({});
     try {
-      const { data: userData } = await supabase.auth.getUser();
+      const { data: userData } = await supa.auth.getUser();
       const userId = userData?.user?.id;
       if (!userId) { setFiles([]); return; }
 
-      let query = supabase
+      let query = supa
         .from("uploads")
         .select("id,storage_path,original_name,mime_type,size_bytes,uploaded_at,assignment_id,status,extracted_text,ocr_error")
         .eq("owner_id", userId)
@@ -90,15 +91,14 @@ export default function AssignmentsPage() {
 
       const withUrls = await Promise.all(
         (data || []).map(async (row) => {
-          const { data: urlData, error: signErr } = await supabase.storage
-            .from(BUCKET)
-            .createSignedUrl(row.storage_path, 60 * 60);
+          const key = row.storage_path?.startsWith(`${BUCKET}/`) ? row.storage_path.slice(BUCKET.length + 1) : row.storage_path;
+          const urlRes = await previewUrl(BUCKET, key, 3600);
 
           return {
             id: row.id,
             storage_path: row.storage_path,
             name: row.original_name || row.storage_path.split("/").pop(),
-            signedUrl: signErr ? null : (urlData?.signedUrl || null),
+            signedUrl: urlRes.ok ? urlRes.url : null,
             isImage: /\.(png|jpe?g|gif|webp)$/i.test(row.original_name || ""),
             isPDF: /\.pdf$/i.test(row.original_name || ""),
             status: row.status || "pending",
@@ -119,15 +119,41 @@ export default function AssignmentsPage() {
   useEffect(() => { loadAssignments(); }, []);
   useEffect(() => { loadFiles(); }, [selectedAssignmentId, forcedUnassigned]);
 
+  // normalize "submissions/owner-1/file.jpg" -> "owner-1/file.jpg"
+  const stripBucketPrefix = (p, bucket = "submissions") =>
+    !p ? p : p.startsWith(bucket + "/") ? p.slice(bucket.length + 1) : p.replace(/^\/+/, "");
+
+  async function handleDelete(upload) {
+    try {
+      // 1) delete from Storage (SDK, not manual REST)
+      const objectPath = stripBucketPrefix(upload.storage_path, "submissions");
+      const { error: storageError } = await supa.storage.from("submissions").remove([objectPath]);
+      if (storageError) throw new Error(`Storage delete failed: ${storageError.message}`);
+
+      // 2) delete the DB row via backend API
+      const resp = await fetch(`${API_BASE}/api/uploads/${upload.id}`, { method: "DELETE" });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(`DB delete failed: ${resp.status} ${text}`);
+      }
+
+      // 3) update UI
+      setFiles((rows) => rows.filter((r) => r.id !== upload.id));
+    } catch (err) {
+      console.error("Delete failed:", err);
+      // show a toast/alert if you have one
+    }
+  }
+
   // create new folder
   async function createAssignment() {
     const title = newTitle.trim();
     if (!title) return;
     setCreating(true);
     try {
-      const { data: userData } = await supabase.auth.getUser();
+      const { data: userData } = await supa.auth.getUser();
       const userId = userData?.user?.id;
-      const { data, error } = await supabase
+      const { data, error } = await supa
         .from("assignments")
         .insert({ owner_id: userId, title, due_date: newDue || null })
         .select("id,title,due_date,created_at")
@@ -146,7 +172,7 @@ export default function AssignmentsPage() {
   // actions: move, rename, delete
   async function moveSelected(toAssignmentId) {
     if (selectedIds.length === 0) return;
-    const { error } = await supabase
+    const { error } = await supa
       .from("uploads")
       .update({ assignment_id: toAssignmentId ?? null })
       .in("id", selectedIds);
@@ -157,13 +183,13 @@ export default function AssignmentsPage() {
   // inline per-item delete (Storage -> DB)
   async function deleteOne(upload) {
     const storagePath = upload.storage_path;
-    const res = await supabase.storage.from("submissions").remove([storagePath]);
+    const res = await supa.storage.from("submissions").remove([storagePath]);
     console.log("Storage remove →", { storagePath, res });
     if (res?.error && !/Not Found|not exist/i.test(res.error.message)) {
       throw new Error(`Storage delete failed: ${res.error.message}`);
     }
 
-    const { error: dbErr } = await supabase
+    const { error: dbErr } = await supa
       .from("uploads")
       .delete()
       .eq("id", upload.id);
@@ -173,7 +199,7 @@ export default function AssignmentsPage() {
   async function renameOne(fileId, newName) {
     const clean = newName.trim();
     if (!clean) return;
-    const { error } = await supabase
+    const { error } = await supa
       .from("uploads")
       .update({ original_name: clean })
       .eq("id", fileId);
@@ -184,14 +210,14 @@ export default function AssignmentsPage() {
 
   async function deleteSelected() {
     if (selectedIds.length === 0) return;
-    const { data, error } = await supabase
+    const { data, error } = await supa
       .from("uploads")
       .select("id,storage_path")
       .in("id", selectedIds);
     if (error) { console.error(error); return; }
 
     const rows = data || [];
-    const results = await Promise.allSettled(rows.map(deleteOne));
+    const results = await Promise.allSettled(rows.map(handleDelete));
 
     const failures = results
       .map((r, i) => (r.status === "rejected" ? { row: rows[i], reason: r.reason } : null))
@@ -304,10 +330,10 @@ export default function AssignmentsPage() {
         {!loadingFiles && files.length > 0 && (
           <div style={{ display: "grid", gap: 12 }}>
             {files.map((f) => (
-              <FileRow
-                key={f.id}
-                file={f}
-              />
+              <div key={f.id} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                <FileRow file={f} />
+                <button className="btn btn-ghost" onClick={() => handleDelete(f)}>Delete</button>
+              </div>
             ))}
           </div>
         )}
@@ -315,3 +341,4 @@ export default function AssignmentsPage() {
     </div>
   );
 }
+

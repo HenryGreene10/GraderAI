@@ -67,15 +67,22 @@ def _normalize_hf(json_obj: Any) -> str:
 
 
 def _provider() -> BaseOCRProvider:
+    # Mock override takes precedence
     if os.getenv("OCR_MOCK") == "1":
+        logger.info("[ocr] Constructing provider=mock (OCR_MOCK=1)")
         return MockOCRProvider()
 
+    # Default to mock when missing or empty
     provider = os.environ.get("OCR_PROVIDER", "mock").strip().lower() or "mock"
+    logger.info("[ocr] Constructing provider=%s", provider)
 
     if provider == "hf":
         api_url = os.environ.get("HF_API_URL", "").strip()
         token = os.environ.get("HF_TOKEN", "").strip() or None
+        # HF provider will raise KeyError if required pieces are missing
         return HFInferenceOCRProvider(api_url=api_url, token=token)
+    if provider == "mock":
+        return MockOCRProvider()
 
     raise NotImplementedError(f"OCR provider '{provider}' not implemented")
 

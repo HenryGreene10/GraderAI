@@ -9,6 +9,19 @@ from starlette.responses import Response
 import httpx
 from pydantic import BaseModel
 from supabase import create_client, Client
+from dotenv import load_dotenv
+import logging
+from uuid import UUID
+# Supabase Python v2 raises PostgREST APIError
+from postgrest.exceptions import APIError
+
+# Simple app logger
+logger = logging.getLogger("backend")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
 
 # New grading services
 from .services.grader import (
@@ -24,59 +37,61 @@ from .services.ocr import extract_text as ocr_extract_text
 from .models.schemas import GradeResult
 
 # ── Environment ────────────────────────────────────────────────────────────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")                         # e.g. https://abc.supabase.co
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
+# Now pull them in
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "submissions")
 
-# Your DB uses owner_id (not user_id)
-OWNER_COLUMN = os.environ.get("OWNER_COLUMN", "owner_id")
+print("DEBUG URL:", repr(SUPABASE_URL))
+print("DEBUG KEY:", repr(SUPABASE_SERVICE_ROLE_KEY[:10] + "..."))
 
-# HandwritingOCR settings
-HANDWRITINGOCR_API_KEY = os.getenv("HANDWRITINGOCR_API_KEY", "")
-HANDWRITINGOCR_ENDPOINT = os.environ.get(
-    "HANDWRITINGOCR_ENDPOINT", "https://www.handwritingocr.com/api/v3/ocr"
-)
-HANDWRITINGOCR_FILE_FIELD = os.environ.get("HANDWRITINGOCR_FILE_FIELD", "file")
-HANDWRITINGOCR_URL_FIELD  = os.environ.get("HANDWRITINGOCR_URL_FIELD",  "url")
-HANDWRITINGOCR_B64_FIELD  = os.environ.get("HANDWRITINGOCR_B64_FIELD",  "image_base64")
-HANDWRITINGOCR_METHOD     = os.environ.get("HANDWRITINGOCR_METHOD", "auto").strip().lower()
-MAX_RETRIES = int(os.environ.get("OCR_MAX_RETRIES", "3"))
-HANDWRITINGOCR_MOCK = os.environ.get("HANDWRITINGOCR_MOCK", "0") == "1"
-HANDWRITINGOCR_DEBUG = os.environ.get("HANDWRITINGOCR_DEBUG", "0") == "1"
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("Supabase credentials are missing. Check backend/.env")
 
-# CORS: set CORS_ALLOW_ORIGINS on Render like:
-#   http://localhost:5173,https://<your-frontend>.onrender.com
-origins_env = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
-if origins_env:
-    ALLOW_ORIGINS = [o.strip() for o in origins_env.split(",") if o.strip()]
-else:
-    # Default allow localhost and 127.0.0.1 for Vite dev
-    ALLOW_ORIGINS = [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ]
-
-# ── Clients / App ──────────────────────────────────────────────────────────────
-logger = logging.getLogger(__name__)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
 app = FastAPI()
+allowed = os.environ.get("CORS_ALLOW_ORIGINS", "http://localhost:5173").split(",")
+_CORS_ORIGINS = [o.strip() for o in allowed if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,
-    allow_credentials=False,                 # keep False when using multiple arbitrary origins
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS", "PUT", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 
+logger.info("[boot] version=%s", "0.1.0")
 logger.info("[boot] SUPABASE_URL=%s", SUPABASE_URL)
-logger.info("[boot] CORS allow_origins=%s", ALLOW_ORIGINS)
+logger.info("[boot] CORS allow_origins=%s", _CORS_ORIGINS)
+logger.info(
+    "[boot] OCR_PROVIDER=%s hf_token_present=%s",
+    (os.getenv("OCR_PROVIDER", "mock") or "mock"),
+    bool(os.getenv("HF_TOKEN")),
+)
+
+# Warn if Supabase env incomplete; do not crash at startup
+_missing_url = not bool(SUPABASE_URL)
+_missing_key = not bool(SUPABASE_SERVICE_ROLE_KEY)
+_missing_bucket = not bool(SUPABASE_BUCKET)
+if _missing_url or _missing_key or _missing_bucket:
+    logger.warning(
+        "Supabase env missing: URL=%s, KEY=%s, BUCKET=%s",
+        _missing_url,
+        _missing_key,
+        _missing_bucket,
+    )
 
 # ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True, "service": "graderai-ocr"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 # Optional explicit OPTIONS (middleware already handles preflight; harmless to keep)
 @app.options("/api/ocr/start")
@@ -98,6 +113,36 @@ def _mark_status(upload_id: str, status: str, fields: dict | None = None):
     if fields:
         payload.update(fields)
     supabase.table("uploads").update(payload).eq("id", upload_id).execute()
+
+def _require_supabase_config():
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not SUPABASE_BUCKET:
+        raise HTTPException(
+            500,
+            "Supabase configuration is incomplete. Please set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and SUPABASE_BUCKET.",
+        )
+        
+        
+def _is_uuid(val: str) -> bool:
+    try:
+        UUID(str(val))
+        return True
+    except Exception:
+        return False
+    
+def _select_upload_row(supabase, upload_id: str):
+    """
+    Returns dict(row) or None. Converts Supabase 'maybe_single' responses safely.
+    """
+    resp = (
+        supabase.table("uploads")
+        .select("id, owner_id, storage_path, status, extracted_text")
+        .eq("id", upload_id)
+        .maybe_single()
+        .execute()
+    )
+    # supabase-py returns resp.data=None when not found
+    return resp.data if getattr(resp, "data", None) else None
+
 
 def _get_signed_url(path: str, expires_in: int = 900) -> str:
     """
@@ -289,26 +334,45 @@ async def start_ocr(
     x_owner_id: Optional[str] = Header(None),
     x_user_id: Optional[str] = Header(None),
 ):
+    _require_supabase_config()
+
+    # 0) Validate input early
+    if not body or not getattr(body, "upload_id", None):
+        raise HTTPException(status_code=400, detail="upload_id is required")
+    try:
+        UUID(str(body.upload_id))
+    except Exception:
+        raise HTTPException(status_code=400, detail="upload_id must be a UUID")
+
     caller_id = x_owner_id or x_user_id
-    # 1) Read upload row safely
-    resp = (
-        supabase.table("uploads")
-        .select("*")
-        .eq("id", body.upload_id)
-        .maybe_single()     # avoids raising when not found
-        .execute()
-    )
-    row = resp.data
+
+    # 1) Read upload row safely (catch PostgREST/API errors and turn into 400)
+    try:
+        resp = (
+            supabase.table("uploads")
+            .select("*")
+            .eq("id", body.upload_id)
+            .maybe_single()     # avoids raising when not found
+            .execute()
+        )
+    except APIError as e:
+        # Bad filter / malformed request -> 400
+        raise HTTPException(status_code=400, detail=f"Invalid request: {getattr(e, 'message', str(e))}")
+
+    row = getattr(resp, "data", None)
     if not row:
-        raise HTTPException(404, "Upload not found")
+        raise HTTPException(status_code=404, detail="Upload not found")
 
     if not _owner_matches(row, caller_id):
-        logger.warning("auth forbid: caller=%s owner=%s user=%s", caller_id, row.get("owner_id"), row.get("user_id"))
-        raise HTTPException(403, "Forbidden")
+        logger.warning(
+            "auth forbid: caller=%s owner=%s user=%s",
+            caller_id, row.get("owner_id"), row.get("user_id"),
+        )
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     storage_path = row.get("storage_path")
     if not storage_path:
-        raise HTTPException(400, "Missing storage_path")
+        raise HTTPException(status_code=400, detail="Missing storage_path")
 
     # 2) Mark processing
     _mark_status(row["id"], "processing", {
@@ -327,6 +391,7 @@ async def start_ocr(
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            # With OCR_MOCK=1 we skip downloading but still call the provider wrapper
             blob = b"" if os.getenv("OCR_MOCK") == "1" else await _download_bytes(signed)
             result = await ocr_extract_text(image_bytes=blob)
 
@@ -389,7 +454,9 @@ async def start_ocr(
     _mark_status(row["id"], "OCR_ERROR", {"ocr_error": last_err})
     row["status"] = "OCR_ERROR"
     row["ocr_error"] = last_err
-    raise HTTPException(status_code=500, detail=f"OCR pipeline error: {last_err or 'unknown'}")
+    # Provider/network errors should be 502 (bad gateway), not 500
+    raise HTTPException(status_code=502, detail=f"OCR pipeline error: {last_err or 'unknown'}")
+
 
 @app.get("/api/ocr/status/{upload_id}")
 async def ocr_status(
@@ -397,6 +464,7 @@ async def ocr_status(
     x_owner_id: Optional[str] = Header(None),
     x_user_id: Optional[str] = Header(None),
 ):
+    _require_supabase_config()
     caller_id = x_owner_id or x_user_id
     resp = supabase.table("uploads").select("*").eq("id", upload_id).maybe_single().execute()
     row = resp.data
@@ -430,6 +498,7 @@ async def start_grade(
     x_owner_id: Optional[str] = Header(None),
     x_user_id: Optional[str] = Header(None),
 ):
+    _require_supabase_config()
     caller_id = x_owner_id or x_user_id
 
     # 1) Fetch upload and authz
@@ -623,45 +692,33 @@ async def grade_options() -> Response:
 
 # Upload deletion (storage-first, then DB)
 @app.delete("/api/uploads/{upload_id}")
-async def delete_upload(
-    upload_id: str,
-    x_owner_id: Optional[str] = Header(None),
-    x_user_id: Optional[str] = Header(None),
-):
-    caller_id = x_owner_id or x_user_id
-    # Lookup row
-    resp = (
-        supabase.table("uploads")
-        .select("*")
-        .eq("id", upload_id)
-        .maybe_single()
-        .execute()
-    )
-    row = resp.data
-    if not row:
-        raise HTTPException(404, "Upload not found")
-    if not _owner_matches(row, caller_id):
-        logger.warning("auth forbid delete: caller=%s owner=%s user=%s", caller_id, row.get("owner_id"), row.get("user_id"))
-        raise HTTPException(403, "Forbidden")
+async def delete_upload(upload_id: str):
+    if not _is_uuid(upload_id):
+        raise HTTPException(status_code=400, detail="upload_id must be a UUID")
 
-    storage_path = row.get("storage_path") or ""
-    key = (storage_path or "").lstrip("/")
-    if key.startswith(f"{SUPABASE_BUCKET}/"):
-        key = key[len(f"{SUPABASE_BUCKET}/"):]
-
-    # Delete from storage first
     try:
-        supabase.storage.from_(SUPABASE_BUCKET).remove([key])
-    except Exception as e:
-        logger.warning("storage remove failed for %s: %s", key, e)
-        raise HTTPException(502, "Failed to delete file from storage")
+        row = _select_upload_row(supabase, upload_id)
+    except APIError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {getattr(e, 'message', str(e))}")
 
-    # Then delete DB row
+    if not row:
+        # Nothing to delete
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    storage_path = row.get("storage_path")
+
+    # 1) Delete from storage first (if present)
+    try:
+        if storage_path:
+            supabase.storage.from_(SUPABASE_BUCKET).remove([storage_path])
+    except Exception:
+        # Storage errors shouldn't leave DB row orphaned; log but continue
+        logger.warning("Storage delete failed for %s", storage_path, exc_info=True)
+
+    # 2) Delete DB row
     try:
         supabase.table("uploads").delete().eq("id", upload_id).execute()
-    except Exception as e:
-        logger.warning("db delete failed for upload %s: %s", upload_id, e)
-        # At this point storage is gone; consider exposing partial failure
-        raise HTTPException(500, "File removed from storage but DB delete failed")
+    except APIError as e:
+        raise HTTPException(status_code=400, detail=f"DB delete failed: {getattr(e, 'message', str(e))}")
 
-    return {"ok": True}
+    return {"ok": True, "deleted": upload_id}

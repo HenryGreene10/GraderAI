@@ -1,14 +1,15 @@
-import React, {
+﻿import React, {
   useEffect,
   useState,
   useCallback,
   useMemo,
   useRef,
 } from "react";
-import { supabase } from "../lib/supabaseClient";
+import { supa } from "../lib/supa";
+import { previewUrl } from "../lib/supa";
 
 /**
- * UploadPanel — UI-only (uses onUpload callback for real work)
+ * UploadPanel â€” UI-only (uses onUpload callback for real work)
  * You can freely restyle this markup later; no backend logic lives inside.
  */
 function UploadPanel({
@@ -107,7 +108,7 @@ function UploadPanel({
   };
 
   const handleUpload = async () => {
-    if (!files.length) {               // no files → open picker instead of error
+    if (!files.length) {               // no files â†’ open picker instead of error
       if (inputRef.current) inputRef.current.click();
       return;
     }
@@ -145,7 +146,7 @@ function UploadPanel({
       <div className="upload-head">
         <h2>Upload worksheets</h2>
         <p>
-          Images or PDF · {multiple ? `Up to ${maxFiles} files` : "Single file"} · ≤{" "}
+          Images or PDF Â· {multiple ? `Up to ${maxFiles} files` : "Single file"} Â· â‰¤{" "}
           {maxSizeMB}MB each
         </p>
       </div>
@@ -224,7 +225,7 @@ function UploadPanel({
                   className="chip-x"
                   aria-label={`Remove ${f.name}`}
                 >
-                  ×
+                  Ã—
                 </button>
               </li>
             ))}
@@ -239,7 +240,7 @@ function UploadPanel({
           disabled={isUploading}
           className="btn btn-primary"
         >
-          {isUploading ? "Uploading…" : "Upload"}
+          {isUploading ? "Uploadingâ€¦" : "Upload"}
         </button>
         <button
           type="button"
@@ -266,7 +267,7 @@ function UploadPanel({
         <div className="progress-wrap" style={{ marginTop: 12 }}>
           {isUploading && (
             <div style={{ fontSize: 12, color: "#475467", marginBottom: 6 }}>
-              Uploading… ({files.length} file{files.length > 1 ? "s" : ""})
+              Uploadingâ€¦ ({files.length} file{files.length > 1 ? "s" : ""})
             </div>
           )}
           <div className="progress-bar" style={{ height: 8, borderRadius: 999, background: "#f2f4f7", overflow: "hidden" }}>
@@ -293,7 +294,7 @@ function UploadPanel({
  */
 async function handleUploadToSupabase(files, setProgress) {
   // 1) Ensure user is logged in
-  const { data: userData, error: userErr } = await supabase.auth.getUser();
+  const { data: userData, error: userErr } = await supa.auth.getUser();
   if (userErr || !userData?.user) {
     throw new Error("You must be signed in to upload.");
   }
@@ -316,10 +317,10 @@ async function handleUploadToSupabase(files, setProgress) {
       .replace(/[^a-zA-Z0-9._-]/g, "");
 
     const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    // Do NOT double-append .ext — clean already contains it
+    // Do NOT double-append .ext â€” clean already contains it
     const objectKey = `${userId}/${unique}-${clean}`;
 
-    const { data: upData, error } = await supabase.storage
+    const { data: upData, error } = await supa.storage
       .from(BUCKET)
       .upload(objectKey, f, {
         contentType: f.type || "application/octet-stream",
@@ -333,12 +334,10 @@ async function handleUploadToSupabase(files, setProgress) {
     // use the canonical path Supabase returns (never recompute yourself)
     const savedKey = upData?.path || objectKey;
 
-    // Optional quick check, verify the object is reachable
+    // Optional quick check, verify the object is reachable using helper
     try {
-      const { data: signed } = await supabase.storage
-        .from(BUCKET)
-        .createSignedUrl(savedKey, 60);
-      console.log("preview url ok?", !!signed?.signedUrl, savedKey);
+      const res = await previewUrl(BUCKET, savedKey);
+      console.log("preview url ok?", !!res?.url, savedKey);
     } catch {}
 
     uploaded.push({
@@ -369,7 +368,7 @@ export default function Dashboard() {
   // New-assignment inline form (moved to Assignments page)
 
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
+    supa.auth.getUser().then(({ data }) => {
       setEmail(data.user?.email ?? null);
     });
   }, []);
@@ -383,11 +382,11 @@ export default function Dashboard() {
   async function loadAssignments() {
     setLoadingAssignments(true);
     try {
-      const { data: userData } = await supabase.auth.getUser();
+      const { data: userData } = await supa.auth.getUser();
       const userId = userData?.user?.id;
       if (!userId) { setAssignments([]); return; }
 
-      const { data, error } = await supabase
+      const { data, error } = await supa
         .from("assignments")
         .select("id,title,due_date,created_at")
         .eq("owner_id", userId)
@@ -412,11 +411,11 @@ export default function Dashboard() {
   async function refreshList() {
     setLoadingList(true);
     try {
-      const { data: userData } = await supabase.auth.getUser();
+      const { data: userData } = await supa.auth.getUser();
       const userId = userData?.user?.id;
       if (!userId) { setMyFiles([]); return; }
 
-      let query = supabase
+      let query = supa
         .from("uploads")
         .select("id, storage_path, original_name, mime_type, size_bytes, uploaded_at, assignment_id")
         .eq("owner_id", userId)
@@ -433,16 +432,15 @@ export default function Dashboard() {
 
       const withUrls = await Promise.all(
         (data || []).map(async (row) => {
-          const { data: urlData } = await supabase.storage
-            .from(BUCKET)
-            .createSignedUrl(row.storage_path, 60 * 60);
           const name = row.original_name || row.storage_path.split("/").pop();
+          const key = row.storage_path?.startsWith(`${BUCKET}/`) ? row.storage_path.slice(BUCKET.length + 1) : row.storage_path;
+          const urlRes = await previewUrl(BUCKET, key);
           return {
             id: row.id,
             path: row.storage_path,
             name,
             size: row.size_bytes ?? 0,
-            signedUrl: urlData?.signedUrl || null,
+            signedUrl: urlRes.ok ? urlRes.url : null,
             isImage: /\.(png|jpe?g|gif|webp)$/i.test(name),
             isPDF: /\.pdf$/i.test(name),
           };
@@ -462,7 +460,7 @@ export default function Dashboard() {
   useEffect(() => { refreshList(); }, [selectedAssignmentId]);
 
   const signOut = async () => {
-    await supabase.auth.signOut();
+    await supa.auth.signOut();
     window.location.href = "/auth";
   };
 
@@ -508,7 +506,7 @@ export default function Dashboard() {
             const uploaded = await handleUploadToSupabase(files, setProgress);
 
             // Insert upload rows (same as before)
-            const { data: userData } = await supabase.auth.getUser();
+            const { data: userData } = await supa.auth.getUser();
             const userId = userData?.user?.id;
             if (userId && uploaded?.length) {
               const rows = uploaded.map(u => ({
@@ -520,11 +518,11 @@ export default function Dashboard() {
                 size_bytes: u.size ?? null,
                 status: "pending",
               }));
-              const { error } = await supabase.from("uploads").insert(rows);
+              const { error } = await supa.from("uploads").insert(rows);
               if (error) console.error(error);
             }
 
-            // 👉 After upload, go to Assignments (filtered to the chosen folder)
+            // ðŸ‘‰ After upload, go to Assignments (filtered to the chosen folder)
             const dest = selectedAssignmentId
               ? `/assignments?assignmentId=${selectedAssignmentId}`
               : `/assignments?filter=unassigned`;
@@ -537,7 +535,7 @@ export default function Dashboard() {
         {false && (
           <div style={{ marginTop: 24 }}>
             <h3 style={{ marginBottom: 8 }}>My uploads</h3>
-            {loadingList && <div>Loading…</div>}
+            {loadingList && <div>Loadingâ€¦</div>}
             {!loadingList && myFiles.length === 0 && <div>No files yet.</div>}
             {!loadingList && myFiles.length > 0 && (
               <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "grid", gap: 12 }}>
@@ -576,3 +574,4 @@ export default function Dashboard() {
     </div>
   );
 }
+
