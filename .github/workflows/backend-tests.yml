@@ -1,0 +1,30 @@
+name: backend-tests
+on: [push, pull_request]
+jobs:
+  tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: venv
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\Activate.ps1
+          python -m pip install --upgrade pip
+          if (Test-Path backend\requirements.txt) { pip install -r backend\requirements.txt }
+          if (Test-Path backend\requirements-dev.txt) { pip install -r backend\requirements-dev.txt }
+      - name: env
+        shell: pwsh
+        run: |
+          echo "SUPABASE_URL=https://example.supabase.co" >> $env:GITHUB_ENV
+          echo "SUPABASE_SERVICE_ROLE_KEY=service-role-xxxx" >> $env:GITHUB_ENV
+          echo "OCR_PROVIDER=mock" >> $env:GITHUB_ENV
+      - name: pytest
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\Activate.ps1
+          cd backend
+          pytest -q
