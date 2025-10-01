@@ -1,5 +1,5 @@
 ﻿import React, { useEffect, useMemo, useState } from "react";
-import { supa, previewUrl } from "../lib/supa";
+import supa, { previewUrl } from "../lib/supa";
   import { API_BASE } from "../lib/apiBase";
 import FileRow from "../components/FileRow.jsx";
 

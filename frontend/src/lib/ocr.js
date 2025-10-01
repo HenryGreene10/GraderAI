@@ -10,25 +10,28 @@ async function getOwnerId() {
 }
 
 /** Start OCR on a specific upload row */
-export async function startOCR(uploadId) {
+export async function startOCR(uploadId, ownerIdParam) {
   if (!uploadId) throw new Error("uploadId is required");
-  const ownerId = await getOwnerId();
+  const ownerId = ownerIdParam || (await getOwnerId());
 
   const r = await fetch(`${API_BASE}/api/ocr/start`, {
     method: "POST",
     mode: "cors",
     headers: {
       "Content-Type": "application/json",
-      // Send BOTH to satisfy either backend variant
-      "X-Owner-Id": ownerId,
-      "X-User-Id": ownerId,
+      "x-owner-id": ownerId,
     },
     body: JSON.stringify({ upload_id: uploadId }),
   });
 
   if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(txt || `startOCR failed (${r.status})`);
+    let body;
+    try {
+      body = await r.json();
+    } catch {
+      body = await r.text().catch(() => "");
+    }
+    throw new Error(JSON.stringify({ status: r.status, body }));
   }
   return r.json();
 }
@@ -48,8 +51,9 @@ export async function getOCRStatus(uploadId) {
   });
 
   if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(txt || `status failed (${r.status})`);
+    let body;
+    try { body = await r.json(); } catch { body = await r.text().catch(() => ""); }
+    throw new Error(JSON.stringify({ status: r.status, body }));
   }
   return r.json();
 }
@@ -83,8 +87,8 @@ export function pollOCR(uploadId, onTick, intervalMs = 1500) {
           }
         }
         if (typeof onTick === "function") onTick(toEmit);
-
-        if (toEmit.status === "done" || toEmit.status === "failed") break;
+        // Only continue polling while "processing"; stop otherwise
+        if (toEmit.status !== "processing") break;
         await new Promise((res) => setTimeout(res, intervalMs));
       }
     } catch (e) {

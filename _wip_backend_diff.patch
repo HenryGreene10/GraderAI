@@ -1,0 +1,278 @@
+﻿diff --git a/backend/.env.example b/backend/.env.example
+index 1ae8c02..135961e 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -5,11 +5,16 @@ SUPABASE_ANON_KEY=sb_publishable_<optional>      # optional; server can call pub
+ SUPABASE_BUCKET=submissions
+ 
+ # OCR / Dev toggles
+-OCR_PROVIDER=mock        # mock | hf | (future providers)
++OCR_PROVIDER=mock        # mock | hf | trocr_local
+ OCR_MOCK=1               # 1 = always return mock text (useful in DEV)
+ HF_TOKEN=<optional>
+ DEV_MODE=1               # 1 = relaxed CORS + mock-friendly paths
+ 
++# Local TrOCR options (when OCR_PROVIDER=trocr_local)
++OCR_MODEL=microsoft/trocr-base-handwritten  # or microsoft/trocr-base-printed
++OCR_MODE=single                             # single | auto
++OCR_DEBUG=0                                 # 1 for verbose provider logs
++
+ # CORS / Frontend origin
+ FRONTEND_ORIGIN=http://localhost:5173
+ 
+diff --git a/backend/__init__.py b/backend/__init__.py
+index a9a2c5b..e69de29 100644
+--- a/backend/__init__.py
++++ b/backend/__init__.py
+@@ -1 +0,0 @@
+-__all__ = []
+diff --git a/backend/app.py b/backend/app.py
+index 6cb2839..a7287c5 100644
+--- a/backend/app.py
++++ b/backend/app.py
+@@ -6,13 +6,21 @@ from fastapi import FastAPI, HTTPException, Header
+ from typing import Optional
+ from fastapi.middleware.cors import CORSMiddleware
+ from starlette.responses import Response
++from starlette.responses import JSONResponse
+ import httpx
+ from pydantic import BaseModel
+ from dotenv import load_dotenv
+-from .services import ocr  # ensure tests can monkeypatch backend.services.ocr
++from services import ocr  # ensure tests can monkeypatch backend.services.ocr
++# Local OCR provider (TrOCR) wiring
++try:
++    from ocr.run_ocr import get_provider as _get_local_ocr_provider, normalize as _normalize_local_text
++except Exception:
++    _get_local_ocr_provider = None  # type: ignore
++    def _normalize_local_text(t: str) -> str:  # type: ignore
++        return (t or "").strip()
+ # Lazy-safe PDF flattener (reportlab may be unavailable offline)
+ try:
+-    from .services.report import flatten_to_pdf as _flatten_to_pdf
++    from services.report import flatten_to_pdf as _flatten_to_pdf
+ except ModuleNotFoundError:
+     def _flatten_to_pdf(summary, overlay):
+         return b"%PDF-1.4\n%mock\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+@@ -35,8 +43,8 @@ except ModuleNotFoundError:
+         ...
+ 
+ # ---- Project config / services (keep your existing imports) ----
+-from backend.config import HF_TOKEN, HF_MODEL_ID, OCR_PROVIDER, REQUIRE_OWNER, summary
+-from .services.grader import (
++from config import HF_TOKEN, HF_MODEL_ID, OCR_PROVIDER, REQUIRE_OWNER, summary
++from services.grader import (
+     parse_questions,
+     generate_autokeys,
+     grade,
+@@ -103,6 +111,7 @@ print("[boot] supabase key preview:", _key_preview)
+ 
+ class StartOCRBody(BaseModel):
+     upload_id: str
++    model: str | None = None
+ 
+  # NOTE: tests will monkeypatch this global. Keep it as a simple module-level var.
+ supabase: Client | None = None
+@@ -171,6 +180,17 @@ def health():
+ def healthz():
+     return {"ok": True}
+ 
++# --- helper to compute response text length across providers ---
++def _resp_text_len(row: dict, final_payload: dict | None = None) -> int:
++    t = (
++        (final_payload or {}).get("ocr_text")
++        or (final_payload or {}).get("extracted_text")
++        or row.get("ocr_text")
++        or row.get("extracted_text")
++        or ""
++    )
++    return len((t or "").strip())
++
+ # Debug config probe (no secrets)
+ @app.get("/api/debug/config")
+ def debug_config():
+@@ -216,11 +236,24 @@ async def ocr_start(
+                 "text": text,
+                 "updated_at": datetime.now(timezone.utc).isoformat(),
+             }
+-            return {"ok": True, "status": "done", "text": text}
++            # Include text_len in success response
++            _text_len = _resp_text_len(
++                {"ocr_text": text, "extracted_text": text},
++                {"ocr_text": text, "extracted_text": text},
++            )
++            print("[ocr] success path: legacy/mock/hf")
++            return {
++                "ok": True,
++                "status": "done",
++                "upload_id": str(body.upload_id),
++                "ocr_status": "done",
++                "text": text,
++                "text_len": _text_len,
++            }
+         except Exception:
+             # Even if logging fails, keep mock path successful
+             logger.exception("ocr_start failed", extra={"upload_id": str(getattr(body, 'upload_id', ''))})
+-            return {"ok": True, "status": "done", "text": "mock extracted text"}
++            return {"ok": True, "status": "done", "text": "mock extracted text", "text_len": len("mock extracted text")}
+     try:
+         upload_id = str(body.upload_id)
+         caller_id = x_owner_id or x_user_id
+@@ -277,11 +310,126 @@ async def ocr_start(
+                 except Exception:
+                     pass
+                 _safe_update_upload(upload_id, payload)
+-                return {"ok": True, "status": OCR_DONE, "text": text_resp}
++                _text_len = _resp_text_len(row, payload)
++                print("[ocr] success path: legacy/mock/hf")
++                return {
++                    "ok": True,
++                    "status": OCR_DONE,
++                    "upload_id": upload_id,
++                    "ocr_status": OCR_DONE,
++                    "text": text_resp,
++                    "text_len": _text_len,
++                }
+             except Exception:
+                 logger.exception("/api/ocr/start mock path failed")
+                 raise HTTPException(status_code=500, detail="mock_update_failed")
+ 
++        # If configured to use local TrOCR provider, run it here
++        if os.getenv("OCR_PROVIDER", "mock").lower() == "trocr_local":
++            try:
++                storage_path = row.get("storage_path")
++                if not storage_path:
++                    raise HTTPException(400, "Missing storage_path")
++                signed = _get_signed_url(storage_path)
++                blob = await _download_bytes(signed)
++                # Derive filename for type detection
++                filename = (storage_path or "").split("/")[-1]
++                prov_name, prov_model, provider = _get_local_ocr_provider()
++                text, meta = provider.run(
++                    file_bytes=blob,
++                    filename=filename,
++                    model_override=(body.model or None),
++                )
++                text = _normalize_local_text(text)
++                text_len = len(text.strip())
++
++                final_payload = {
++                    "status": "OCR_DONE",
++                    "ocr_status": OCR_DONE,
++                    "extracted_text": text,
++                    "ocr_text": text,
++                    "ocr_completed_at": _utc_iso(),
++                    "ocr_error": None,
++                }
++                try:
++                    row.update(final_payload)
++                except Exception:
++                    pass
++                _safe_update_upload(upload_id, final_payload)
++
++                # Log detailed run into ocr_runs (best-effort)
++                try:
++                    tried = meta.get("tried")
++                    supabase.table("ocr_runs").insert({
++                        "upload_id": upload_id,
++                        "provider": prov_name,
++                        "model": meta.get("model"),
++                        "latency_ms": meta.get("latency_ms"),
++                        "status": "ok",
++                        "error": None,
++                        "device": meta.get("device"),
++                        "tried": None if tried is None else json.dumps(tried),
++                    }).execute()
++                except Exception:
++                    pass
++
++                text_len = _resp_text_len(row, final_payload)
++                print("[ocr] success path: trocr_local")
++                return {
++                    "ok": True,
++                    "status": "done",
++                    "upload_id": upload_id,
++                    "ocr_status": "done",
++                    "provider": "trocr_local",
++                    "model": meta.get("model"),
++                    "latency_ms": meta.get("latency_ms"),
++                    "text_len": text_len,
++                }
++            except Exception as e:
++                # Mark error and record run
++                err_msg = (
++                    "PDF conversion failed" if str(row.get("storage_path", "")).lower().endswith(".pdf") else str(e)
++                )
++                try:
++                    supabase.table("ocr_runs").insert({
++                        "upload_id": upload_id,
++                        "provider": "trocr_local",
++                        "model": os.getenv("OCR_MODEL", "microsoft/trocr-base-handwritten"),
++                        "latency_ms": None,
++                        "status": "failed",
++                        "error": err_msg,
++                        "device": None,
++                        "tried": None,
++                    }).execute()
++                except Exception:
++                    pass
++
++                err_payload = {
++                    "status": "OCR_ERROR",
++                    "ocr_status": OCR_ERROR,
++                    "ocr_error": err_msg,
++                    "ocr_completed_at": _utc_iso(),
++                }
++                try:
++                    row.update(err_payload)
++                except Exception:
++                    pass
++                _safe_update_upload(upload_id, err_payload)
++                return JSONResponse(
++                    status_code=502,
++                    content={
++                        "ok": False,
++                        "status": "error",
++                        "upload_id": upload_id,
++                        "ocr_status": "failed",
++                        "provider": "trocr_local",
++                        "model": meta.get("model") if 'meta' in locals() else None,
++                        "latency_ms": meta.get("latency_ms") if 'meta' in locals() else None,
++                        "text_len": 0,
++                        "ocr_error": err_msg,
++                    },
++                )
++
+         # Real provider path with simple retry on 5xx/429
+         attempts_log: list = []
+         try:
+@@ -333,7 +481,16 @@ async def ocr_start(
+                 }).execute()
+             except Exception:
+                 pass
+-            return {"ok": True, "status": OCR_DONE, "text": text}
++            _text_len = _resp_text_len(row, final_payload)
++            print("[ocr] success path: legacy/mock/hf")
++            return {
++                "ok": True,
++                "status": OCR_DONE,
++                "upload_id": upload_id,
++                "ocr_status": OCR_DONE,
++                "text": text,
++                "text_len": _text_len,
++            }
+         except httpx.ReadTimeout as te:
+             # Log and mark error
+             try:
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 61d1596..1234b09 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -5,3 +5,7 @@ supabase
+ python-dotenv
+ python-multipart
+ reportlab
++transformers>=4.42
++torch
++pillow
++pymupdf

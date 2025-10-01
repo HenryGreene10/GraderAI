@@ -1,4 +1,5 @@
-﻿// frontend/src/lib/supabaseClient.js
-// Re-export from unified Supabase module to keep a single client
-export { supa as supabase } from "./supa";
-export * from "./supa";
+// frontend/src/lib/supabaseClient.js
+// Provide a named supabase export based on the default client
+import supa from "./supa";
+export const supabase = supa;
+

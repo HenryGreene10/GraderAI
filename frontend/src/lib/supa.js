@@ -1,11 +1,58 @@
 // frontend/src/lib/supa.js
 import { createClient } from "@supabase/supabase-js";
 
-// Supabase client
-export const supa = createClient(
-  import.meta.env.VITE_SUPABASE_URL,
-  import.meta.env.VITE_SUPABASE_ANON_KEY
-);
+// Supabase client (explicit env detection)
+const SUPA_URL = String(import.meta.env?.VITE_SUPABASE_URL || "").trim();
+const SUPA_KEY = String(import.meta.env?.VITE_SUPABASE_ANON_KEY || "").trim();
+console.info("[supa] env present:", { url: !!SUPA_URL, key: !!SUPA_KEY });
+
+let supa;
+if (SUPA_URL && SUPA_KEY) {
+  try {
+    supa = createClient(SUPA_URL, SUPA_KEY);
+  } catch (_e) {
+    // fall through to stub
+  }
+}
+
+if (!supa) {
+  // minimal stub so app renders even without env
+  const auth = {
+    async getSession() { return { data: { session: null }, error: null }; },
+    async getUser() { return { data: { user: null }, error: null }; },
+    onAuthStateChange(cb) {
+      const subscription = { unsubscribe() {} };
+      try { if (typeof cb === "function") setTimeout(() => cb("INITIAL", null), 0); } catch {}
+      return { data: { subscription } };
+    },
+    async signOut() { return { error: null }; },
+    async signInWithPassword() { return { data: null, error: { message: "Missing Supabase env" } }; },
+    async signUp() { return { data: null, error: { message: "Missing Supabase env" } }; },
+  };
+  const chain = () => ({
+    select() { return Promise.resolve({ data: [], error: null }); },
+    insert() { return Promise.resolve({ data: null, error: null }); },
+    update() { return Promise.resolve({ data: null, error: null }); },
+    delete() { return Promise.resolve({ data: null, error: null }); },
+    eq() { return this; },
+    is() { return this; },
+    order() { return this; },
+  });
+  supa = {
+    auth,
+    from() { return chain(); },
+    storage: {
+      from() {
+        return {
+          getPublicUrl() { return { data: { publicUrl: null } }; },
+          async createSignedUrl() { return { data: { signedUrl: "" }, error: null }; },
+          async remove() { return { data: null, error: null }; },
+        };
+      },
+    },
+  };
+}
+
 
 // Helpers per request
 const norm = (p) => (!p ? p : String(p).replace(/^\/+/, "").replace(/\/{2,}/g, "/"));

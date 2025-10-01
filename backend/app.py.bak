@@ -1,6 +1,4 @@
-﻿import os, json, time, asyncio, base64, mimetypes, logging
-if __name__ == "__main__":
-    raise SystemExit("Run with: python -m uvicorn backend.app:app --reload --port 8000")
+import os, json, time, asyncio, base64, mimetypes, logging
 from datetime import datetime as dt, timezone
 from typing import Optional
 
@@ -12,18 +10,20 @@ from starlette.responses import JSONResponse
 import httpx
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from pathlib import Path
-from .services import ocr  # ensure tests can monkeypatch backend.services.ocr
-# Local OCR provider: avoid heavy import (torch) at module import time
-_get_local_ocr_provider = None  # set by local import inside handler when needed
-def _normalize_local_text(t: str) -> str:
-    return (t or "").strip()
-# Lazy-safe PDF flattener (reportlab may be unavailable)
+from services import ocr  # ensure tests can monkeypatch backend.services.ocr
+# Local OCR provider (TrOCR) wiring
 try:
-    from .services.report import flatten_to_pdf as _flatten_to_pdf
+    from ocr.run_ocr import get_provider as _get_local_ocr_provider, normalize as _normalize_local_text
 except Exception:
-    def _flatten_to_pdf(*_args, **_kwargs):
-        return None
+    _get_local_ocr_provider = None  # type: ignore
+    def _normalize_local_text(t: str) -> str:  # type: ignore
+        return (t or "").strip()
+# Lazy-safe PDF flattener (reportlab may be unavailable offline)
+try:
+    from services.report import flatten_to_pdf as _flatten_to_pdf
+except ModuleNotFoundError:
+    def _flatten_to_pdf(summary, overlay):
+        return b"%PDF-1.4\n%mock\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 # --- Guarded imports so tests can run without these packages installed ---
 
@@ -43,8 +43,8 @@ except ModuleNotFoundError:
         ...
 
 # ---- Project config / services (keep your existing imports) ----
-from .config import HF_TOKEN, HF_MODEL_ID, OCR_PROVIDER, REQUIRE_OWNER, summary
-from .services.grader import (
+from config import HF_TOKEN, HF_MODEL_ID, OCR_PROVIDER, REQUIRE_OWNER, summary
+from services.grader import (
     parse_questions,
     generate_autokeys,
     grade,
@@ -56,10 +56,6 @@ from .services.grader import (
 # ---------------------------------------
 # App logger + env bootstrap
 # ---------------------------------------
-_here = Path(__file__).resolve().parent
-# Load env from backend/.env explicitly (and keep process env intact)
-load_dotenv(_here / ".env")
-load_dotenv(_here.parent / ".env", override=False)  # optional parent fallback
 load_dotenv()
 
 logger = logging.getLogger("backend")
@@ -82,26 +78,20 @@ OCR_ERROR   = "error"
 HANDWRITINGOCR_MOCK = os.getenv("HANDWRITINGOCR_MOCK", "1") == "1"
 REQUIRE_OWNER = os.getenv("REQUIRE_OWNER", "1") == "1"
 
-SUPABASE_URL = os.getenv("SUPABASE_URL") or None
-SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or None
-SUPABASE_BUCKET = (
-    os.getenv("SUPABASE_BUCKET")
-    or os.getenv("SUPABASE_STORAGE_BUCKET")
-    or os.getenv("STORAGE_BUCKET")
-    or None
-)
-OCR_PROVIDER = (os.getenv("OCR_PROVIDER") or "mock").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "submissions")
 
 print("[boot] supabase url:", SUPABASE_URL)
-_key_preview = (str(SUPABASE_KEY)[:10] + "…") if SUPABASE_KEY else "<unset>"
+_key_preview = (SUPABASE_SERVICE_ROLE_KEY[:10] + "…") if SUPABASE_SERVICE_ROLE_KEY else "<unset>"
 print("[boot] supabase key preview:", _key_preview)
 
 supabase: Client | None = None
-if create_client and SUPABASE_URL and SUPABASE_KEY:
+if create_client and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     except Exception as e:
-        # In tests/offline CI this is fineâ€”tests will monkeypatch `app.supabase`
+        # In tests/offline CI this is fine—tests will monkeypatch `app.supabase`
         print("[boot] create_client failed (ignored for tests):", repr(e))
         supabase = None
 print("[boot] supabase client:", "ready" if supabase else "NONE")
@@ -115,7 +105,7 @@ def _require_supabase_config():
         raise HTTPException(status_code=503, detail="Supabase client unavailable (tests may patch this)")
 
 print("[boot] supabase url:", SUPABASE_URL)
-_key_preview = (str(SUPABASE_KEY)[:10] + "…") if SUPABASE_KEY else "<unset>"
+_key_preview = (SUPABASE_SERVICE_ROLE_KEY[:10] + "…") if SUPABASE_SERVICE_ROLE_KEY else "<unset>"
 print("[boot] supabase key preview:", _key_preview)
 
 
@@ -125,84 +115,31 @@ class StartOCRBody(BaseModel):
 
  # NOTE: tests will monkeypatch this global. Keep it as a simple module-level var.
 supabase: Client | None = None
-if create_client and SUPABASE_URL and SUPABASE_KEY:
+if create_client and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     except Exception as e:
         print("[boot] create_client failed (ignored for tests):", repr(e))
         supabase = None
 print("[boot] supabase client:", "ready" if supabase else "NONE")
-
-# No-op Supabase stub to avoid crashes when env/client are missing.
-class _NoopSupa:
-    class _NoopResp:
-        def __init__(self):
-            self.data = None
-            self.error = None
-    class _NoopTable:
-        def insert(self, *a, **k): return self
-        def upsert(self, *a, **k): return self
-        def update(self, *a, **k): return self
-        def delete(self, *a, **k): return self
-        def select(self, *a, **k): return self
-        def eq(self, *a, **k): return self
-        def single(self): return self
-        def maybe_single(self): return self
-        def execute(self): return _NoopSupa._NoopResp()
-    class _NoopStorageBucket:
-        def create_signed_url(self, *a, **k): return {"signedURL": None}
-    class _NoopStorage:
-        def from_(self, *a, **k): return _NoopSupa._NoopStorageBucket()
-    def table(self, *_a, **_k): return _NoopSupa._NoopTable()
-    @property
-    def storage(self): return _NoopSupa._NoopStorage()
-
-if supabase is None:
-    try:
-        logger.warning("[boot] Supabase disabled; using no-op client")
-    except Exception:
-        print("[boot] Supabase disabled; using no-op client")
-    supabase = _NoopSupa()
 app = FastAPI()
 from fastapi.middleware.cors import CORSMiddleware
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 ALT_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173"]
-DEV_MODE = os.getenv("DEV_MODE", "0") not in ("0", "", "false", "False")
+DEV_MODE = os.getenv("DEV_MODE", "0") == "1"
 _OCR_DEV: dict[str, dict] = {}
-# Explicit CORS allowlist for Vite dev server
-_allowed = ["http://localhost:5173", "http://127.0.0.1:5173"]
+if DEV_MODE:
+    _allowed = ["*"]
+else:
+    _allowed = [FRONTEND_ORIGIN, *ALT_ORIGINS]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,
-    max_age=600,
 )
 logger.info("[boot] CORS installed first")
-
-# Generic OPTIONS handler for safety (CORS preflight)
-@app.options("/api/{path:path}")
-async def options_any(path: str) -> Response:
-    return Response(status_code=204)
-
-# Boot summary line for quick verification
-try:
-    logger.info(
-        "[boot] env | SUPABASE_URL=%s KEY=%s BUCKET=%s | OCR_PROVIDER=%s | DEV_MODE=%s",
-        bool(SUPABASE_URL), bool(SUPABASE_KEY), bool(SUPABASE_BUCKET), OCR_PROVIDER, DEV_MODE,
-    )
-except Exception:
-    pass
-
-# Explicit preflight routes so nothing else intercepts
-@app.options("/api/ocr/start")
-def _preflight_start() -> Response:
-    return Response(status_code=204)
-
-@app.options("/api/ocr/status/{_upload_id}")
-def _preflight_status(_upload_id: str) -> Response:
-    return Response(status_code=204)
 
 logger.info("[boot] version=%s", "0.1.0")
 logger.info("[boot] SUPABASE_URL=%s", SUPABASE_URL)
@@ -217,7 +154,7 @@ logger.info("[boot] DEV_MODE=%s", "1" if DEV_MODE else "0")
 
 # Warn if Supabase env incomplete; do not crash at startup
 _missing_url = not bool(SUPABASE_URL)
-_missing_key = not bool(SUPABASE_KEY)
+_missing_key = not bool(SUPABASE_SERVICE_ROLE_KEY)
 _missing_bucket = not bool(SUPABASE_BUCKET)
 if _missing_url or _missing_key or _missing_bucket:
     logger.warning(
@@ -232,7 +169,7 @@ def _utc_iso():
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 BOOT_VERSION = "1.0.3"
-# â”€â”€ Health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 @app.get("/api/health")
 def health():
@@ -253,43 +190,6 @@ def _resp_text_len(row: dict, final_payload: dict | None = None) -> int:
         or ""
     )
     return len((t or "").strip())
-
-
-# Dev-only local resolver for uploads when Supabase is disabled
-def resolve_upload_path(upload_id: str, owner_id: str | None = None) -> str | None:
-    """
-    Dev fallback: if Supabase storage is unavailable, try to find the uploaded file on local disk.
-    Strategy:
-      - Look under env var LOCAL_SUBMISSIONS_DIR (if set), optionally within owner_id subfolder.
-      - Search for common image/pdf extensions whose filename contains the upload_id.
-    Returns absolute file path or None.
-    """
-    try:
-        base = os.getenv("LOCAL_SUBMISSIONS_DIR") or os.getenv("DEV_UPLOADS_DIR")
-        if not base:
-            return None
-        base = os.path.abspath(base)
-        if not os.path.isdir(base):
-            return None
-        exts = (".png", ".jpg", ".jpeg", ".pdf", ".webp")
-        candidates = []
-        search_roots = [base]
-        if owner_id:
-            p = os.path.join(base, str(owner_id))
-            if os.path.isdir(p):
-                search_roots.insert(0, p)
-        for root in search_roots:
-            for dirpath, _dirnames, filenames in os.walk(root):
-                for fn in filenames:
-                    low = fn.lower()
-                    if any(low.endswith(ext) for ext in exts) and (upload_id in fn):
-                        candidates.append(os.path.join(dirpath, fn))
-        if candidates:
-            # Prefer owner-specific match if present, else first
-            return os.path.abspath(sorted(candidates, key=lambda p: (0 if owner_id and os.path.sep + str(owner_id) + os.path.sep in p else 1, len(p)))[0])
-        return None
-    except Exception:
-        return None
 
 # Debug config probe (no secrets)
 @app.get("/api/debug/config")
@@ -326,7 +226,6 @@ async def ocr_start(
                             "ocr_status": "done",
                             "ocr_text": text,
                             "ocr_updated_at": datetime.now(timezone.utc).isoformat(),
-                            "ocr_completed_at": datetime.now(timezone.utc).isoformat(),
                         }
                     ).eq("id", str(body.upload_id)).execute()
             except Exception:
@@ -343,25 +242,21 @@ async def ocr_start(
                 {"ocr_text": text, "extracted_text": text},
             )
             print("[ocr] success path: legacy/mock/hf")
-            try:
-                logger.info("ocr_done upload_id=%s text_len=%s latency_ms=%s", str(body.upload_id), _text_len, 0)
-            except Exception:
-                pass
-            return {"status": "done", "upload_id": str(body.upload_id), "text_len": _text_len, "latency_ms": 0}
+            return {
+                "ok": True,
+                "status": "done",
+                "upload_id": str(body.upload_id),
+                "ocr_status": "done",
+                "text": text,
+                "text_len": _text_len,
+            }
         except Exception:
             # Even if logging fails, keep mock path successful
             logger.exception("ocr_start failed", extra={"upload_id": str(getattr(body, 'upload_id', ''))})
-            return {"status": "done", "upload_id": str(body.upload_id), "text_len": len("mock extracted text"), "latency_ms": 0}
+            return {"ok": True, "status": "done", "text": "mock extracted text", "text_len": len("mock extracted text")}
     try:
         upload_id = str(body.upload_id)
         caller_id = x_owner_id or x_user_id
-        # Diagnostics at start
-        try:
-            _prov = os.getenv("OCR_PROVIDER", "trocr_local")
-            _model = os.getenv("OCR_MODEL", "microsoft/trocr-base-handwritten")
-            logger.info("ocr_start upload_id=%s owner=%s provider=%s model=%s", upload_id, (caller_id or ""), _prov, _model)
-        except Exception:
-            pass
 
         # Fetch upload row for authz + path
         resp0 = (
@@ -373,73 +268,10 @@ async def ocr_start(
         )
         row = resp0.data
         if not row:
-            # Dev fallback: attempt to resolve local path without Supabase
-            if DEV_MODE:
-                local_path = resolve_upload_path(upload_id, caller_id)
-                if local_path and os.path.isfile(local_path):
-                    # Run trocr_local provider against local file without signed URL
-                    try:
-                        try:
-                            from .ocr.run_ocr import (
-                                get_provider as __get_local_ocr_provider,
-                                normalize as __normalize_local_text,
-                                ProviderUnavailable as __ProviderUnavailable,
-                            )
-                        except ImportError as e:
-                            logger.exception("import_error: %s", e)
-                            return JSONResponse(status_code=503, content={"detail": "ocr_provider_unavailable", "message": "torch/hf missing"})
-                        except Exception as e:
-                            logger.exception("provider_import_failed: %s", e)
-                            return JSONResponse(status_code=503, content={"detail": "ocr_provider_unavailable", **({"message": str(e)} if DEV_MODE else {})})
-                        try:
-                            prov_name, prov_model, provider = __get_local_ocr_provider()
-                        except __ProviderUnavailable as e:
-                            logger.exception("provider_unavailable: %s", e)
-                            return JSONResponse(status_code=503, content={"detail": "ocr_provider_unavailable", **({"message": str(e)} if DEV_MODE else {"message": "unavailable"})})
-                        # Diagnostics
-                        try:
-                            _prov = os.getenv("OCR_PROVIDER", "trocr_local")
-                            _model = os.getenv("OCR_MODEL", prov_model)
-                            logger.info("ocr_start provider=%s model=%s upload_id=%s", _prov, _model, upload_id)
-                        except Exception:
-                            pass
-                        with open(local_path, "rb") as fh:
-                            blob = fh.read()
-                        filename = os.path.basename(local_path)
-                        text, meta = provider.run(
-                            file_bytes=blob,
-                            filename=filename,
-                            model_override=(body.model or None),
-                        )
-                        text = __normalize_local_text(text)
-                        text_len = len(text.strip())
-                        final_payload = {
-                            "status": "OCR_DONE",
-                            "ocr_status": OCR_DONE,
-                            "extracted_text": text,
-                            "ocr_text": text,
-                            "ocr_completed_at": _utc_iso(),
-                            "ocr_error": None,
-                        }
-                        _safe_update_upload(upload_id, final_payload)
-                        try:
-                            logger.info("ocr_done upload_id=%s text_len=%s latency_ms=%s", upload_id, text_len, None)
-                        except Exception:
-                            pass
-                        return {
-                            "status": "done",
-                            "upload_id": upload_id,
-                            "text_len": text_len,
-                            "latency_ms": None,
-                        }
-                    except Exception as e:
-                        logger.exception("/api/ocr/start local file path failed")
-                        return JSONResponse(status_code=500, content={"detail": "internal_error", **({"message": str(e)} if DEV_MODE else {})})
-            # Otherwise, not found
-            return JSONResponse(status_code=404, content={"detail": "not_found"})
+            raise HTTPException(status_code=404, detail="Upload not found")
         # Allow dev without owner header; enforce only in non-dev
         if (not DEV_MODE) and REQUIRE_OWNER and caller_id and str(row.get("owner_id")) != str(caller_id):
-            return JSONResponse(status_code=404, content={"detail": "not_found"})
+            raise HTTPException(status_code=403, detail="Forbidden")
 
         # Mark running
         try:
@@ -480,11 +312,14 @@ async def ocr_start(
                 _safe_update_upload(upload_id, payload)
                 _text_len = _resp_text_len(row, payload)
                 print("[ocr] success path: legacy/mock/hf")
-                try:
-                    logger.info("ocr_done upload_id=%s text_len=%s latency_ms=%s", upload_id, _text_len, 0)
-                except Exception:
-                    pass
-                return {"status": "done", "upload_id": upload_id, "text_len": _text_len, "latency_ms": 0}
+                return {
+                    "ok": True,
+                    "status": OCR_DONE,
+                    "upload_id": upload_id,
+                    "ocr_status": OCR_DONE,
+                    "text": text_resp,
+                    "text_len": _text_len,
+                }
             except Exception:
                 logger.exception("/api/ocr/start mock path failed")
                 raise HTTPException(status_code=500, detail="mock_update_failed")
@@ -494,65 +329,18 @@ async def ocr_start(
             try:
                 storage_path = row.get("storage_path")
                 if not storage_path:
-                    return JSONResponse(status_code=400, content={"detail": "bad_request", "message": "Missing storage_path"})
-                # Try Supabase signed URL; if storage disabled in dev, fall back to local file resolution
-                blob = None
-                filename = (storage_path or "").split("/")[-1]
-                try:
-                    signed = _get_signed_url(storage_path)
-                    blob = await _download_bytes(signed)
-                except Exception:
-                    # Dev fallback to local disk
-                    base = os.getenv("LOCAL_SUBMISSIONS_DIR") or os.getenv("DEV_UPLOADS_DIR")
-                    key = (storage_path or "").lstrip("/")
-                    if base:
-                        local_candidate = os.path.join(os.path.abspath(base), key.split("/", 1)[-1])
-                        if os.path.isfile(local_candidate):
-                            with open(local_candidate, "rb") as fh:
-                                blob = fh.read()
-                            filename = os.path.basename(local_candidate)
-                    if blob is None:
-                        # Last try: generic search by upload_id
-                        local_any = resolve_upload_path(upload_id, caller_id)
-                        if local_any and os.path.isfile(local_any):
-                            with open(local_any, "rb") as fh:
-                                blob = fh.read()
-                            filename = os.path.basename(local_any)
-                    if blob is None:
-                        return JSONResponse(status_code=404, content={"detail": "not_found", **({"message": "file not found locally"} if DEV_MODE else {})})
+                    raise HTTPException(400, "Missing storage_path")
+                signed = _get_signed_url(storage_path)
+                blob = await _download_bytes(signed)
                 # Derive filename for type detection
-                filename = filename or (storage_path or "").split("/")[-1]
-                # Lazy import heavy local OCR provider right before use
-                try:
-                    from .ocr.run_ocr import (
-                        get_provider as __get_local_ocr_provider,
-                        normalize as __normalize_local_text,
-                        ProviderUnavailable as __ProviderUnavailable,
-                    )
-                except ImportError as e:
-                    logger.exception("import_error: %s", e)
-                    return JSONResponse(status_code=503, content={"detail": "ocr_provider_unavailable", "message": ("torch/hf missing" if DEV_MODE else "unavailable")})
-                except Exception as e:
-                    logger.exception("provider_import_failed: %s", e)
-                    return JSONResponse(status_code=503, content={"detail": "ocr_provider_unavailable", **({"message": str(e)} if DEV_MODE else {})})
-                try:
-                    prov_name, prov_model, provider = __get_local_ocr_provider()
-                except __ProviderUnavailable as e:
-                    logger.exception("provider_unavailable: %s", e)
-                    return JSONResponse(status_code=503, content={"detail": "ocr_provider_unavailable", **({"message": str(e)} if DEV_MODE else {"message": "unavailable"})})
-                # Diagnostics before calling provider
-                try:
-                    _prov = os.getenv("OCR_PROVIDER", "trocr_local")
-                    _model = os.getenv("OCR_MODEL", prov_model)
-                    logger.info("ocr_start provider=%s model=%s upload_id=%s", _prov, _model, upload_id)
-                except Exception:
-                    pass
+                filename = (storage_path or "").split("/")[-1]
+                prov_name, prov_model, provider = _get_local_ocr_provider()
                 text, meta = provider.run(
                     file_bytes=blob,
                     filename=filename,
                     model_override=(body.model or None),
                 )
-                text = __normalize_local_text(text)
+                text = _normalize_local_text(text)
                 text_len = len(text.strip())
 
                 final_payload = {
@@ -568,10 +356,6 @@ async def ocr_start(
                 except Exception:
                     pass
                 _safe_update_upload(upload_id, final_payload)
-                try:
-                    logger.info("ocr_done upload_id=%s text_len=%s latency_ms=%s", upload_id, text_len, None)
-                except Exception:
-                    pass
 
                 # Log detailed run into ocr_runs (best-effort)
                 try:
@@ -592,10 +376,14 @@ async def ocr_start(
                 text_len = _resp_text_len(row, final_payload)
                 print("[ocr] success path: trocr_local")
                 return {
+                    "ok": True,
                     "status": "done",
                     "upload_id": upload_id,
-                    "text_len": text_len,
+                    "ocr_status": "done",
+                    "provider": "trocr_local",
+                    "model": meta.get("model"),
                     "latency_ms": meta.get("latency_ms"),
+                    "text_len": text_len,
                 }
             except Exception as e:
                 # Mark error and record run
@@ -628,8 +416,18 @@ async def ocr_start(
                     pass
                 _safe_update_upload(upload_id, err_payload)
                 return JSONResponse(
-                    status_code=400,
-                    content={"detail": "bad_request", "message": err_msg},
+                    status_code=502,
+                    content={
+                        "ok": False,
+                        "status": "error",
+                        "upload_id": upload_id,
+                        "ocr_status": "failed",
+                        "provider": "trocr_local",
+                        "model": meta.get("model") if 'meta' in locals() else None,
+                        "latency_ms": meta.get("latency_ms") if 'meta' in locals() else None,
+                        "text_len": 0,
+                        "ocr_error": err_msg,
+                    },
                 )
 
         # Real provider path with simple retry on 5xx/429
@@ -640,13 +438,6 @@ async def ocr_start(
                 raise HTTPException(400, "Missing storage_path")
             signed = _get_signed_url(storage_path)
 
-            # Diagnostics before calling remote provider
-            try:
-                _prov = os.getenv("OCR_PROVIDER", "mock")
-                _model = os.getenv("OCR_MODEL", "microsoft/trocr-base-handwritten")
-                logger.info("ocr_start provider=%s model=%s upload_id=%s", _prov, _model, upload_id)
-            except Exception:
-                pass
             max_attempts = 3
             data = None
             for attempt in range(max_attempts):
@@ -692,11 +483,14 @@ async def ocr_start(
                 pass
             _text_len = _resp_text_len(row, final_payload)
             print("[ocr] success path: legacy/mock/hf")
-            try:
-                logger.info("ocr_done upload_id=%s text_len=%s latency_ms=%s", upload_id, _text_len, None)
-            except Exception:
-                pass
-            return {"status": "done", "upload_id": upload_id, "text_len": _text_len, "latency_ms": None}
+            return {
+                "ok": True,
+                "status": OCR_DONE,
+                "upload_id": upload_id,
+                "ocr_status": OCR_DONE,
+                "text": text,
+                "text_len": _text_len,
+            }
         except httpx.ReadTimeout as te:
             # Log and mark error
             try:
@@ -714,7 +508,7 @@ async def ocr_start(
             except Exception:
                 pass
             _safe_update_upload(upload_id, err_payload)
-            return JSONResponse(status_code=400, content={"detail": "bad_request", "message": "ocr_timeout"})
+            raise HTTPException(status_code=500, detail="ocr_timeout")
         except httpx.HTTPStatusError as he:
             code = getattr(he.response, "status_code", 502)
             try:
@@ -732,18 +526,12 @@ async def ocr_start(
             except Exception:
                 pass
             _safe_update_upload(upload_id, err_payload2)
-            return JSONResponse(status_code=400, content={"detail": "bad_request", "message": "ocr_failed"})
-    except HTTPException as he:
-        # Map common expected errors to 400
-        if he.status_code in (400, 403, 404):
-            return JSONResponse(status_code=400, content={"detail": "bad_request", "message": str(getattr(he, 'detail', 'bad_request'))})
-        logger.exception("/api/ocr/start unexpected http error")
-        msg = str(getattr(he, 'detail', '')) if DEV_MODE else None
-        return JSONResponse(status_code=500, content={"detail": "internal_error", **({"message": msg} if msg else {})})
-    except Exception as e:
+            raise HTTPException(status_code=502 if code >= 500 else code, detail="ocr_failed")
+    except HTTPException:
+        raise
+    except Exception:
         logger.exception("/api/ocr/start unexpected error")
-        msg = str(e) if DEV_MODE else None
-        return JSONResponse(status_code=500, content={"detail": "internal_error", **({"message": msg} if msg else {})})
+        raise HTTPException(status_code=500, detail="internal_error")
 
 def _ocr_status_common(upload_id: str, owner_id: Optional[str]):
     # Dev in-memory fast path
@@ -777,57 +565,13 @@ def ocr_status_path(
     x_owner_id: Optional[str] = Header(None),
     x_user_id: Optional[str] = Header(None),
 ):
-    try:
-        owner = x_owner_id or x_user_id
-        # Dev in-memory path
-        if DEV_MODE and upload_id in _OCR_DEV:
-            d = _OCR_DEV[upload_id]
-            st = str(d.get("status") or "pending").lower()
-            if st == "running":
-                st = "processing"
-            if st == "error":
-                st = "failed"
-            return {"status": st, "text_len": len((d.get("text") or "").strip())}
-
-        row = _safe_select_status(str(upload_id))
-        if not row:
-            return JSONResponse(status_code=404, content={"detail": "not_found"})
-
-        # Owner check (non-dev only) → hide existence behind 404
-        if (not DEV_MODE) and REQUIRE_OWNER and owner and str(row.get("owner_id")) != str(owner):
-            return JSONResponse(status_code=404, content={"detail": "not_found"})
-
-        # Compute status per contract
-        has_err = bool(row.get("ocr_error"))
-        text = (row.get("extracted_text") or row.get("ocr_text") or "").strip()
-        text_len = len(text)
-        has_completed = bool(row.get("ocr_completed_at")) or text_len > 0
-        has_started = bool(row.get("ocr_started_at"))
-
-        if has_err:
-            st = "failed"
-        elif has_completed:
-            st = "done"
-        elif has_started:
-            st = "processing"
-        else:
-            st = "pending"
-
-        payload = {"status": st, "text_len": text_len if text_len else 0}
-        if st == "failed":
-            err = row.get("ocr_error")
-            if err:
-                payload["error"] = err
-        return payload
-    except Exception:
-        # Never return 500 for status; treat as not found to keep UI resilient
-        return JSONResponse(status_code=404, content={"detail": "not_found"})
+    return _ocr_status_common(upload_id, x_owner_id or x_user_id)
     
 @app.get("/api/config")
 def config_probe():
     return summary(safe=True)
 
-# â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def _owner_matches(row: dict, caller_id: str | None) -> bool:
     if not caller_id or not row:
         return False
@@ -884,7 +628,7 @@ def _safe_select_status(uid: str):
         r = (
             supabase.table("uploads")
             .select(
-                "id,owner_id,status,extracted_text,ocr_status,ocr_error,ocr_started_at,ocr_completed_at,ocr_updated_at"
+                "id,owner_id,status,extracted_text,ocr_status,ocr_started_at,ocr_completed_at,ocr_updated_at"
             )
             .eq("id", uid)
             .execute()
@@ -1081,7 +825,7 @@ def _parse_text(api_json: dict) -> tuple[str, dict]:
             text = "\n".join(p.get("text", "") for p in api_json["pages"])
     return text.strip(), api_json
 
-# â”€â”€ API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── API ────────────────────────────────────────────────────────────────────────
 
 # (Removed duplicate OCR endpoints; see hardened implementations above)
 
@@ -1360,7 +1104,3 @@ async def delete_upload(upload_id: str):
         raise HTTPException(status_code=400, detail=f"DB delete failed: {getattr(e, 'message', str(e))}")
 
     return {"ok": True}
-
-
-
-

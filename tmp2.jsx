@@ -160,8 +160,8 @@ export default function FileRow({ file }) {
 
 function StatusChip({ value }) {
   const colors = {
-    pending:  { bg:"#f3f4f6", fg:"#374151", label:"pending" },
-    processing:{ bg:"#fef3c7", fg:"#92400e", label:"processing" },
+    pending:  { bg:"#fef3c7", fg:"#92400e", label:"pending" },
+    processing:{ bg:"#e0e7ff", fg:"#3730a3", label:"processing" },
     done:     { bg:"#dcfce7", fg:"#065f46", label:"done" },
     failed:   { bg:"#fee2e2", fg:"#991b1b", label:"failed" },
   }[value] || { bg:"#eef2ff", fg:"#334155", label:value };
@@ -175,4 +175,5 @@ function StatusChip({ value }) {
     </span>
   );
 }
+
 

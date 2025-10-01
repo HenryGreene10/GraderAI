@@ -5,8 +5,7 @@
   useMemo,
   useRef,
 } from "react";
-import { supa } from "../lib/supa";
-import { previewUrl } from "../lib/supa";
+import supa, { previewUrl } from "../lib/supa";
 
 /**
  * UploadPanel â€” UI-only (uses onUpload callback for real work)

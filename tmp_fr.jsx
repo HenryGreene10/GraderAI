@@ -4,11 +4,7 @@ import { startOCR, pollOCR } from "../lib/ocr";
 import { API_BASE } from "../lib/apiBase";
 
 export default function FileRow({ file }) {
-  const [row, setRow] = useState(() => ({
-    ...file,
-    ocr_status: file.ocr_status || file.status || "pending",
-    text_len: file.text_len || 0,
-  }));
+  const [status, setStatus] = useState(file.status || "pending");
   const [text, setText] = useState(file.extracted_text || "");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -16,19 +12,19 @@ export default function FileRow({ file }) {
 
   // auto-start once for "pending"
   useEffect(() => {
-    if (row.ocr_status === "pending" && !startedRef.current) {
+    if (status === "pending" && !startedRef.current) {
       startedRef.current = true;
       (async () => {
         try {
           const resp = await startOCR(file.id);
           // If backend already completes OCR synchronously, reflect immediately
-          if (resp && resp.status === "done") {
-            setRow((r) => ({ ...r, ocr_status: "done", text_len: Number(resp.text_len || 0) }));
+          if (resp && (resp.status === "done" || resp.ocr_status === "done")) {
+            setStatus("done");
             if (resp.text) setText(resp.text);
             showToast("OCR complete");
             try { console.log("SMOKE_OK", { api: API_BASE, upload: file.id }); } catch {}
           } else {
-            setRow((r) => ({ ...r, ocr_status: "processing" }));
+            setStatus("processing");
           }
         } catch (e) {
           let msg = e?.message || "Failed to start";
@@ -40,18 +36,18 @@ export default function FileRow({ file }) {
             msg = `OCR failed (${status}): ${detail}`;
           } catch {}
           setErr(msg);
-          setRow((r) => ({ ...r, ocr_status: "failed" }));
+          setStatus("failed");
           showToast(msg);
         }
       })();
     }
-  }, [row.ocr_status, file.id]);
+  }, [status, file.id]);
 
   // poll until done/failed
   useEffect(() => {
-    if (row.ocr_status === "processing") {
+    if (status === "processing" || status === "pending") {
       const stop = pollOCR(file.id, (s) => {
-        setRow((r) => ({ ...r, ocr_status: s.status, text_len: Number(s.text_len || r.text_len || 0) }));
+        setStatus(s.status);
         if (s.extracted_text) setText(s.extracted_text);
         if (s.error) setErr(s.error);
         if (s.status === "done") {
@@ -61,11 +57,11 @@ export default function FileRow({ file }) {
       }, 2000);
       return stop;
     }
-  }, [row.ocr_status, file.id]);
+  }, [status, file.id]);
 
   const retry = async () => {
     setErr("");
-    setRow((r) => ({ ...r, ocr_status: "pending" }));
+    setStatus("pending");
     startedRef.current = false;
   };
 
@@ -75,12 +71,12 @@ export default function FileRow({ file }) {
       setErr("");
       const resp = await startOCR(file.id);
       if (resp && (resp.status === "done" || resp.ocr_status === "done")) {
-        setRow((r) => ({ ...r, ocr_status: "done", text_len: Number(resp.text_len || 0) }));
+        setStatus("done");
         if (resp.text) setText(resp.text);
         showToast("OCR complete");
         try { console.log("SMOKE_OK", { api: API_BASE, upload: file.id }); } catch {}
       } else {
-        setRow((r) => ({ ...r, ocr_status: "processing" }));
+        setStatus("processing");
       }
     } catch (e) {
       let msg = e?.message || "Failed to start";
@@ -92,7 +88,7 @@ export default function FileRow({ file }) {
         msg = `OCR failed (${status}): ${detail}`;
       } catch {}
       setErr(msg);
-      setRow((r) => ({ ...r, ocr_status: "failed" }));
+      setStatus("failed");
       showToast(msg);
       console.error(e);
     } finally {
@@ -125,10 +121,10 @@ export default function FileRow({ file }) {
           {toast}
         </div>
       )}
-      {row.signedUrl ? (
+      {file.signedUrl ? (
         <img
-          src={row.signedUrl}
-          alt={row.name}
+          src={file.signedUrl}
+          alt={file.name}
           style={{ maxHeight: 220, width: "auto", display: "block", objectFit: "cover", borderRadius: 8 }}
           loading="lazy"
         />
@@ -137,9 +133,9 @@ export default function FileRow({ file }) {
       )}
 
       <div style={{ flex:1 }}>
-        <div style={{ fontWeight: 600 }}>{row.name}</div>
+        <div style={{ fontWeight: 600 }}>{file.name}</div>
         <div style={{ fontSize: 12, color: "#667085" }}>
-          <StatusChip value={row.ocr_status} /> {err && <span style={{ color:"#b42318" }}> Â· {err}</span>}
+          <StatusChip value={status} /> {err && <span style={{ color:"#b42318" }}> Â· {err}</span>}
         </div>
 
         {text && (
@@ -148,7 +144,7 @@ export default function FileRow({ file }) {
           </div>
         )}
 
-        {(row.ocr_status === "error" || row.ocr_status === "ocr_error" || row.ocr_status === "failed") && !busy && (
+        {(status === "error" || status === "ocr_error" || status === "failed") && !busy && (
           <button onClick={handleRetry} className="btn btn-ghost" aria-label="Retry">
             Retry
           </button>
@@ -160,8 +156,8 @@ export default function FileRow({ file }) {
 
 function StatusChip({ value }) {
   const colors = {
-    pending:  { bg:"#f3f4f6", fg:"#374151", label:"pending" },
-    processing:{ bg:"#fef3c7", fg:"#92400e", label:"processing" },
+    pending:  { bg:"#fef3c7", fg:"#92400e", label:"pending" },
+    processing:{ bg:"#e0e7ff", fg:"#3730a3", label:"processing" },
     done:     { bg:"#dcfce7", fg:"#065f46", label:"done" },
     failed:   { bg:"#fee2e2", fg:"#991b1b", label:"failed" },
   }[value] || { bg:"#eef2ff", fg:"#334155", label:value };
