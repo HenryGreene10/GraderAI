@@ -13,6 +13,11 @@ import httpx
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pathlib import Path
+from io import BytesIO
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 from .services import ocr  # ensure tests can monkeypatch backend.services.ocr
 # Local OCR provider: avoid heavy import (torch) at module import time
 _get_local_ocr_provider = None  # set by local import inside handler when needed
@@ -212,12 +217,41 @@ logger.info(
     (os.getenv("OCR_PROVIDER", "mock") or "mock"),
     bool(os.getenv("HF_TOKEN")),
 )
+if (os.getenv("OCR_PROVIDER", "mock").lower() == "trocr_local") and (Image is None):
+    try:
+        logger.error("Pillow not installed; trocr_local requires pillow. pip install pillow")
+    except Exception:
+        pass
 logger.info("[boot] FRONTEND_ORIGIN=%s", FRONTEND_ORIGIN)
 logger.info("[boot] DEV_MODE=%s", "1" if DEV_MODE else "0")
 
-# Warn if Supabase env incomplete; do not crash at startup
+# Log the registered OCR read route for sanity
+try:
+    logger.info("[boot] GET /api/uploads/{id}/ocr ready (SR read)")
+except Exception:
+    pass
+
+# Supabase env + clients (top-level)
+# Explicit env loads as requested
+try:
+    load_dotenv("backend/.env")
+    load_dotenv(".env", override=False)
+except Exception:
+    pass
+
+# Normalize keys: treat SUPABASE_KEY as service-role, keep anon separate
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SR_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_BUCKET = (
+    os.getenv("SUPABASE_BUCKET")
+    or os.getenv("SUPABASE_STORAGE_BUCKET")
+    or os.getenv("STORAGE_BUCKET")
+    or None
+)
+
 _missing_url = not bool(SUPABASE_URL)
-_missing_key = not bool(SUPABASE_KEY)
+_missing_key = not bool(ANON_KEY)
 _missing_bucket = not bool(SUPABASE_BUCKET)
 if _missing_url or _missing_key or _missing_bucket:
     logger.warning(
@@ -226,6 +260,61 @@ if _missing_url or _missing_key or _missing_bucket:
         _missing_key,
         _missing_bucket,
     )
+
+supabase_sr = (
+    create_client(SUPABASE_URL, SR_KEY)
+    if (create_client and SUPABASE_URL and SR_KEY)
+    else None
+)
+supabase = (
+    create_client(SUPABASE_URL, ANON_KEY)
+    if (create_client and SUPABASE_URL and ANON_KEY)
+    else None
+)
+try:
+    logger.info("[boot] supabase_sr active=%s", bool(supabase_sr))
+except Exception:
+    pass
+if supabase_sr is None:
+    try:
+        logger.warning("Missing SUPABASE_SERVICE_ROLE_KEY; SR client disabled. RLS reads/writes may fail.")
+    except Exception:
+        pass
+
+# --- Supabase write helpers using service-role client ---
+def _sb_error_snapshot(resp):
+    try:
+        return {
+            "status_code": getattr(resp, "status_code", None),
+            "data": getattr(resp, "data", None),
+            "error": getattr(resp, "error", None),
+        }
+    except Exception:
+        return {"snapshot": str(resp)}
+
+def _update_upload_sr(uid: str, payload: dict):
+    if supabase_sr is None:
+        raise HTTPException(status_code=500, detail="service-role client unavailable")
+    try:
+        r = supabase_sr.table("uploads").update(payload).eq("id", uid).execute()
+    except Exception as e:
+        try:
+            logger.error("supabase.update uploads exception: %s", e)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="OCR persist failed (update exception)")
+    rows = getattr(r, "data", None)
+    if not rows:
+        try:
+            logger.error("supabase.update uploads 0 rows", extra=_sb_error_snapshot(r))
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="OCR persist failed (RLS?)")
+    return r
+
+# Override safe updater to route writes via service-role
+def _safe_update_upload(uid: str, payload: dict):
+    return _update_upload_sr(uid, payload)
 
 def _utc_iso():
     import datetime as dt
@@ -253,6 +342,23 @@ def _resp_text_len(row: dict, final_payload: dict | None = None) -> int:
         or ""
     )
     return len((t or "").strip())
+
+
+# --- Storage download helper (SR-auth) ---
+async def _download_storage_bytes(storage_path: str) -> bytes:
+    """
+    Download raw bytes from Supabase Storage via SR key.
+    storage_path is the 'path' saved in uploads.storage_path (no leading slash).
+    """
+    if not (SUPABASE_URL and supabase_sr and SUPABASE_BUCKET and storage_path):
+        raise RuntimeError("storage download precondition failed")
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{storage_path}"
+    headers = {"Authorization": f"Bearer {SR_KEY}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers=headers)
+        if r.status_code == 200:
+            return r.content
+        raise HTTPException(status_code=404, detail=f"file not found in storage ({r.status_code})")
 
 
 # Dev-only local resolver for uploads when Supabase is disabled
@@ -302,6 +408,46 @@ def debug_config():
         "supabase_ready": bool(supabase),
     }
 
+def _bytes_to_pil(b: bytes):
+    if not Image:
+        raise RuntimeError("Pillow (PIL) is not installed; required for trocr_local.")
+    return Image.open(BytesIO(b)).convert("RGB")
+
+def _run_local_provider(provider, blob: bytes, storage_path: str, model_name: str | None):
+    """
+    Try several provider.run signatures:
+      1) file_bytes=..., filename=..., model_override=...
+      2) image_bytes=..., model_override=...
+      3) image=..., model_override=...
+      4) positional blob, model_override=...
+    Return (text, meta).
+    """
+    fname = os.path.basename(storage_path) or "upload.bin"
+
+    # 1) Preferred: file_bytes + filename
+    try:
+        return provider.run(file_bytes=blob, filename=fname, model_override=model_name)
+    except TypeError:
+        pass
+
+    # 2) Legacy: image_bytes
+    try:
+        return provider.run(image_bytes=blob, model_override=model_name)
+    except TypeError:
+        pass
+
+    # 3) Legacy: image
+    try:
+        return provider.run(image=blob, model_override=model_name)
+    except TypeError:
+        pass
+
+    # 4) Positional blob
+    try:
+        return provider.run(blob, model_override=model_name)  # type: ignore[arg-type]
+    except TypeError as e:
+        raise
+
 @app.post("/api/ocr/start")
 async def ocr_start(
     body: StartOCRBody,
@@ -320,15 +466,18 @@ async def ocr_start(
             # Best-effort DB update (ignored if missing/unavailable)
             try:
                 if supabase:
-                    supabase.table("uploads").update(
+                    _update_upload_sr(
+                        str(body.upload_id),
                         {
-                            "status": "OCR_DONE",
-                            "ocr_status": "done",
+                            "extracted_text": text,
                             "ocr_text": text,
-                            "ocr_updated_at": datetime.now(timezone.utc).isoformat(),
-                            "ocr_completed_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                    ).eq("id", str(body.upload_id)).execute()
+                            "ocr_meta": {},
+                            "ocr_status": OCR_DONE,
+                            "ocr_completed_at": _utc_iso(),
+                            "ocr_updated_at": _utc_iso(),
+                            "ocr_error": None,
+                        },
+                    )
             except Exception:
                 pass
             # Always reflect in-memory store
@@ -359,84 +508,126 @@ async def ocr_start(
         try:
             _prov = os.getenv("OCR_PROVIDER", "trocr_local")
             _model = os.getenv("OCR_MODEL", "microsoft/trocr-base-handwritten")
-            logger.info("ocr_start upload_id=%s owner=%s provider=%s model=%s", upload_id, (caller_id or ""), _prov, _model)
+            logger.info("ocr_start upload_id=%s owner=%s provider=%s model=%s handwritten", upload_id, (caller_id or ""), _prov, _model)
         except Exception:
             pass
 
-        # Fetch upload row for authz + path
-        resp0 = (
-            supabase.table("uploads")
-            .select("id, owner_id, storage_path, status, extracted_text")
-            .eq("id", upload_id)
-            .maybe_single()
-            .execute()
-        )
-        row = resp0.data
-        if not row:
-            # Dev fallback: attempt to resolve local path without Supabase
-            if DEV_MODE:
-                local_path = resolve_upload_path(upload_id, caller_id)
-                if local_path and os.path.isfile(local_path):
-                    # Run trocr_local provider against local file without signed URL
-                    try:
-                        try:
-                            from .ocr.run_ocr import (
-                                get_provider as __get_local_ocr_provider,
-                                normalize as __normalize_local_text,
-                                ProviderUnavailable as __ProviderUnavailable,
-                            )
-                        except ImportError as e:
-                            logger.exception("import_error: %s", e)
-                            return JSONResponse(status_code=503, content={"detail": "ocr_provider_unavailable", "message": "torch/hf missing"})
-                        except Exception as e:
-                            logger.exception("provider_import_failed: %s", e)
-                            return JSONResponse(status_code=503, content={"detail": "ocr_provider_unavailable", **({"message": str(e)} if DEV_MODE else {})})
-                        try:
-                            prov_name, prov_model, provider = __get_local_ocr_provider()
-                        except __ProviderUnavailable as e:
-                            logger.exception("provider_unavailable: %s", e)
-                            return JSONResponse(status_code=503, content={"detail": "ocr_provider_unavailable", **({"message": str(e)} if DEV_MODE else {"message": "unavailable"})})
-                        # Diagnostics
-                        try:
-                            _prov = os.getenv("OCR_PROVIDER", "trocr_local")
-                            _model = os.getenv("OCR_MODEL", prov_model)
-                            logger.info("ocr_start provider=%s model=%s upload_id=%s", _prov, _model, upload_id)
-                        except Exception:
-                            pass
-                        with open(local_path, "rb") as fh:
-                            blob = fh.read()
-                        filename = os.path.basename(local_path)
-                        text, meta = provider.run(
-                            file_bytes=blob,
-                            filename=filename,
-                            model_override=(body.model or None),
-                        )
-                        text = __normalize_local_text(text)
-                        text_len = len(text.strip())
-                        final_payload = {
-                            "status": "OCR_DONE",
-                            "ocr_status": OCR_DONE,
-                            "extracted_text": text,
-                            "ocr_text": text,
-                            "ocr_completed_at": _utc_iso(),
-                            "ocr_error": None,
-                        }
-                        _safe_update_upload(upload_id, final_payload)
-                        try:
-                            logger.info("ocr_done upload_id=%s text_len=%s latency_ms=%s", upload_id, text_len, None)
-                        except Exception:
-                            pass
-                        return {
-                            "status": "done",
-                            "upload_id": upload_id,
-                            "text_len": text_len,
-                            "latency_ms": None,
-                        }
-                    except Exception as e:
-                        logger.exception("/api/ocr/start local file path failed")
-                        return JSONResponse(status_code=500, content={"detail": "internal_error", **({"message": str(e)} if DEV_MODE else {})})
-            # Otherwise, not found
-            return JSONResponse(status_code=404, content={"detail": "not_found"})
+        # Fetch upload row for authz + path (SR preferred; avoid maybe_single)
+        client = supabase_sr or supabase
+        try:
+            logger.info(
+                "ocr_start upload_id=%s provider=%s model=%s sr=%s",
+                upload_id,
+                os.getenv("OCR_PROVIDER", "mock"),
+                os.getenv("OCR_MODEL", ""),
+                bool(supabase_sr),
+            )
+        except Exception:
+            pass
+        try:
+            resp0 = (
+                client
+                .table("uploads")
+                .select("id, owner_id, storage_path, mime_type, extracted_text, ocr_status, ocr_error")
+                .eq("id", upload_id)
+                .limit(1)
+                .execute()
+            )
+            rows = (getattr(resp0, "data", None) or [])
+        except Exception as e:
+            logger.error("uploads.select failed id=%s: %s", upload_id, e, exc_info=True)
+            raise HTTPException(status_code=500, detail={"detail": "internal_error", "message": "uploads.select failed"})
+        if not rows:
+            raise HTTPException(status_code=404, detail="Upload not found")
+        row = rows[0]
+
+        # trocr_local: download bytes from Storage and run provider
+        if (os.getenv("OCR_PROVIDER", "mock").lower() == "trocr_local"):
+            storage_path = row.get("storage_path")
+            mime_type = row.get("mime_type")
+
+            # mark running (OCR fields only)
+            _safe_update_upload(upload_id, {
+                "ocr_status": OCR_RUNNING,
+                "ocr_error": None,
+                "ocr_started_at": _utc_iso(),
+                "ocr_updated_at": _utc_iso(),
+            })
+
+            # download bytes via SR
+            try:
+                blob = await _download_storage_bytes(storage_path)
+            except HTTPException as he:
+                logger.error("storage download failed id=%s path=%s: %s", upload_id, storage_path, getattr(he, 'detail', he))
+                _safe_update_upload(upload_id, {
+                    "ocr_status": OCR_ERROR,
+                    "ocr_error": "storage_download_failed",
+                    "ocr_updated_at": _utc_iso(),
+                    "ocr_completed_at": _utc_iso(),
+                })
+                raise
+
+            try:
+                try:
+                    from .ocr.run_ocr import (
+                        get_provider as __get_local_ocr_provider,
+                        ProviderUnavailable as __ProviderUnavailable,
+                    )
+                except ImportError as e:
+                    logger.exception("provider_import_failed: %s", e)
+                    raise HTTPException(status_code=503, detail={"detail": "ocr_provider_unavailable", "message": "torch/hf missing"})
+                prov_name, prov_model, provider = __get_local_ocr_provider()
+                model_name = (body.model or None)
+                try:
+                    text, meta = _run_local_provider(provider, blob, row["storage_path"], model_name)
+                except Exception as e:
+                    logger.exception("trocr_local run failed: %s", e)
+                    _safe_update_upload(upload_id, {
+                        "ocr_status": OCR_ERROR,
+                        "ocr_error": str(e),
+                        "ocr_updated_at": _utc_iso(),
+                        "ocr_completed_at": _utc_iso(),
+                    })
+                    raise HTTPException(status_code=500, detail={"detail": "internal_error", "message": "ocr failed"})
+                # Normalize/persist on success (OCR fields only)
+                text = (text or "").strip()
+                _safe_update_upload(upload_id, {
+                    "extracted_text": text,
+                    "ocr_text": text,
+                    "ocr_meta": meta or {},
+                    "ocr_status": OCR_DONE,
+                    "ocr_updated_at": _utc_iso(),
+                    "ocr_completed_at": _utc_iso(),
+                    "ocr_error": None,
+                })
+                return {"status": "done", "upload_id": upload_id, "text_len": len(text), "latency_ms": None}
+                text = _normalize_local_text(text)
+                _safe_update_upload(upload_id, {
+                    "extracted_text": text,
+                    "ocr_text": text,
+                    "ocr_meta": meta or {},
+                    "ocr_status": OCR_DONE,
+                    "ocr_updated_at": _utc_iso(),
+                    "ocr_completed_at": _utc_iso(),
+                    "ocr_error": None,
+                })
+                return {
+                    "status": "done",
+                    "upload_id": upload_id,
+                    "text_len": len(text or ""),
+                    "latency_ms": None,
+                }
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.exception("ocr_start trocr_local failed")
+                _safe_update_upload(upload_id, {
+                    "ocr_status": OCR_ERROR,
+                    "ocr_error": str(e),
+                    "ocr_completed_at": _utc_iso(),
+                    "ocr_updated_at": _utc_iso(),
+                })
+                raise HTTPException(status_code=500, detail={"detail": "internal_error", "message": "ocr failed"})
         # Allow dev without owner header; enforce only in non-dev
         if (not DEV_MODE) and REQUIRE_OWNER and caller_id and str(row.get("owner_id")) != str(caller_id):
             return JSONResponse(status_code=404, content={"detail": "not_found"})
@@ -464,12 +655,12 @@ async def ocr_start(
                 time.sleep(0.01)
                 text_resp = "mock extracted text"
                 payload = {
-                    "status": "OCR_DONE",  # DB stores uppercase terminal status per tests
                     "ocr_status": OCR_DONE,
                     "extracted_text": "[MOCK OCR] The quick brown fox jumps over the lazy dog.",
                     "ocr_text":       text_resp,
                     "ocr_meta": {"provider": "mock", "pages": 1, "confidence": 0.99},
                     "ocr_completed_at": _utc_iso(),
+                    "ocr_updated_at": _utc_iso(),
                     "ocr_error": None,
                 }
                 # Mutate in-memory row (tests' FakeTable.update doesn't persist)
@@ -556,11 +747,12 @@ async def ocr_start(
                 text_len = len(text.strip())
 
                 final_payload = {
-                    "status": "OCR_DONE",
-                    "ocr_status": OCR_DONE,
                     "extracted_text": text,
                     "ocr_text": text,
+                    "ocr_meta": meta or {},
+                    "ocr_status": OCR_DONE,
                     "ocr_completed_at": _utc_iso(),
+                    "ocr_updated_at": _utc_iso(),
                     "ocr_error": None,
                 }
                 try:
@@ -617,10 +809,10 @@ async def ocr_start(
                     pass
 
                 err_payload = {
-                    "status": "OCR_ERROR",
                     "ocr_status": OCR_ERROR,
                     "ocr_error": err_msg,
                     "ocr_completed_at": _utc_iso(),
+                    "ocr_updated_at": _utc_iso(),
                 }
                 try:
                     row.update(err_payload)
@@ -668,11 +860,11 @@ async def ocr_start(
             text = (data or {}).get("text") or ""
             # Store DB terminal status as uppercase per tests, but API returns lowercase
             final_payload = {
-                "status": "OCR_DONE",
-                "ocr_status": OCR_DONE,
                 "extracted_text": text,
                 "ocr_text": text,
+                "ocr_status": OCR_DONE,
                 "ocr_completed_at": _utc_iso(),
+                "ocr_updated_at": _utc_iso(),
                 "ocr_error": None,
             }
             try:
@@ -682,7 +874,7 @@ async def ocr_start(
             _safe_update_upload(upload_id, final_payload)
             # Log attempt record
             try:
-                supabase.table("ocr_results").insert({
+                supabase_sr.table("ocr_results").insert({
                     "upload_id": upload_id,
                     "status": "OCR_DONE",
                     "attempts_log": json.dumps(attempts_log),
@@ -700,7 +892,7 @@ async def ocr_start(
         except httpx.ReadTimeout as te:
             # Log and mark error
             try:
-                supabase.table("ocr_results").insert({
+                supabase_sr.table("ocr_results").insert({
                     "upload_id": upload_id,
                     "status": "OCR_ERROR",
                     "attempts_log": json.dumps(attempts_log + [str(te)]),
@@ -708,7 +900,7 @@ async def ocr_start(
                 }).execute()
             except Exception:
                 pass
-            err_payload = {"status": "OCR_ERROR", "ocr_status": OCR_ERROR, "ocr_error": str(te), "ocr_completed_at": _utc_iso()}
+            err_payload = {"ocr_status": OCR_ERROR, "ocr_error": str(te), "ocr_completed_at": _utc_iso(), "ocr_updated_at": _utc_iso()}
             try:
                 row.update(err_payload)
             except Exception:
@@ -718,7 +910,7 @@ async def ocr_start(
         except httpx.HTTPStatusError as he:
             code = getattr(he.response, "status_code", 502)
             try:
-                supabase.table("ocr_results").insert({
+                supabase_sr.table("ocr_results").insert({
                     "upload_id": upload_id,
                     "status": "OCR_ERROR",
                     "attempts_log": json.dumps(attempts_log),
@@ -726,7 +918,7 @@ async def ocr_start(
                 }).execute()
             except Exception:
                 pass
-            err_payload2 = {"status": "OCR_ERROR", "ocr_status": OCR_ERROR, "ocr_error": getattr(he, "message", str(he)), "ocr_completed_at": _utc_iso()}
+            err_payload2 = {"ocr_status": OCR_ERROR, "ocr_error": getattr(he, "message", str(he)), "ocr_completed_at": _utc_iso(), "ocr_updated_at": _utc_iso()}
             try:
                 row.update(err_payload2)
             except Exception:
@@ -834,10 +1026,13 @@ def _owner_matches(row: dict, caller_id: str | None) -> bool:
     return caller_id in {row.get("owner_id"), row.get("user_id")}
 
 def _mark_status(upload_id: str, status: str, fields: dict | None = None):
-    payload = {"status": status}
+    # Do not touch 'status' column; only update provided fields.
+    payload = {}
     if fields:
         payload.update(fields)
-    supabase.table("uploads").update(payload).eq("id", upload_id).execute()
+    if not payload:
+        return
+    _update_upload_sr(upload_id, payload)
 
 def _require_supabase_config():
     # Keep original behavior for runtime; tests patch `supabase` directly.
@@ -867,14 +1062,8 @@ def _select_upload_row(supabase, upload_id: str):
 
 # --- Safe DB helpers to avoid 500s on transient PostgREST errors ---
 def _safe_update_upload(uid: str, payload: dict):
-    try:
-        if supabase:
-            supabase.table("uploads").update(payload).eq("id", uid).execute()
-    except PostgrestAPIError as e:
-        try:
-            logger.warning("safe_update failed", extra={"upload_id": uid, "error": str(e)})
-        except Exception:
-            logger.warning("safe_update failed: %s", e)
+    # Thin wrapper to route through service-role client with row-count check
+    return _update_upload_sr(uid, payload)
 
 
 def _safe_select_status(uid: str):
@@ -1124,7 +1313,7 @@ async def start_grade(
         if not storage_path:
             raise HTTPException(400, "Missing storage_path")
 
-        _mark_status(row["id"], OCR_RUNNING, {"ocr_error": None})
+        _mark_status(row["id"], OCR_RUNNING, {"ocr_status": OCR_RUNNING, "ocr_error": None, "ocr_started_at": _utc_iso(), "ocr_updated_at": _utc_iso()})
         row["status"] = "processing"
         row["ocr_error"] = None
         signed = _get_signed_url(storage_path)
@@ -1141,7 +1330,7 @@ async def start_grade(
             attempts_log.append(200)
 
             try:
-                supabase.table("ocr_results").insert({
+                supabase_sr.table("ocr_results").insert({
                     "upload_id": row["id"],
                     "text": text,
                     "status": "OCR_DONE",
@@ -1153,8 +1342,12 @@ async def start_grade(
 
             _mark_status(row["id"], OCR_DONE, {
                 "extracted_text": text,
-                "ocr_completed_at": dt.now(timezone.utc).isoformat(),
-                "ocr_meta": json.dumps(meta),
+                "ocr_text": text,
+                "ocr_meta": meta,
+                "ocr_status": OCR_DONE,
+                "ocr_completed_at": _utc_iso(),
+                "ocr_updated_at": _utc_iso(),
+                "ocr_error": None,
             })
             row["status"] = OCR_DONE
             row["extracted_text"] = text
@@ -1164,7 +1357,7 @@ async def start_grade(
         except httpx.ReadTimeout:
             attempts_log.append("timeout")
             try:
-                supabase.table("ocr_results").insert({
+                supabase_sr.table("ocr_results").insert({
                     "upload_id": row["id"],
                     "text": None,
                     "status": "OCR_ERROR",
@@ -1173,7 +1366,7 @@ async def start_grade(
                 }).execute()
             except Exception as e:
                 logger.warning("failed to insert ocr_results: %s", e)
-            _mark_status(row["id"], OCR_ERROR, {"ocr_error": "timeout"})
+            _mark_status(row["id"], OCR_ERROR, {"ocr_status": OCR_ERROR, "ocr_error": "timeout", "ocr_completed_at": _utc_iso(), "ocr_updated_at": _utc_iso()})
             row["status"] = OCR_ERROR
             row["ocr_error"] = "timeout"
             raise HTTPException(status_code=422, detail="ocr provider timeout")
@@ -1182,7 +1375,7 @@ async def start_grade(
             code = getattr(e.response, "status_code", 500)
             attempts_log.append(code)
             try:
-                supabase.table("ocr_results").insert({
+                supabase_sr.table("ocr_results").insert({
                     "upload_id": row["id"],
                     "text": None,
                     "status": "OCR_ERROR",
@@ -1191,7 +1384,7 @@ async def start_grade(
                 }).execute()
             except Exception as e2:
                 logger.warning("failed to insert ocr_results: %s", e2)
-            _mark_status(row["id"], OCR_ERROR, {"ocr_error": f"http {code}"})
+            _mark_status(row["id"], OCR_ERROR, {"ocr_status": OCR_ERROR, "ocr_error": f"http {code}", "ocr_completed_at": _utc_iso(), "ocr_updated_at": _utc_iso()})
             row["status"] = OCR_ERROR
             row["ocr_error"] = f"http {code}"
             raise HTTPException(status_code=500, detail=f"OCR failed: http {code}")
@@ -1199,7 +1392,7 @@ async def start_grade(
         except Exception as e:
             attempts_log.append("error")
             try:
-                supabase.table("ocr_results").insert({
+                supabase_sr.table("ocr_results").insert({
                     "upload_id": row["id"],
                     "text": None,
                     "status": "OCR_ERROR",
@@ -1362,5 +1555,70 @@ async def delete_upload(upload_id: str):
     return {"ok": True}
 
 
+
+@app.get("/api/uploads/{id}/ocr")
+async def get_upload_ocr(
+    id: str,
+    x_owner_id: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
+):
+    """
+    Return OCR text and metadata for an upload.
+    Response shape:
+      { "ocr_text": str, "ocr_meta": obj, "status": str }
+
+    If no row -> 404. If row exists but no text -> {"status": "pending"}.
+    Uses same owner check policy as other upload reads (404 on mismatch).
+    """
+    _require_supabase_config()
+
+    upload_id = str(id)
+    caller_id = x_owner_id or x_user_id
+    try:
+        logger.info("ocr_read id=%s owner=%s sr=%s", upload_id, caller_id, True)
+    except Exception:
+        pass
+
+    # SR-only read for RLS-protected table
+    resp = (
+        supabase_sr
+        .table("uploads")
+        .select("id, owner_id, ocr_text, extracted_text, ocr_meta, ocr_status, ocr_error")
+        .eq("id", upload_id)
+        .maybe_single()
+        .execute()
+    )
+    row = getattr(resp, "data", None)
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # Enforce explicit owner check when caller_id present
+    if caller_id and str(row.get("owner_id")) != str(caller_id):
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    # Prefer newer column if present, else legacy extracted_text
+    text = (row.get("extracted_text") or row.get("ocr_text") or "").strip()
+    status = (row.get("ocr_status") or "unknown").strip() or "unknown"
+
+    # If empty text, do not hide errors; include ocr_error if status indicates error
+    if not text:
+        payload = {
+            "ocr_text": "",
+            "ocr_meta": row.get("ocr_meta") or {},
+            "status": status,
+        }
+        st_low = str(status or "").lower()
+        if st_low in {"error", "failed", "ocr_error"} and row.get("ocr_error"):
+            payload["ocr_error"] = row.get("ocr_error")
+        return payload
+
+    payload = {
+        "ocr_text": text,
+        "ocr_meta": row.get("ocr_meta") or {},
+        "status": status,
+    }
+    if str(status).lower() in {"error", "failed"} and row.get("ocr_error"):
+        payload["ocr_error"] = row.get("ocr_error")
+    return payload
 
 

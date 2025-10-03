@@ -2,6 +2,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { startOCR, pollOCR } from "../lib/ocr";
 import { API_BASE } from "../lib/apiBase";
+import { supabase } from "../lib/supabaseClient";
 
 export default function FileRow({ file }) {
   const [row, setRow] = useState(() => ({
@@ -13,6 +14,9 @@ export default function FileRow({ file }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const startedRef = useRef(false);
+  // Minimal OCR panel state
+  const [ocrPanelText, setOcrPanelText] = useState("");
+  const [ocrPanelStatus, setOcrPanelStatus] = useState("pending");
 
   // auto-start once for "pending"
   useEffect(() => {
@@ -46,6 +50,37 @@ export default function FileRow({ file }) {
       })();
     }
   }, [row.ocr_status, file.id]);
+
+  // Fetch OCR text for the panel on mount / when upload changes
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data } = await supabase.auth.getUser();
+        const ownerId = data?.user?.id;
+        const r = await fetch(`${API_BASE}/api/uploads/${file.id}/ocr`, {
+          method: "GET",
+          headers: ownerId ? { "X-Owner-Id": ownerId, "X-User-Id": ownerId } : {},
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!cancelled) {
+          if (j && j.ocr_text) {
+            setOcrPanelText(j.ocr_text);
+            setOcrPanelStatus(j.status || "done");
+          } else {
+            setOcrPanelText("");
+            setOcrPanelStatus(j?.status || "pending");
+          }
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setOcrPanelText("");
+          setOcrPanelStatus("pending");
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [file.id]);
 
   // poll until done/failed
   useEffect(() => {
@@ -147,6 +182,25 @@ export default function FileRow({ file }) {
             {text}
           </div>
         )}
+
+        {/* Minimal OCR panel */}
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "#475467", marginBottom: 4 }}>OCR</div>
+          <pre
+            style={{
+              background: "#f9fafb",
+              padding: "8px 10px",
+              borderRadius: 6,
+              fontSize: 12,
+              whiteSpace: "pre-wrap",
+              maxHeight: 220,
+              overflow: "auto",
+              border: "1px solid #e5e7eb",
+            }}
+          >
+            {ocrPanelText || "pending..."}
+          </pre>
+        </div>
 
         {(row.ocr_status === "error" || row.ocr_status === "ocr_error" || row.ocr_status === "failed") && !busy && (
           <button onClick={handleRetry} className="btn btn-ghost" aria-label="Retry">
