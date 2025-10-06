@@ -3,16 +3,49 @@ if __name__ == "__main__":
     raise SystemExit("Run with: python -m uvicorn backend.app:app --reload --port 8000")
 from datetime import datetime as dt, timezone
 from typing import Optional
+from typing import Tuple
 
 from fastapi import FastAPI, HTTPException, Header
 from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 from starlette.responses import JSONResponse
+import asyncio
+import io
+import json
+import os
+import pytesseract
+import posixpath
 import httpx
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pathlib import Path
+_here = Path(__file__).parent
+load_dotenv(_here / ".env")              # backend/.env
+load_dotenv(_here.parent / ".env")       # project root .env (optional)
+load_dotenv()                            # process env fallback
+# --- Tesseract bootstrap (Windows-friendly) ---
+import os
+import pytesseract
+
+# Prefer explicit env; fall back to common install path
+tcmd = os.getenv("TESSERACT_CMD") or r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+
+# Make sure the process PATH includes the folder (some installs need this)
+tdir = os.path.dirname(tcmd)
+if tdir and os.path.isdir(tdir):
+    os.environ["PATH"] = tdir + os.pathsep + os.environ.get("PATH", "")
+
+# Tell pytesseract which exe to use
+pytesseract.pytesseract.tesseract_cmd = tcmd
+
+# Boot diagnostics
+print("[BOOT][tesseract] cmd =", repr(pytesseract.pytesseract.tesseract_cmd))
+try:
+    print("[BOOT][tesseract] version =", pytesseract.get_tesseract_version())
+except Exception as e:
+    print("[BOOT][tesseract] version_error =", e)
+# --- end bootstrap ---
 from io import BytesIO
 try:
     from PIL import Image
@@ -195,7 +228,7 @@ async def options_any(path: str) -> Response:
 try:
     logger.info(
         "[boot] env | SUPABASE_URL=%s KEY=%s BUCKET=%s | OCR_PROVIDER=%s | DEV_MODE=%s",
-        bool(SUPABASE_URL), bool(SUPABASE_KEY), bool(SUPABASE_BUCKET), OCR_PROVIDER, DEV_MODE,
+        bool(SUPABASE_URL), bool(SUPABASE_KEY), bool(os.getenv("SUBMISSIONS_BUCKET")), OCR_PROVIDER, DEV_MODE,
     )
 except Exception:
     pass
@@ -250,9 +283,14 @@ SUPABASE_BUCKET = (
     or None
 )
 
+# HF TrOCR via Inference API (helper config)
+SUBMISSIONS_BUCKET = os.getenv("SUBMISSIONS_BUCKET", "submissions")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+TROCR_MODEL = os.getenv("TROCR_MODEL", "microsoft/trocr-base-handwritten")
+
 _missing_url = not bool(SUPABASE_URL)
 _missing_key = not bool(ANON_KEY)
-_missing_bucket = not bool(SUPABASE_BUCKET)
+_missing_bucket = not bool(SUBMISSIONS_BUCKET)
 if _missing_url or _missing_key or _missing_bucket:
     logger.warning(
         "Supabase env missing: URL=%s, KEY=%s, BUCKET=%s",
@@ -267,10 +305,17 @@ supabase_sr = (
     else None
 )
 supabase = (
-    create_client(SUPABASE_URL, ANON_KEY)
-    if (create_client and SUPABASE_URL and ANON_KEY)
+    create_client(SUPABASE_URL, SR_KEY)
+    if (create_client and SUPABASE_URL and SR_KEY)
     else None
 )
+bucket = os.getenv("SUBMISSIONS_BUCKET", "submissions")
+hf_token_present = bool(os.getenv("HF_API_TOKEN"))
+print("[BOOT] bucket=", bucket)
+print("[BOOT] provider=", os.getenv("OCR_PROVIDER"))
+print("[BOOT] trocr_model=", os.getenv("TROCR_MODEL"))
+print("[BOOT] has_service_role=", "yes" if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "no")
+print("[BOOT] hf_token_present=", hf_token_present)
 try:
     logger.info("[boot] supabase_sr active=%s", bool(supabase_sr))
 except Exception:
@@ -345,20 +390,22 @@ def _resp_text_len(row: dict, final_payload: dict | None = None) -> int:
 
 
 # --- Storage download helper (SR-auth) ---
-async def _download_storage_bytes(storage_path: str) -> bytes:
-    """
-    Download raw bytes from Supabase Storage via SR key.
-    storage_path is the 'path' saved in uploads.storage_path (no leading slash).
-    """
-    if not (SUPABASE_URL and supabase_sr and SUPABASE_BUCKET and storage_path):
-        raise RuntimeError("storage download precondition failed")
-    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{storage_path}"
-    headers = {"Authorization": f"Bearer {SR_KEY}"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, headers=headers)
-        if r.status_code == 200:
-            return r.content
-        raise HTTPException(status_code=404, detail=f"file not found in storage ({r.status_code})")
+def _normalize(storage_path: str, bucket: str) -> str:
+    p = (storage_path or "").lstrip("/")
+    prefix = f"{bucket}/"
+    return p[len(prefix):] if p.startswith(prefix) else p
+
+def _download_bytes_from_storage(storage_path: str) -> bytes:
+    bucket = os.getenv("SUBMISSIONS_BUCKET", "submissions")
+    rel = _normalize(storage_path, bucket)
+    print(f"[OCR] storage.download bucket={bucket} path={rel}")
+    client = supabase_sr or supabase
+    if client is None:
+        raise RuntimeError("Supabase client unavailable")
+    data = client.storage.from_(bucket).download(rel)
+    if not data:
+        raise HTTPException(status_code=404, detail="file not found in storage")
+    return data
 
 
 # Dev-only local resolver for uploads when Supabase is disabled
@@ -541,6 +588,41 @@ async def ocr_start(
             raise HTTPException(status_code=404, detail="Upload not found")
         row = rows[0]
 
+        # Provider selection based on OCR_PROVIDER
+        storage_path = row.get("storage_path")
+        if not storage_path:
+            raise HTTPException(status_code=400, detail="Missing storage_path")
+        _safe_update_upload(upload_id, {
+            "ocr_status": "running",
+            "ocr_started_at": _utc_iso(),
+            "ocr_updated_at": _utc_iso(),
+            "ocr_error": None,
+        })
+        prov = (os.getenv("OCR_PROVIDER") or "tesseract").strip().lower()
+
+        if prov == "tesseract":
+            result = await asyncio.to_thread(run_ocr_tesseract, storage_path)
+        elif prov in ("hf_trocr_api", "hf_tr_ocr_api"):
+            result = await asyncio.to_thread(run_ocr_hf_trocr_api, storage_path)
+        elif prov in ("azure", "azure_vision"):
+            result = await run_ocr_azure_vision(storage_path)
+        else:
+            result = {"text": "", "meta": {"error": f"unknown_provider:{prov}"}}
+
+        text = result.get("text") or ""
+        meta = result.get("meta") or {}
+        status = "ok" if text else "fail"
+        err = meta.get("error")
+        _safe_update_upload(upload_id, {
+            "ocr_text": text,
+            "ocr_meta": meta,
+            "ocr_status": status,
+            "ocr_error": err,
+            "ocr_completed_at": _utc_iso(),
+            "ocr_updated_at": _utc_iso(),
+        })
+        return {"ok": True, "chars": len(text or ""), "status": status, "error": err}
+
         # trocr_local: download bytes from Storage and run provider
         if (os.getenv("OCR_PROVIDER", "mock").lower() == "trocr_local"):
             storage_path = row.get("storage_path")
@@ -556,7 +638,7 @@ async def ocr_start(
 
             # download bytes via SR
             try:
-                blob = await _download_storage_bytes(storage_path)
+                blob = _download_bytes_from_storage(storage_path)
             except HTTPException as he:
                 logger.error("storage download failed id=%s path=%s: %s", upload_id, storage_path, getattr(he, 'detail', he))
                 _safe_update_upload(upload_id, {
@@ -690,8 +772,7 @@ async def ocr_start(
                 blob = None
                 filename = (storage_path or "").split("/")[-1]
                 try:
-                    signed = _get_signed_url(storage_path)
-                    blob = await _download_bytes(signed)
+                    blob = _download_bytes_from_storage(storage_path)
                 except Exception:
                     # Dev fallback to local disk
                     base = os.getenv("LOCAL_SUBMISSIONS_DIR") or os.getenv("DEV_UPLOADS_DIR")
@@ -830,8 +911,6 @@ async def ocr_start(
             storage_path = row.get("storage_path")
             if not storage_path:
                 raise HTTPException(400, "Missing storage_path")
-            signed = _get_signed_url(storage_path)
-
             # Diagnostics before calling remote provider
             try:
                 _prov = os.getenv("OCR_PROVIDER", "mock")
@@ -843,8 +922,9 @@ async def ocr_start(
             data = None
             for attempt in range(max_attempts):
                 try:
-                    # Let provider client handle image URL; tests patch httpx inside services.ocr
-                    data = await ocr.extract_text(image_url=signed)
+                    # Let provider client handle image bytes; tests may patch httpx inside services.ocr
+                    blob = _download_bytes_from_storage(storage_path)
+                    data = await ocr.extract_text(image_bytes=blob)
                     attempts_log.append(200)
                     break
                 except httpx.HTTPStatusError as he:
@@ -1090,23 +1170,128 @@ def _safe_select_status(uid: str):
         return None
 
 
-def _get_signed_url(path: str, expires_in: int = 900) -> str:
+# removed signed URL helper; use storage.download via service role
+
+def _split_rel(storage_path: str, bucket: str) -> Tuple[str, str]:
+    # normalize to "folder1/folder2/file.jpg" without bucket prefix
+    p = storage_path.lstrip("/").replace("\\", "/")
+    if p.startswith(f"{bucket}/"):
+        p = p[len(bucket)+1:]
+    # collapse repeated slashes
+    parts = [x for x in p.split("/") if x]
+    rel = "/".join(parts)
+    d = "/".join(parts[:-1]) if len(parts) > 1 else ""
+    f = parts[-1] if parts else ""
+    return d, f
+
+def _download_bytes_from_storage(storage_path: str) -> bytes:
+    bucket = os.getenv("SUBMISSIONS_BUCKET", "submissions")
+    d, f = _split_rel(storage_path, bucket)
+    print(f"[OCR] storage.download bucket={bucket} dir='{d}' file='{f}'")
+    # List the directory for visibility
+    try:
+      listing = supabase.storage.from_(bucket).list(d or "")
+      names = [x.get("name") for x in listing]
+      print(f"[OCR] dir listing ({len(names)}): {names[:10]}")
+    except Exception as e:
+      print(f"[OCR] list failed for bucket={bucket} dir='{d}' :: {e}")
+    # Try download
+    rel_path = f"{d}/{f}" if d else f
+    blob = supabase.storage.from_(bucket).download(rel_path)
+    if not blob:
+        raise RuntimeError(f"Not Found: bucket={bucket} rel='{rel_path}'")
+    return blob
+
+def run_ocr_hf_trocr_api(storage_path: str):
+    img_bytes = _download_bytes_from_storage(storage_path)
+    api = f"https://api-inference.huggingface.co/models/{TROCR_MODEL}"
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"} if HF_API_TOKEN else {}
+    r = httpx.post(api, headers=headers, content=img_bytes, timeout=45)
+    meta = {"provider": "hf_trocr_api", "model": TROCR_MODEL, "source": storage_path, "status": r.status_code}
+    if r.status_code >= 400:
+        meta["error"] = r.text[:500]
+        return {"text": "", "meta": meta}
+    data = r.json()
+    text = " ".join(d.get("generated_text", "") for d in data) if isinstance(data, list) else ""
+    if not text:
+        meta["warn"] = f"Unexpected HF response: {str(data)[:300]}"
+    return {"text": text.strip(), "meta": meta}
+
+def run_ocr_tesseract(storage_path: str):
+    import io, numpy as np
+    from PIL import Image, ImageOps, ImageFilter
+    blob = _download_bytes_from_storage(storage_path)
+    im = Image.open(io.BytesIO(blob)).convert("L")
+
+    # lightweight preproc (works well for faint pencil)
+    im = ImageOps.autocontrast(im, cutoff=2)      # boost contrast
+    im = im.resize((im.width*2, im.height*2))     # upsample helps LSTM
+    im = im.filter(ImageFilter.UnsharpMask(radius=2, percent=120, threshold=3))
+
+    cfgs = [
+        "--oem 1 --psm 7 -l eng",    # single line
+        "--oem 1 --psm 11 -l eng",   # sparse text
+        "--oem 1 --psm 6 -l eng",    # block
+        "--oem 1 --psm 13 -l eng",   # raw line
+    ]
+    best = {"text": "", "meta": {"provider":"tesseract", "tried": cfgs, "chosen": None}}
+    for cfg in cfgs:
+        try:
+            txt = pytesseract.image_to_string(im, config=cfg) or ""
+        except Exception as e:
+            best["meta"].setdefault("errors", []).append(f"{cfg}: {e}")
+            continue
+        if len(txt.strip()) > len(best["text"].strip()):
+            best["text"] = txt.strip()
+            best["meta"]["chosen"] = cfg
+    return best
+
+async def run_ocr_azure_vision(storage_path: str):
     """
-    Supabase signing expects a bucket-relative key. Never include the bucket name
-    in the key and never include a leading slash.
+    Azure Computer Vision Read v3.2 via REST.
+    Requires AZURE_ENDPOINT (https://<res>.cognitiveservices.azure.com) and AZURE_KEY.
+    Returns {"text": str, "meta": {...}}.
     """
-    key = (path or "").lstrip("/")
-    if key.startswith(f"{SUPABASE_BUCKET}/"):
-        key = key[len(f"{SUPABASE_BUCKET}/"):]
-    # sign
-    resp = supabase.storage.from_(SUPABASE_BUCKET).create_signed_url(key, expires_in)
-    signed = None
-    if isinstance(resp, dict):
-        signed = resp.get("signedURL") or resp.get("signed_url")
-    if not signed:
-        raise HTTPException(404, f"Object not found for key={key}")
-    return signed if signed.startswith("http") \
-        else f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{key}?{signed}"
+    endpoint = os.getenv("AZURE_ENDPOINT", "").rstrip("/")
+    key = os.getenv("AZURE_KEY", "")
+    if not endpoint or not key:
+        return {"text": "", "meta": {"provider": "azure_vision", "error": "missing_endpoint_or_key"}}
+
+    img_bytes = _download_bytes_from_storage(storage_path)
+    if not img_bytes:
+        return {"text": "", "meta": {"provider": "azure_vision", "error": "empty_image_bytes"}}
+
+    analyze_url = f"{endpoint}/vision/v3.2/read/analyze"
+    headers = {"Ocp-Apim-Subscription-Key": key, "Content-Type": "application/octet-stream"}
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        resp = await client.post(analyze_url, headers=headers, content=img_bytes)
+        if resp.status_code not in (200, 202):
+            return {"text": "", "meta": {"provider": "azure_vision", "status": resp.status_code, "error": resp.text}}
+        op_loc = resp.headers.get("operation-location") or resp.headers.get("Operation-Location")
+        if not op_loc:
+            return {"text": "", "meta": {"provider": "azure_vision", "error": "missing_operation_location"}}
+
+        for _ in range(20):
+            await asyncio.sleep(0.75)
+            r = await client.get(op_loc, headers={"Ocp-Apim-Subscription-Key": key})
+            data = r.json()
+            status = (data.get("status") or "").lower()
+            if status == "failed":
+                return {"text": "", "meta": {"provider": "azure_vision", "status": status, "result": data}}
+            if status == "succeeded":
+                lines = []
+                try:
+                    pages = data.get("analyzeResult", {}).get("readResults") or []
+                    for pg in pages:
+                        for ln in pg.get("lines", []):
+                            t = ln.get("text") or ""
+                            if t:
+                                lines.append(t)
+                except Exception as e:
+                    return {"text": "", "meta": {"provider": "azure_vision", "status": status, "parse_error": str(e), "raw": data}}
+                return {"text": "\n".join(lines).strip(), "meta": {"provider": "azure_vision", "status": status}}
+        return {"text": "", "meta": {"provider": "azure_vision", "error": "timeout"}}
 
 async def _download_bytes(url: str) -> bytes:
     async with httpx.AsyncClient(timeout=60) as client:
@@ -1540,9 +1725,9 @@ async def delete_upload(upload_id: str):
     try:
         if storage_path:
             key = (storage_path or "").lstrip("/")
-            if key.startswith(f"{SUPABASE_BUCKET}/"):
-                key = key[len(f"{SUPABASE_BUCKET}/"):]
-            supabase.storage.from_(SUPABASE_BUCKET).remove([key])
+            if key.startswith(f"{SUBMISSIONS_BUCKET}/"):
+                key = key[len(f"{SUBMISSIONS_BUCKET}/"):]
+            supabase.storage.from_(SUBMISSIONS_BUCKET).remove([key])
     except Exception as e:
         raise HTTPException(status_code=502, detail="storage remove failed")
 
