@@ -51,27 +51,30 @@ export default function FileRow({ file }) {
     }
   }, [row.ocr_status, file.id]);
 
+  // helper: refresh OCR panel
+  const refreshOCR = async () => {
+    const { data } = await supabase.auth.getUser();
+    const ownerId = data?.user?.id;
+    const r = await fetch(`${API_BASE}/api/uploads/${file.id}/ocr`, {
+      method: "GET",
+      headers: ownerId ? { "X-Owner-Id": ownerId, "X-User-Id": ownerId } : {},
+    });
+    const j = await r.json().catch(() => ({}));
+    if (j && j.ocr_text) {
+      setOcrPanelText(j.ocr_text);
+      setOcrPanelStatus(j.status || "done");
+    } else {
+      setOcrPanelText("");
+      setOcrPanelStatus(j?.status || "pending");
+    }
+  };
+
   // Fetch OCR text for the panel on mount / when upload changes
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const { data } = await supabase.auth.getUser();
-        const ownerId = data?.user?.id;
-        const r = await fetch(`${API_BASE}/api/uploads/${file.id}/ocr`, {
-          method: "GET",
-          headers: ownerId ? { "X-Owner-Id": ownerId, "X-User-Id": ownerId } : {},
-        });
-        const j = await r.json().catch(() => ({}));
-        if (!cancelled) {
-          if (j && j.ocr_text) {
-            setOcrPanelText(j.ocr_text);
-            setOcrPanelStatus(j.status || "done");
-          } else {
-            setOcrPanelText("");
-            setOcrPanelStatus(j?.status || "pending");
-          }
-        }
+        if (!cancelled) await refreshOCR();
       } catch (e) {
         if (!cancelled) {
           setOcrPanelText("");
@@ -183,23 +186,48 @@ export default function FileRow({ file }) {
           </div>
         )}
 
-        {/* Minimal OCR panel */}
+        {/* OCR tab */}
         <div style={{ marginTop: 10 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: "#475467", marginBottom: 4 }}>OCR</div>
-          <pre
-            style={{
-              background: "#f9fafb",
-              padding: "8px 10px",
-              borderRadius: 6,
-              fontSize: 12,
-              whiteSpace: "pre-wrap",
-              maxHeight: 220,
-              overflow: "auto",
-              border: "1px solid #e5e7eb",
-            }}
-          >
-            {ocrPanelText || "pending..."}
-          </pre>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom: 6 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: "#475467" }}>OCR</div>
+              <StatusChip value={(function(){
+                const st = String(ocrPanelStatus || '').toLowerCase();
+                if (ocrPanelText && ocrPanelText.trim().length) return 'done';
+                if (st === 'processing' || st === 'running' || st === 'pending') return 'processing';
+                if (st === 'done') return 'done';
+                return 'failed';
+              })()} />
+            </div>
+            <div>
+              <button
+                type="button"
+                onClick={async () => { try { setBusy(true); await startOCR(file.id); await refreshOCR(); } finally { setBusy(false); } }}
+                className="btn btn-ghost"
+                disabled={busy}
+              >
+                Run OCR
+              </button>
+            </div>
+          </div>
+          {ocrPanelText && ocrPanelText.trim().length ? (
+            <pre
+              style={{
+                background: "#f9fafb",
+                padding: "8px 10px",
+                borderRadius: 6,
+                fontSize: 12,
+                whiteSpace: "pre-wrap",
+                maxHeight: 220,
+                overflow: "auto",
+                border: "1px solid #e5e7eb",
+              }}
+            >
+              {ocrPanelText}
+            </pre>
+          ) : (
+            <div style={{ fontSize: 12, color: "#667085" }}>No OCR text yet — run OCR</div>
+          )}
         </div>
 
         {(row.ocr_status === "error" || row.ocr_status === "ocr_error" || row.ocr_status === "failed") && !busy && (
