@@ -1,22 +1,32 @@
-﻿// frontend/src/components/FileRow.jsx
+// frontend/src/components/FileRow.jsx
 import React, { useEffect, useRef, useState } from "react";
-import { startOCR, pollOCR } from "../lib/ocr";
+import { startOCR } from "../lib/ocr";
 import { API_BASE } from "../lib/apiBase";
 import { supabase } from "../lib/supabaseClient";
 
-export default function FileRow({ file }) {
+function FileRow({ file }) {
   const [row, setRow] = useState(() => ({
     ...file,
     ocr_status: file.ocr_status || file.status || "pending",
     text_len: file.text_len || 0,
   }));
-  const [text, setText] = useState(file.extracted_text || "");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const startedRef = useRef(false);
-  // Minimal OCR panel state
-  const [ocrPanelText, setOcrPanelText] = useState("");
-  const [ocrPanelStatus, setOcrPanelStatus] = useState("pending");
+
+  // Verdicts / PDF state
+  const [verdicts, setVerdicts] = useState(file.verdicts || {});
+  const [gradedPath, setGradedPath] = useState(file.graded_pdf_path || null);
+  const [gradedSigned, setGradedSigned] = useState(null);
+
+  const initialStatus = (() => {
+    if (file.graded_pdf_path) return "pdf_ready";
+    const st = String((file.ocr_status || file.status || "").toLowerCase());
+    if (st === "processing" || st === "running" || st === "pending") return "processing";
+    if (st === "done" || st === "ocr_done") return "ocr_done";
+    return "idle";
+  })();
+  const [status, setStatus] = useState(initialStatus);
 
   // auto-start once for "pending"
   useEffect(() => {
@@ -25,33 +35,23 @@ export default function FileRow({ file }) {
       (async () => {
         try {
           const resp = await startOCR(file.id);
-          // If backend already completes OCR synchronously, reflect immediately
-          if (resp && resp.status === "done") {
+          if (resp && (resp.status === "done" || resp.ocr_status === "done")) {
             setRow((r) => ({ ...r, ocr_status: "done", text_len: Number(resp.text_len || 0) }));
-            if (resp.text) setText(resp.text);
-            showToast("OCR complete");
-            try { console.log("SMOKE_OK", { api: API_BASE, upload: file.id }); } catch {}
+            setStatus("ocr_done");
           } else {
             setRow((r) => ({ ...r, ocr_status: "processing" }));
+            setStatus("processing");
           }
         } catch (e) {
-          let msg = e?.message || "Failed to start";
-          try {
-            const parsed = JSON.parse(msg);
-            const status = parsed?.status;
-            const body = parsed?.body;
-            const detail = body?.detail || body?.message || (typeof body === 'string' ? body : "");
-            msg = `OCR failed (${status}): ${detail}`;
-          } catch {}
-          setErr(msg);
+          setErr(e?.message || "Failed to start");
           setRow((r) => ({ ...r, ocr_status: "failed" }));
-          showToast(msg);
+          setStatus("error");
         }
       })();
     }
   }, [row.ocr_status, file.id]);
 
-  // helper: refresh OCR panel
+  // Update OCR status only (no text shown)
   const refreshOCR = async () => {
     const { data } = await supabase.auth.getUser();
     const ownerId = data?.user?.id;
@@ -60,46 +60,23 @@ export default function FileRow({ file }) {
       headers: ownerId ? { "X-Owner-Id": ownerId, "X-User-Id": ownerId } : {},
     });
     const j = await r.json().catch(() => ({}));
-    if (j && j.ocr_text) {
-      setOcrPanelText(j.ocr_text);
-      setOcrPanelStatus(j.status || "done");
-    } else {
-      setOcrPanelText("");
-      setOcrPanelStatus(j?.status || "pending");
-    }
+    const st = String(j?.status || row.ocr_status || "pending").toLowerCase();
+    setRow((r) => ({ ...r, ocr_status: st }));
+    if (st === "done") setStatus("ocr_done");
+    else if (st === "processing" || st === "running" || st === "pending") setStatus("processing");
+    else if (st === "failed" || st === "error") setStatus("error");
+    else setStatus("idle");
   };
 
-  // Fetch OCR text for the panel on mount / when upload changes
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      try {
-        if (!cancelled) await refreshOCR();
-      } catch (e) {
-        if (!cancelled) {
-          setOcrPanelText("");
-          setOcrPanelStatus("pending");
-        }
-      }
+      try { if (!cancelled) await refreshOCR(); } catch {}
     })();
     return () => { cancelled = true; };
   }, [file.id]);
 
-  // poll until done/failed
-  useEffect(() => {
-    if (row.ocr_status === "processing") {
-      const stop = pollOCR(file.id, (s) => {
-        setRow((r) => ({ ...r, ocr_status: s.status, text_len: Number(s.text_len || r.text_len || 0) }));
-        if (s.extracted_text) setText(s.extracted_text);
-        if (s.error) setErr(s.error);
-        if (s.status === "done") {
-          showToast("OCR complete");
-          try { console.log("SMOKE_OK", { api: API_BASE, upload: file.id }); } catch {}
-        }
-      }, 2000);
-      return stop;
-    }
-  }, [row.ocr_status, file.id]);
+  // Simplified: no long polling here; we refetch status after a short delay
 
   const retry = async () => {
     setErr("");
@@ -107,32 +84,26 @@ export default function FileRow({ file }) {
     startedRef.current = false;
   };
 
-  async function handleRetry() {
+  async function handleRunOCR() {
     try {
       setBusy(true);
       setErr("");
-      const resp = await startOCR(file.id);
-      if (resp && (resp.status === "done" || resp.ocr_status === "done")) {
-        setRow((r) => ({ ...r, ocr_status: "done", text_len: Number(resp.text_len || 0) }));
-        if (resp.text) setText(resp.text);
-        showToast("OCR complete");
-        try { console.log("SMOKE_OK", { api: API_BASE, upload: file.id }); } catch {}
-      } else {
-        setRow((r) => ({ ...r, ocr_status: "processing" }));
-      }
+      // Prefer new route; fallback to legacy
+      let ok = false;
+      await fetch(`${API_BASE}/api/ocr/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_id: String(file.id) }),
+      });
+      setRow((r) => ({ ...r, ocr_status: "processing" }));
+      setStatus("processing");
+      await new Promise((res) => setTimeout(res, 1500));
+      await refreshOCR();
+      setStatus("ocr_done");
     } catch (e) {
-      let msg = e?.message || "Failed to start";
-      try {
-        const parsed = JSON.parse(msg);
-        const status = parsed?.status;
-        const body = parsed?.body;
-        const detail = body?.detail || body?.message || (typeof body === 'string' ? body : "");
-        msg = `OCR failed (${status}): ${detail}`;
-      } catch {}
-      setErr(msg);
+      setErr(e?.message || "Failed to start");
       setRow((r) => ({ ...r, ocr_status: "failed" }));
-      showToast(msg);
-      console.error(e);
+      setStatus("error");
     } finally {
       setBusy(false);
     }
@@ -144,6 +115,85 @@ export default function FileRow({ file }) {
     setToast(msg);
     setTimeout(() => setToast(""), 2000);
   }
+
+  async function refreshRowFromDB() {
+    try {
+      const { data: userData } = await supabase.auth.getUser();
+      const userId = userData?.user?.id;
+      const { data, error } = await supabase
+        .from("uploads")
+        .select("id,status,ocr_error,graded_pdf_path,verdicts")
+        .eq("owner_id", userId)
+        .eq("id", file.id)
+        .maybeSingle();
+      if (error) throw error;
+      if (data) {
+        setVerdicts(data.verdicts || {});
+        setGradedPath(data.graded_pdf_path || null);
+        if (data.graded_pdf_path) setStatus("pdf_ready");
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  // Lightweight prompt-based actions
+  const setVerdictsPrompt = async () => {
+    try {
+      const allowed = new Set(["correct", "incorrect", "partial"]);
+      const _q5 = window.prompt("q5: correct/incorrect/partial");
+      if (_q5 == null) { showToast("Invalid verdict"); return; }
+      const _q6a = window.prompt("q6a: correct/incorrect/partial");
+      if (_q6a == null) { showToast("Invalid verdict"); return; }
+      const _q6b = window.prompt("q6b: correct/incorrect/partial");
+      if (_q6b == null) { showToast("Invalid verdict"); return; }
+
+      const q5 = String(_q5).trim().toLowerCase();
+      const q6a = String(_q6a).trim().toLowerCase();
+      const q6b = String(_q6b).trim().toLowerCase();
+      if (!allowed.has(q5)) { showToast("Invalid verdict"); return; }
+      if (!allowed.has(q6a)) { showToast("Invalid verdict"); return; }
+      if (!allowed.has(q6b)) { showToast("Invalid verdict"); return; }
+
+      const body = { per_question: { q5, q6a, q6b } };
+      const res = await fetch(`${API_BASE}/api/uploads/${file.id}/verdicts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new Error(detail || `Failed: ${res.status}`);
+      }
+      setVerdicts({ q5, q6a, q6b });
+      showToast("Verdicts saved");
+      await refreshRowFromDB();
+    } catch (e) {
+      showToast(e?.message || "Failed to save verdicts");
+    }
+  };
+
+  const createPdf = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/uploads/${file.id}/pdf`, { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showToast(String(data?.detail || `Failed: ${res.status}`));
+        return;
+      }
+      setGradedPath(data.path || null);
+      const signed = data?.signedUrl
+        ? `${data.signedUrl}${String(data.signedUrl).includes("?") ? "&" : "?"}t=${Date.now()}`
+        : null;
+      setGradedSigned(signed);
+      setStatus("pdf_ready");
+      showToast("Graded PDF ready");
+    } catch (e) {
+      showToast(e?.message || "Failed to create PDF");
+    }
+  };
+
+  const hasVerdicts = verdicts && Object.keys(verdicts).length > 0;
 
   return (
     <div style={{ display:"flex", gap:12, alignItems:"flex-start", padding:"10px 0", position: "relative" }}>
@@ -163,6 +213,7 @@ export default function FileRow({ file }) {
           {toast}
         </div>
       )}
+
       {row.signedUrl ? (
         <img
           src={row.signedUrl}
@@ -177,61 +228,48 @@ export default function FileRow({ file }) {
       <div style={{ flex:1 }}>
         <div style={{ fontWeight: 600 }}>{row.name}</div>
         <div style={{ fontSize: 12, color: "#667085" }}>
-          <StatusChip value={row.ocr_status} /> {err && <span style={{ color:"#b42318" }}> Â· {err}</span>}
+          <StatusChip value={status} /> {err && <span style={{ color:"#b42318" }}> {err}</span>}
         </div>
 
-        {text && (
-          <div style={{ marginTop: 8, whiteSpace: "pre-wrap", fontSize: 14 }}>
-            {text}
-          </div>
-        )}
-
-        {/* OCR tab */}
-        <div style={{ marginTop: 10 }}>
-          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom: 6 }}>
-            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-              <div style={{ fontSize: 12, fontWeight: 600, color: "#475467" }}>OCR</div>
-              <StatusChip value={(function(){
-                const st = String(ocrPanelStatus || '').toLowerCase();
-                if (ocrPanelText && ocrPanelText.trim().length) return 'done';
-                if (st === 'processing' || st === 'running' || st === 'pending') return 'processing';
-                if (st === 'done') return 'done';
-                return 'failed';
-              })()} />
-            </div>
-            <div>
-              <button
-                type="button"
-                onClick={async () => { try { setBusy(true); await startOCR(file.id); await refreshOCR(); } finally { setBusy(false); } }}
-                className="btn btn-ghost"
-                disabled={busy}
-              >
-                Run OCR
-              </button>
-            </div>
-          </div>
-          {ocrPanelText && ocrPanelText.trim().length ? (
-            <pre
-              style={{
-                background: "#f9fafb",
-                padding: "8px 10px",
-                borderRadius: 6,
-                fontSize: 12,
-                whiteSpace: "pre-wrap",
-                maxHeight: 220,
-                overflow: "auto",
-                border: "1px solid #e5e7eb",
+        {/* Actions */}
+        <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button type="button" className="btn btn-ghost" onClick={handleRunOCR} disabled={busy}>
+            Run OCR
+          </button>
+          <button type="button" className="btn btn-ghost" onClick={setVerdictsPrompt}>
+            Set verdicts
+          </button>
+          <button type="button" className="btn btn-ghost" onClick={createPdf} disabled={!hasVerdicts} title={!hasVerdicts ? "Set verdicts first" : ""}>
+            Create graded PDF
+          </button>
+          {(gradedSigned || gradedPath || row.graded_pdf_path) && (
+            <a
+              className="btn btn-primary"
+              href={gradedSigned || undefined}
+              onClick={async (e) => {
+                if (gradedSigned) return; // use provided URL
+                e.preventDefault();
+                try {
+                  const key = (gradedPath || row.graded_pdf_path);
+                  if (!key) return;
+                  const urlRes = await import("../lib/supa").then(m => m.previewUrl("graded-pdfs", key, 3600));
+                  if (urlRes.ok && urlRes.url) {
+                    window.open(urlRes.url, "_blank");
+                  }
+                } catch (err) {
+                  console.error(err);
+                }
               }}
+              target={gradedSigned ? "_blank" : undefined}
+              rel="noreferrer"
             >
-              {ocrPanelText}
-            </pre>
-          ) : (
-            <div style={{ fontSize: 12, color: "#667085" }}>No OCR text yet — run OCR</div>
+              Download graded PDF
+            </a>
           )}
         </div>
 
-        {(row.ocr_status === "error" || row.ocr_status === "ocr_error" || row.ocr_status === "failed") && !busy && (
-          <button onClick={handleRetry} className="btn btn-ghost" aria-label="Retry">
+        {(status === "error") && !busy && (
+          <button onClick={retry} className="btn btn-ghost" aria-label="Retry">
             Retry
           </button>
         )}
@@ -242,11 +280,12 @@ export default function FileRow({ file }) {
 
 function StatusChip({ value }) {
   const colors = {
-    pending:  { bg:"#f3f4f6", fg:"#374151", label:"pending" },
-    processing:{ bg:"#fef3c7", fg:"#92400e", label:"processing" },
-    done:     { bg:"#dcfce7", fg:"#065f46", label:"done" },
-    failed:   { bg:"#fee2e2", fg:"#991b1b", label:"failed" },
-  }[value] || { bg:"#eef2ff", fg:"#334155", label:value };
+    idle:       { bg:"#f3f4f6", fg:"#374151", label:"idle" },
+    processing: { bg:"#fef3c7", fg:"#92400e", label:"processing" },
+    ocr_done:   { bg:"#dcfce7", fg:"#065f46", label:"ocr_done" },
+    pdf_ready:  { bg:"#dbeafe", fg:"#1e3a8a", label:"pdf_ready" },
+    error:      { bg:"#fee2e2", fg:"#991b1b", label:"error" },
+  }[value] || { bg:"#eef2ff", fg:"#334155", label:String(value || "idle") };
 
   return (
     <span style={{
@@ -258,3 +297,4 @@ function StatusChip({ value }) {
   );
 }
 
+export default FileRow;

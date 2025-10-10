@@ -79,7 +79,7 @@ export default function AssignmentsPage() {
 
       let query = supa
         .from("uploads")
-        .select("id,storage_path,original_name,mime_type,size_bytes,uploaded_at,assignment_id,status,extracted_text,ocr_error")
+        .select("id,storage_path,original_name,mime_type,size_bytes,uploaded_at,assignment_id,status,extracted_text,ocr_error,graded_pdf_path,verdicts")
         .eq("owner_id", userId)
         .order("uploaded_at", { ascending: false });
 
@@ -104,6 +104,8 @@ export default function AssignmentsPage() {
             status: row.status || "pending",
             extracted_text: row.extracted_text || "",
             ocr_error: row.ocr_error || null,
+            graded_pdf_path: row.graded_pdf_path || null,
+            verdicts: row.verdicts || null,
           };
         })
       );

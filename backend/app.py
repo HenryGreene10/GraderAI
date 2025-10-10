@@ -90,6 +90,15 @@ from .services.grader import (
     RUBRIC_VERSION,
     PROMPT_VERSION,
 )
+try:
+    from .regioner import infer_regions  # type: ignore
+    from .stamper import stamp_pdf       # type: ignore
+except Exception:
+    # Fallback tiny shims if optional modules are unavailable
+    def infer_regions(ocr_boxes):  # type: ignore
+        return {"q5": [], "q6a": [], "q6b": []}
+    def stamp_pdf(image_bytes, regions, verdicts):  # type: ignore
+        return image_bytes
 
 # ---------------------------------------
 # App logger + env bootstrap
@@ -212,12 +221,17 @@ _allowed = ["http://localhost:5173", "http://127.0.0.1:5173"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     allow_credentials=True,
     max_age=600,
 )
 logger.info("[boot] CORS installed first")
+
+# Explicit preflight for graded PDF endpoint
+@app.options("/api/uploads/{upload_id}/pdf")
+def _preflight_pdf(upload_id: str) -> Response:
+    return Response(status_code=200)
 
 # Generic OPTIONS handler for safety (CORS preflight)
 @app.options("/api/{path:path}")
@@ -575,7 +589,7 @@ async def ocr_start(
             resp0 = (
                 client
                 .table("uploads")
-                .select("id, owner_id, storage_path, mime_type, extracted_text, ocr_status, ocr_error")
+                .select("id, owner_id, storage_path, mime_type, extracted_text, ocr_status, ocr_error, ocr_boxes, graded_pdf_path, verdicts")
                 .eq("id", upload_id)
                 .limit(1)
                 .execute()
@@ -611,16 +625,34 @@ async def ocr_start(
 
         text = result.get("text") or ""
         meta = result.get("meta") or {}
-        status = "ok" if text else "fail"
+        boxes = result.get("boxes") or {}
+        status = OCR_DONE if text else OCR_ERROR
         err = meta.get("error")
-        _safe_update_upload(upload_id, {
-            "ocr_text": text,
-            "ocr_meta": meta,
-            "ocr_status": status,
-            "ocr_error": err,
-            "ocr_completed_at": _utc_iso(),
-            "ocr_updated_at": _utc_iso(),
-        })
+
+        # Persist boxes & text together in a single update
+        try:
+            supabase.table("uploads").update({
+                "extracted_text": text,
+                "ocr_boxes": boxes,
+                "ocr_completed_at": dt.utcnow().isoformat(),
+                "ocr_status": OCR_DONE,
+            }).eq("id", upload_id).execute()
+        except Exception as _e:
+            # Fallback to safe updater if needed
+            _safe_update_upload(upload_id, {
+                "extracted_text": text,
+                "ocr_boxes": boxes,
+                "ocr_completed_at": _utc_iso(),
+                "ocr_status": OCR_DONE,
+            })
+
+        # Log counts
+        try:
+            pages = (boxes or {}).get("pages") or []
+            line_count = sum(len((p or {}).get("lines") or []) for p in pages)
+            logger.info("saved_ocr boxes_count=%s text_len=%s", line_count, len(text))
+        except Exception:
+            pass
         return {"ok": True, "chars": len(text or ""), "status": status, "error": err}
 
         # trocr_local: download bytes from Storage and run provider
@@ -942,6 +974,7 @@ async def ocr_start(
             final_payload = {
                 "extracted_text": text,
                 "ocr_text": text,
+                "ocr_boxes": (data or {}).get("pages"),
                 "ocr_status": OCR_DONE,
                 "ocr_completed_at": _utc_iso(),
                 "ocr_updated_at": _utc_iso(),
@@ -1131,7 +1164,7 @@ def _select_upload_row(supabase, upload_id: str):
     """
     resp = (
         supabase.table("uploads")
-        .select("id, owner_id, storage_path, status, extracted_text")
+        .select("id, owner_id, storage_path, status, extracted_text, graded_pdf_path, ocr_boxes, verdicts")
         .eq("id", upload_id)
         .maybe_single()
         .execute()
@@ -1153,7 +1186,7 @@ def _safe_select_status(uid: str):
         r = (
             supabase.table("uploads")
             .select(
-                "id,owner_id,status,extracted_text,ocr_status,ocr_error,ocr_started_at,ocr_completed_at,ocr_updated_at"
+                "id,owner_id,status,extracted_text,ocr_status,ocr_error,ocr_started_at,ocr_completed_at,ocr_updated_at,graded_pdf_path"
             )
             .eq("id", uid)
             .execute()
@@ -1280,17 +1313,83 @@ async def run_ocr_azure_vision(storage_path: str):
             if status == "failed":
                 return {"text": "", "meta": {"provider": "azure_vision", "status": status, "result": data}}
             if status == "succeeded":
-                lines = []
+                # Build text and minimal ocr_boxes structure (tolerant to v3/v4 shapes)
                 try:
-                    pages = data.get("analyzeResult", {}).get("readResults") or []
-                    for pg in pages:
-                        for ln in pg.get("lines", []):
-                            t = ln.get("text") or ""
-                            if t:
-                                lines.append(t)
+                    ar = data.get("analyzeResult", {}) or {}
+                    pages_v4 = ar.get("pages") or []
+                    read_results = ar.get("readResults") or []
+
+                    text_lines: list[str] = []
+                    ocr_boxes = {"width": None, "height": None, "unit": None, "pages": []}
+
+                    if pages_v4:
+                        # Prefer v4 pages shape
+                        first = pages_v4[0]
+                        ocr_boxes["width"] = first.get("width")
+                        ocr_boxes["height"] = first.get("height")
+                        ocr_boxes["unit"] = first.get("unit") or "pixel"
+                        for p in pages_v4:
+                            lines_out = []
+                            for ln in (p.get("lines") or []):
+                                txt = ln.get("content") or ln.get("text") or ""
+                                if txt:
+                                    text_lines.append(txt)
+                                poly = ln.get("polygon") or ln.get("boundingBox") or []
+                                try:
+                                    xs = [float(poly[i]) for i in range(0, len(poly), 2)]
+                                    ys = [float(poly[i]) for i in range(1, len(poly), 2)]
+                                    if xs and ys:
+                                        min_x, min_y = min(xs), min(ys)
+                                        max_x, max_y = max(xs), max(ys)
+                                        bbox = [min_x, min_y, max_x - min_x, max_y - min_y]
+                                    else:
+                                        bbox = None
+                                except Exception:
+                                    bbox = None
+                                lines_out.append({"text": txt, "bbox": bbox})
+                            ocr_boxes["pages"].append({
+                                "number": p.get("pageNumber") or p.get("page") or None,
+                                "lines": lines_out,
+                            })
+                    elif read_results:
+                        # Legacy v3 readResults lines
+                        first = read_results[0] if read_results else {}
+                        # No width/height/unit in v3 readResults; leave None
+                        for pg in read_results:
+                            lines_out = []
+                            for ln in (pg.get("lines") or []):
+                                txt = ln.get("text") or ln.get("content") or ""
+                                if txt:
+                                    text_lines.append(txt)
+                                poly = ln.get("boundingBox") or ln.get("polygon") or []
+                                try:
+                                    xs = [float(poly[i]) for i in range(0, len(poly), 2)]
+                                    ys = [float(poly[i]) for i in range(1, len(poly), 2)]
+                                    if xs and ys:
+                                        min_x, min_y = min(xs), min(ys)
+                                        max_x, max_y = max(xs), max(ys)
+                                        bbox = [min_x, min_y, max_x - min_x, max_y - min_y]
+                                    else:
+                                        bbox = None
+                                except Exception:
+                                    bbox = None
+                                lines_out.append({"text": txt, "bbox": bbox})
+                            ocr_boxes["pages"].append({
+                                "number": pg.get("page") or None,
+                                "lines": lines_out,
+                            })
+                    else:
+                        # Unknown shape; return raw
+                        return {"text": "", "meta": {"provider": "azure_vision", "status": status, "raw": data}}
+
                 except Exception as e:
                     return {"text": "", "meta": {"provider": "azure_vision", "status": status, "parse_error": str(e), "raw": data}}
-                return {"text": "\n".join(lines).strip(), "meta": {"provider": "azure_vision", "status": status}}
+
+                return {
+                    "text": "\n".join(text_lines).strip(),
+                    "meta": {"provider": "azure_vision", "status": status},
+                    "boxes": ocr_boxes,
+                }
         return {"text": "", "meta": {"provider": "azure_vision", "error": "timeout"}}
 
 async def _download_bytes(url: str) -> bytes:
@@ -1643,6 +1742,15 @@ async def start_grade(
 
     # 6) Update DB row with grading metadata
     try:
+        verdicts = [
+            {
+                "question_id": i.question_id,
+                "correct": bool(i.score >= i.max_score),
+                "score": i.score,
+                "max_score": i.max_score,
+            }
+            for i in getattr(result, "items", [])
+        ]
         supabase.table("uploads").update({
             "rubric_version": result.rubric_version,
             "prompt_version": result.prompt_version,
@@ -1650,6 +1758,7 @@ async def start_grade(
             "graded_pdf_path": pdf_key,
             "overlay_path": overlay_key,
             "grade_json": json.dumps(result.model_dump()),
+            "verdicts": verdicts,
         }).eq("id", row["id"]).execute()
     except Exception as e:
         logger.warning("uploads update failed: %s", e)
@@ -1684,7 +1793,7 @@ def start_grade_start(
     caller_id = x_owner_id or x_user_id
     resp = (
         supabase.table("uploads")
-        .select("id, owner_id, extracted_text, ocr_text")
+        .select("id, owner_id, extracted_text, ocr_text, graded_pdf_path, verdicts")
         .eq("id", body.upload_id)
         .maybe_single()
         .execute()
@@ -1704,6 +1813,174 @@ def start_grade_start(
         "total_score": result.total_score,
         "items": [item.model_dump() for item in result.items],
     }
+
+
+class VerdictsBody(BaseModel):
+    per_question: dict[str, str]
+
+
+@app.post("/api/uploads/{upload_id}/verdicts")
+def set_upload_verdicts(
+    upload_id: str,
+    body: VerdictsBody,
+    x_user_id: Optional[str] = Header(None),
+    x_owner_id: Optional[str] = Header(None),
+):
+    _require_supabase_config()
+    caller_id = x_owner_id or x_user_id
+
+    resp = (
+        supabase.table("uploads")
+        .select("id, owner_id, verdicts")
+        .eq("id", upload_id)
+        .maybe_single()
+        .execute()
+    )
+    row = getattr(resp, "data", None)
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    if REQUIRE_OWNER and caller_id and str(row.get("owner_id")) != str(caller_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    allowed = {"correct", "incorrect", "partial"}
+    pq = body.per_question or {}
+    norm: dict[str, str] = {}
+    for k, v in pq.items():
+        val = str(v or "").strip().lower()
+        if val not in allowed:
+            raise HTTPException(status_code=400, detail={"detail": "invalid_verdict", "question_id": k, "value": v})
+        if k:
+            norm[str(k)] = val
+
+    supabase.table("uploads").update({"verdicts": norm}).eq("id", row["id"]).execute()
+    return {"status": "ok", "verdicts": norm}
+
+
+@app.post("/api/uploads/{upload_id}/pdf")
+def build_stamped_pdf(
+    upload_id: str,
+    x_user_id: Optional[str] = Header(None),
+    x_owner_id: Optional[str] = Header(None),
+):
+    """Generate graded PDF using existing OCR boxes and verdicts."""
+    _require_supabase_config()
+    caller_id = x_owner_id or x_user_id
+    try:
+        # Fetch upload row and authz
+        resp = (
+            supabase.table("uploads")
+            .select("id, owner_id, storage_path, ocr_boxes, verdicts")
+            .eq("id", upload_id)
+            .maybe_single()
+            .execute()
+        )
+        row = getattr(resp, "data", None)
+        if not row:
+            raise HTTPException(status_code=404, detail="Upload not found")
+        if REQUIRE_OWNER and caller_id and str(row.get("owner_id")) != str(caller_id):
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        if not row.get("ocr_boxes"):
+            raise HTTPException(status_code=409, detail="OCR boxes missing — run OCR")
+        if not row.get("verdicts"):
+            raise HTTPException(status_code=409, detail="Verdicts not set")
+
+        storage_path = row.get("storage_path")
+        if not storage_path:
+            raise HTTPException(status_code=404, detail="Missing storage_path")
+
+        # Download original submission bytes from submissions bucket
+        original_bytes = _download_bytes_from_storage(storage_path)
+
+        # Build regions and stamp the PDF
+        regions = infer_regions(row.get("ocr_boxes"))
+        pdf_bytes = stamp_pdf(original_bytes, regions, row.get("verdicts"))
+
+        # Upload to graded-pdfs bucket under graded/{owner}/{id}.pdf
+        owner_id = row.get("owner_id") or caller_id or "unknown"
+        key = f"graded/{owner_id}/{row['id']}.pdf"
+        bucket = "graded-pdfs"
+        try:
+            # Log size before upload
+            try:
+                logger.info("graded_pdf_bytes=%s path=%s", len(pdf_bytes or b""), key)
+            except Exception:
+                pass
+            supabase.storage.from_(bucket).upload(
+                key,
+                pdf_bytes,
+                {"content-type": "application/pdf", "upsert": True},
+            )
+        except Exception as e:
+            try:
+                logger.exception("graded upload failed: %s", e)
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"upload_failed: {e}")
+
+        # Update DB and sign URL
+        try:
+            supabase.table("uploads").update({
+                "graded_pdf_path": key,
+                "ocr_updated_at": _utc_iso(),
+            }).eq("id", row["id"]).execute()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"persist_failed: {e}")
+
+        try:
+            signed = supabase.storage.from_(bucket).create_signed_url(key, 86400)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"sign_url_failed: {e}")
+
+        return {"path": key, "signedUrl": (signed or {}).get("signedURL")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            logger.exception("pdf_error: %s", e)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"pdf_error: {e}")
+
+
+@app.get("/api/uploads/{upload_id}/pdf/debug")
+def debug_download_graded_pdf(
+    upload_id: str,
+    x_user_id: Optional[str] = Header(None),
+    x_owner_id: Optional[str] = Header(None),
+):
+    """Stream graded PDF bytes directly for local debugging."""
+    _require_supabase_config()
+    caller_id = x_owner_id or x_user_id
+    try:
+        resp = (
+            supabase.table("uploads")
+            .select("id, owner_id, graded_pdf_path")
+            .eq("id", upload_id)
+            .maybe_single()
+            .execute()
+        )
+        row = getattr(resp, "data", None)
+        if not row:
+            raise HTTPException(status_code=404, detail="Upload not found")
+        if REQUIRE_OWNER and caller_id and str(row.get("owner_id")) != str(caller_id):
+            raise HTTPException(status_code=403, detail="Forbidden")
+        path = row.get("graded_pdf_path")
+        if not path:
+            raise HTTPException(status_code=404, detail="No graded_pdf_path")
+        try:
+            blob = supabase.storage.from_("graded-pdfs").download(path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"download_failed: {e}")
+        return Response(content=blob, media_type="application/pdf")
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            logger.exception("pdf_debug_error: %s", e)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"pdf_debug_error: {e}")
 
 
 # Upload deletion (storage-first, then DB)
@@ -1768,7 +2045,7 @@ async def get_upload_ocr(
     resp = (
         supabase_sr
         .table("uploads")
-        .select("id, owner_id, ocr_text, extracted_text, ocr_meta, ocr_status, ocr_error")
+        .select("id, owner_id, ocr_text, extracted_text, ocr_meta, ocr_status, ocr_error, ocr_boxes")
         .eq("id", upload_id)
         .maybe_single()
         .execute()
