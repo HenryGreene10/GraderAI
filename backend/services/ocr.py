@@ -90,3 +90,11 @@ def _provider() -> BaseOCRProvider:
 async def extract_text(image_bytes: Optional[bytes] = None, image_url: Optional[str] = None) -> dict:
     prov = _provider()
     return await prov.extract_text(image_bytes=image_bytes, image_url=image_url)
+
+
+def normalize_ocr_result(raw: dict) -> dict:
+    return {
+        "text": (raw or {}).get("text") or "",
+        "boxes": (raw or {}).get("boxes") or (raw or {}).get("pages"),
+        "confidence": (raw or {}).get("confidence"),
+    }

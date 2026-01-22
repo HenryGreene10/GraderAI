@@ -5,7 +5,3 @@ supabase
 python-dotenv
 python-multipart
 reportlab
-transformers>=4.42
-torch
-pillow
-pymupdf
