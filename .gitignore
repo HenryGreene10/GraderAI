@@ -17,8 +17,10 @@ coverage/
 # Env / secrets
 .env
 *.env
+.env.local
 backend/.env
 frontend/.env
+frontend/.env.local
 
 # OS
 .DS_Store
