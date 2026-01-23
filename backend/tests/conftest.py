@@ -9,6 +9,7 @@ os.environ.setdefault("OCR_MOCK", "1")
 os.environ.setdefault("OCR_PROVIDER", "mock")
 os.environ.pop("HF_TOKEN", None)
 os.environ.setdefault("CORS_ALLOW_ORIGINS", "http://localhost:5173")
+os.environ.setdefault("SUPABASE_JWT_SECRET", "test-jwt-secret")
 
 
 class _Resp:

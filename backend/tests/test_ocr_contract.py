@@ -1,10 +1,38 @@
+import base64
+import hashlib
+import hmac
+import json
+import os
+import time
+
 from fastapi.testclient import TestClient
 
 from backend.app import app
 
 
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
+
+
+def _make_token(user_id="owner-1"):
+    secret = os.environ.get("SUPABASE_JWT_SECRET", "")
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {"sub": user_id, "exp": int(time.time()) + 3600}
+    header_b64 = _b64url(json.dumps(header).encode("utf-8"))
+    payload_b64 = _b64url(json.dumps(payload).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+    sig = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    return f"{header_b64}.{payload_b64}.{_b64url(sig)}"
+
+
 def _auth_headers(user_id="owner-1"):
-    return {"X-Owner-Id": user_id, "X-User-Id": user_id}
+    return {"Authorization": f"Bearer {_make_token(user_id)}"}
+
+
+def test_ocr_requires_auth():
+    client = TestClient(app)
+    r = client.post("/api/ocr/start", json={"upload_id": "u3"})
+    assert r.status_code == 401
 
 
 def test_ocr_start_happy_path(fake_supabase, monkeypatch):

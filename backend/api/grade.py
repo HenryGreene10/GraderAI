@@ -1,14 +1,14 @@
 import datetime as dt
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from ..auth import get_current_user_id
 from ..config import (
     GRADED_BUCKET,
     OCR_REVIEW_THRESHOLD,
     OVERLAYS_BUCKET,
-    REQUIRE_OWNER,
 )
 from ..models.schemas import GradeResult, Overlay
 from ..services import ocr as ocr_service
@@ -86,17 +86,14 @@ async def _ensure_ocr(row: dict) -> dict:
 @router.post("/api/grade")
 async def start_grade(
     body: StartGradeBody,
-    x_owner_id: Optional[str] = Header(None),
-    x_user_id: Optional[str] = Header(None),
+    user_id: str = Depends(get_current_user_id),
 ):
-    caller_id = x_owner_id or x_user_id
+    caller_id = user_id
     row = get_upload(
         body.upload_id,
         caller_id,
         columns="id,owner_id,storage_path,ocr_text,extracted_text,ocr_boxes,ocr_confidence",
     )
-    if REQUIRE_OWNER and caller_id and str(row.get("owner_id")) != str(caller_id):
-        raise HTTPException(status_code=403, detail="Forbidden")
 
     ocr_result = await _ensure_ocr(row)
     text = ocr_result["text"]

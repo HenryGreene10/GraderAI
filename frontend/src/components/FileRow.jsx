@@ -4,6 +4,22 @@ import { startOCR } from "../lib/ocr";
 import { API_BASE } from "../lib/apiBase";
 import { supabase } from "../lib/supabaseClient";
 
+async function getAuthHeaders() {
+  const [{ data: userData }, { data: sessionData }] = await Promise.all([
+    supabase.auth.getUser(),
+    supabase.auth.getSession(),
+  ]);
+  const ownerId = userData?.user?.id;
+  const token = sessionData?.session?.access_token;
+  const headers = {};
+  if (ownerId) {
+    headers["X-Owner-Id"] = ownerId;
+    headers["X-User-Id"] = ownerId;
+  }
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
 function FileRow({ file }) {
   const [row, setRow] = useState(() => ({
     ...file,
@@ -53,11 +69,10 @@ function FileRow({ file }) {
 
   // Update OCR status only (no text shown)
   const refreshOCR = async () => {
-    const { data } = await supabase.auth.getUser();
-    const ownerId = data?.user?.id;
-    const r = await fetch(`${API_BASE}/api/uploads/${file.id}/ocr`, {
+    const headers = await getAuthHeaders();
+    const r = await fetch(`${API_BASE}/api/ocr/status/${file.id}`, {
       method: "GET",
-      headers: ownerId ? { "X-Owner-Id": ownerId, "X-User-Id": ownerId } : {},
+      headers,
     });
     const j = await r.json().catch(() => ({}));
     const st = String(j?.status || row.ocr_status || "pending").toLowerCase();
@@ -88,18 +103,16 @@ function FileRow({ file }) {
     try {
       setBusy(true);
       setErr("");
-      // Prefer new route; fallback to legacy
-      let ok = false;
-      await fetch(`${API_BASE}/api/ocr/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ upload_id: String(file.id) }),
-      });
-      setRow((r) => ({ ...r, ocr_status: "processing" }));
-      setStatus("processing");
-      await new Promise((res) => setTimeout(res, 1500));
-      await refreshOCR();
-      setStatus("ocr_done");
+      const resp = await startOCR(file.id);
+      if (resp && (resp.status === "done" || resp.ocr_status === "done")) {
+        setRow((r) => ({ ...r, ocr_status: "done", text_len: Number(resp.text_len || 0) }));
+        setStatus("ocr_done");
+      } else {
+        setRow((r) => ({ ...r, ocr_status: "processing" }));
+        setStatus("processing");
+        await new Promise((res) => setTimeout(res, 1500));
+        await refreshOCR();
+      }
     } catch (e) {
       setErr(e?.message || "Failed to start");
       setRow((r) => ({ ...r, ocr_status: "failed" }));
@@ -156,10 +169,11 @@ function FileRow({ file }) {
       if (!allowed.has(q6b)) { showToast("Invalid verdict"); return; }
 
       const body = { per_question: { q5, q6a, q6b } };
-      const res = await fetch(`${API_BASE}/api/uploads/${file.id}/verdicts`, {
+      const headers = await getAuthHeaders();
+      const res = await fetch(`${API_BASE}/api/override`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        headers: { "Content-Type": "application/json", ...headers },
+        body: JSON.stringify({ upload_id: String(file.id), overrides: body }),
       });
       if (!res.ok) {
         const detail = await res.text().catch(() => "");
@@ -175,25 +189,30 @@ function FileRow({ file }) {
 
   const createPdf = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/uploads/${file.id}/pdf`, { method: "POST" });
+      const headers = await getAuthHeaders();
+      const res = await fetch(`${API_BASE}/api/grade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+        body: JSON.stringify({ upload_id: String(file.id) }),
+      });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         showToast(String(data?.detail || `Failed: ${res.status}`));
         return;
       }
-      setGradedPath(data.path || null);
+      setGradedPath(data.graded_pdf_path || data.path || null);
       const signed = data?.signedUrl
         ? `${data.signedUrl}${String(data.signedUrl).includes("?") ? "&" : "?"}t=${Date.now()}`
         : null;
       setGradedSigned(signed);
       setStatus("pdf_ready");
-      showToast("Graded PDF ready");
+      showToast("Grading complete");
     } catch (e) {
       showToast(e?.message || "Failed to create PDF");
     }
   };
 
-  const hasVerdicts = verdicts && Object.keys(verdicts).length > 0;
+  const hasOverrides = verdicts && Object.keys(verdicts).length > 0;
 
   return (
     <div style={{ display:"flex", gap:12, alignItems:"flex-start", padding:"10px 0", position: "relative" }}>
@@ -236,10 +255,15 @@ function FileRow({ file }) {
           <button type="button" className="btn btn-ghost" onClick={handleRunOCR} disabled={busy}>
             Run OCR
           </button>
-          <button type="button" className="btn btn-ghost" onClick={setVerdictsPrompt}>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            onClick={setVerdictsPrompt}
+            title={hasOverrides ? "Overrides saved" : "Set manual overrides"}
+          >
             Set verdicts
           </button>
-          <button type="button" className="btn btn-ghost" onClick={createPdf} disabled={!hasVerdicts} title={!hasVerdicts ? "Set verdicts first" : ""}>
+          <button type="button" className="btn btn-ghost" onClick={createPdf}>
             Create graded PDF
           </button>
           {(gradedSigned || gradedPath || row.graded_pdf_path) && (

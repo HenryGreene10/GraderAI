@@ -9,17 +9,30 @@ async function getOwnerId() {
   return data.user.id;
 }
 
+async function getAuthHeaders(ownerId) {
+  const { data } = await supabase.auth.getSession();
+  const token = data?.session?.access_token;
+  const headers = {};
+  if (ownerId) {
+    headers["X-Owner-Id"] = ownerId;
+    headers["X-User-Id"] = ownerId;
+  }
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
 /** Start OCR on a specific upload row */
 export async function startOCR(uploadId, ownerIdParam) {
   if (!uploadId) throw new Error("uploadId is required");
   const ownerId = ownerIdParam || (await getOwnerId());
+  const authHeaders = await getAuthHeaders(ownerId);
 
   const r = await fetch(`${API_BASE}/api/ocr/start`, {
     method: "POST",
     mode: "cors",
     headers: {
       "Content-Type": "application/json",
-      "x-owner-id": ownerId,
+      ...authHeaders,
     },
     body: JSON.stringify({ upload_id: uploadId }),
   });
@@ -40,14 +53,12 @@ export async function startOCR(uploadId, ownerIdParam) {
 export async function getOCRStatus(uploadId) {
   if (!uploadId) throw new Error("uploadId is required");
   const ownerId = await getOwnerId();
+  const authHeaders = await getAuthHeaders(ownerId);
 
   const r = await fetch(`${API_BASE}/api/ocr/status/${uploadId}`, {
     method: "GET",
     mode: "cors",
-    headers: {
-      "X-Owner-Id": ownerId,
-      "X-User-Id": ownerId,
-    },
+    headers: authHeaders,
   });
 
   if (!r.ok) {
@@ -68,13 +79,11 @@ export function pollOCR(uploadId, onTick, intervalMs = 1500) {
   (async function loop() {
     try {
       const ownerId = await getOwnerId();
+      const authHeaders = await getAuthHeaders(ownerId);
       // simple polling loop
       while (!stopped) {
         const r = await fetch(`${API_BASE}/api/ocr/status/${uploadId}`, {
-          headers: {
-            "X-Owner-Id": ownerId,
-            "X-User-Id": ownerId,
-          },
+          headers: authHeaders,
           mode: "cors",
         });
         const json = await r.json().catch(() => ({}));

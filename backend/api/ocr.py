@@ -1,9 +1,9 @@
 import datetime as dt
-from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from ..auth import get_current_user_id
 from ..services import ocr
 from ..services.db import get_upload, update_upload
 from ..services.ocr import normalize_ocr_result
@@ -28,11 +28,9 @@ def _utc_iso() -> str:
 @router.post("/start")
 async def start_ocr(
     body: StartOCRBody,
-    x_owner_id: Optional[str] = Header(None),
-    x_user_id: Optional[str] = Header(None),
+    user_id: str = Depends(get_current_user_id),
 ):
-    caller_id = x_owner_id or x_user_id
-    row = get_upload(body.upload_id, caller_id, columns="id,owner_id,storage_path")
+    row = get_upload(body.upload_id, user_id, columns="id,owner_id,storage_path")
     storage_path = row.get("storage_path")
     if not storage_path:
         raise HTTPException(status_code=400, detail="Missing storage_path")
@@ -91,13 +89,11 @@ async def start_ocr(
 @router.get("/status/{upload_id}")
 def ocr_status(
     upload_id: str,
-    x_owner_id: Optional[str] = Header(None),
-    x_user_id: Optional[str] = Header(None),
+    user_id: str = Depends(get_current_user_id),
 ):
-    caller_id = x_owner_id or x_user_id
     row = get_upload(
         upload_id,
-        caller_id,
+        user_id,
         columns="id,owner_id,ocr_status,ocr_error,ocr_text,extracted_text",
     )
     text = (row.get("ocr_text") or row.get("extracted_text") or "").strip()

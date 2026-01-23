@@ -1,9 +1,10 @@
 import datetime as dt
-from typing import Any, Optional
+from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from ..auth import get_current_user_id
 from ..services.db import get_upload, update_upload
 from ..services.supabase_client import get_supabase
 
@@ -22,11 +23,9 @@ def _utc_iso() -> str:
 @router.post("/override")
 def apply_override(
     body: OverrideBody,
-    x_owner_id: Optional[str] = Header(None),
-    x_user_id: Optional[str] = Header(None),
+    user_id: str = Depends(get_current_user_id),
 ):
-    caller_id = x_owner_id or x_user_id
-    row = get_upload(body.upload_id, caller_id, columns="id,owner_id")
+    row = get_upload(body.upload_id, user_id, columns="id,owner_id")
 
     sb = get_supabase()
     if sb is None:
@@ -36,7 +35,7 @@ def apply_override(
         sb.table("overrides").insert(
             {
                 "upload_id": row["id"],
-                "owner_id": row.get("owner_id") or caller_id,
+                "owner_id": row.get("owner_id") or user_id,
                 "overrides_json": body.overrides,
                 "created_at": _utc_iso(),
                 "updated_at": _utc_iso(),

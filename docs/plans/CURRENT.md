@@ -21,8 +21,10 @@ Stabilize the simplified backend + Supabase setup and align the frontend with th
 
 ## Tickets
 
-### 1) Supabase setup + verification
+### 1) Supabase setup + verification - [x] DONE — Supabase setup + verification
 Short scope: create buckets and RLS; verify backend can read/write.
+Status: DONE (schema applied; buckets created; storage + table RLS enforced; auth.uid() prefix; authenticated-only)
+Notes: Policy names messy but conditions verified identical; leaving as-is.
 
 Acceptance checks
 - Migration applied and schema matches `migrations/2025-01-21_init_schema.sql`.
@@ -31,6 +33,7 @@ Acceptance checks
 - Backend health: basic read/write to each bucket succeeds via service role.
 
 ### 2) Frontend update to new endpoints
+Notes: Backend auth verifies Supabase JWT (Authorization: Bearer ...) and uses sub for ownership.
 Update client calls to use the simplified backend routes:
 - `POST /api/ocr/start`
 - `GET /api/ocr/status/{id}`
