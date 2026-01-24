@@ -1,18 +1,25 @@
 # Current Plan (GraderAI MVP)
 
 ## Current objective
-Stabilize the simplified backend + Supabase setup and align the frontend with the new API contracts so grading flow (OCR -> grade -> PDF -> overrides) can be validated end-to-end.
+Make the UI the source of truth and validate the real workflow: upload -> auto OCR -> grade -> PDF -> override.
 
 ## Supabase setup checklist
-- Apply `migrations/2025-01-21_init_schema.sql` to the project database.
-- Create storage buckets: `submissions`, `graded-pdfs`, `overlays`.
-- RLS policies summary:
-  - Tables: owner/teacher rows are scoped by `auth.uid()`.
+- Status: DONE / verified for local dev.
+- Migration applied: `migrations/2025-01-21_init_schema.sql`.
+- Buckets created: `submissions`, `graded-pdfs`, `overlays`.
+- RLS policies verified:
+  - Tables: owner/teacher rows scoped by `auth.uid()`.
   - Storage: enforce `auth.uid()` prefix in object paths and bucket name allowlists.
+
+## Local dev setup (short)
+- Backend env includes `SUPABASE_JWT_SECRET` (JWT auth).
+- Frontend uses `frontend/.env.local` with `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_API_BASE_URL`.
+- Do not commit `.env.local`.
 
 ## Backend env vars
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
+- `SUPABASE_JWT_SECRET`
 - `SUBMISSIONS_BUCKET`
 - `GRADED_BUCKET`
 - `OVERLAYS_BUCKET`
@@ -21,35 +28,52 @@ Stabilize the simplified backend + Supabase setup and align the frontend with th
 
 ## Tickets
 
-### 1) Supabase setup + verification - [x] DONE — Supabase setup + verification
-Short scope: create buckets and RLS; verify backend can read/write.
-Status: DONE (schema applied; buckets created; storage + table RLS enforced; auth.uid() prefix; authenticated-only)
-Notes: Policy names messy but conditions verified identical; leaving as-is.
-
+### Ticket 1 — Supabase foundation (DONE)
+Scope: schema, buckets, RLS, and verified backend read/write via service role.
 Acceptance checks
 - Migration applied and schema matches `migrations/2025-01-21_init_schema.sql`.
 - Buckets exist with expected names.
 - RLS policies enforce `auth.uid()` ownership and storage path prefix constraints.
-- Backend health: basic read/write to each bucket succeeds via service role.
+- Backend read/write succeeds to tables and buckets.
 
-### 2) Frontend update to new endpoints
-Notes: Backend auth verifies Supabase JWT (Authorization: Bearer ...) and uses sub for ownership.
-Update client calls to use the simplified backend routes:
-- `POST /api/ocr/start`
-- `GET /api/ocr/status/{id}`
-- `POST /api/grade`
-- `POST /api/override`
-
+### Ticket 2 — Local dev wiring (DONE)
+Scope: local env wiring for frontend and backend auth.
 Acceptance checks
-- New endpoints are called with expected payloads.
-- OCR flow: start -> poll status -> results displayed.
-- Grade flow: submission -> grades -> overlays/PDF links render.
-- Override flow: update persists and re-renders.
+- `frontend/.env.local` drives Supabase client via `import.meta.env`.
+- `VITE_API_BASE_URL` routes frontend to local backend.
+- App no longer shows "Missing Supabase env" when vars are present.
 
-### 3) Frontend encoding fixes
-Resolve encoding issues in UI rendering and content handling.
-
+### Ticket 3 — Uploads UI becomes source of truth (NEXT)
+Scope: the uploads list is the canonical view for storage + DB state.
 Acceptance checks
-- `frontend/src/pages/Dashboard.jsx` renders without encoding glitches.
-- `frontend/src/pages/AssignmentsPage.jsx` renders without encoding glitches.
+- Uploaded items appear in the UI list.
+- Preview works for each upload.
+- Delete removes the storage object and its DB row.
+
+### Ticket 4 — OCR pipeline (auto) (TODO)
+Scope: auto-trigger OCR and surface minimal status/results in the UI.
+Acceptance checks
+- Upload triggers `POST /api/ocr/start` automatically.
+- Polling updates status in the list/details view.
+- OCR result is stored and minimally displayed.
+
+### Ticket 5 — Grade + PDF (TODO)
+Scope: UI can run grading and open the produced PDF.
+Acceptance checks
+- `POST /api/grade` works from the UI with auth headers.
+- Grade result is stored and visible in the UI.
+- PDF link renders and opens.
+
+### Ticket 6 — Overrides (TODO)
+Scope: teacher overrides persist and re-render outputs.
+Acceptance checks
+- `POST /api/override` persists changes.
+- Overrides re-render overlay and PDF.
+- UI shows override state.
+
+### Ticket 7 — Frontend polish / encoding fixes (LATER)
+Scope: UI cleanup, encoding warnings removed, and small UX refinements.
+Acceptance checks
 - No console warnings related to invalid characters/encoding.
+- Dashboard and Assignments pages render cleanly.
+- Visual polish pass applied to upload + results views.
