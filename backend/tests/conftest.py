@@ -9,7 +9,6 @@ os.environ.setdefault("OCR_MOCK", "1")
 os.environ.setdefault("OCR_PROVIDER", "mock")
 os.environ.pop("HF_TOKEN", None)
 os.environ.setdefault("CORS_ALLOW_ORIGINS", "http://localhost:5173")
-os.environ.setdefault("SUPABASE_JWT_SECRET", "test-jwt-secret")
 
 
 class _Resp:
@@ -66,6 +65,24 @@ class FakeTable:
         return _Resp(None)
 
 
+class FakeAuth:
+    def __init__(self, token_map=None):
+        self.token_map = token_map or {}
+
+    def get_user(self, token):
+        if not token:
+            raise Exception("invalid token")
+        user_id = self.token_map.get(token)
+        if not user_id:
+            if token.startswith("user:"):
+                user_id = token.split("user:", 1)[1]
+            else:
+                user_id = token
+        if not user_id:
+            raise Exception("invalid token")
+        return {"user": {"id": user_id}}
+
+
 class FakeBucket:
     def __init__(self, storage, name):
         self.storage = storage
@@ -98,6 +115,7 @@ class FakeSupabase:
     def __init__(self, db):
         self._db = db
         self.storage = FakeStorage()
+        self.auth = FakeAuth()
 
     def table(self, name):
         return FakeTable(self._db, name)

@@ -1,77 +1,73 @@
-import base64
-import hashlib
-import hmac
-import json
-import time
 from typing import Any, Optional
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 
-from .config import SUPABASE_JWT_SECRET
-
-
-def _b64url_decode(data: str) -> bytes:
-    padded = data + "=" * (-len(data) % 4)
-    return base64.urlsafe_b64decode(padded.encode("utf-8"))
+from .services.supabase_client import get_supabase
 
 
-def _verify_supabase_jwt(token: str) -> dict[str, Any]:
-    try:
-        header_b64, payload_b64, sig_b64 = token.split(".")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+def _extract_user(resp: Any) -> Optional[Any]:
+    if resp is None:
+        return None
+    if isinstance(resp, dict):
+        if "user" in resp:
+            return resp.get("user")
+        data = resp.get("data")
+        if isinstance(data, dict) and "user" in data:
+            return data.get("user")
 
-    try:
-        header = json.loads(_b64url_decode(header_b64))
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    user = getattr(resp, "user", None)
+    if user is not None:
+        return user
 
-    if header.get("alg") != "HS256":
-        raise HTTPException(status_code=401, detail="Unsupported token algorithm")
+    data = getattr(resp, "data", None)
+    if isinstance(data, dict) and "user" in data:
+        return data.get("user")
+    if data is not None:
+        maybe_user = getattr(data, "user", None)
+        if maybe_user is not None:
+            return maybe_user
 
-    if not SUPABASE_JWT_SECRET:
-        raise HTTPException(status_code=500, detail="Supabase JWT secret not configured")
-
-    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
-    expected = hmac.new(
-        SUPABASE_JWT_SECRET.encode("utf-8"),
-        signing_input,
-        hashlib.sha256,
-    ).digest()
-
-    try:
-        signature = _b64url_decode(sig_b64)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    if not hmac.compare_digest(signature, expected):
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    try:
-        payload = json.loads(_b64url_decode(payload_b64))
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    exp = payload.get("exp")
-    if exp is not None:
-        try:
-            if time.time() > float(exp):
-                raise HTTPException(status_code=401, detail="Token expired")
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=401, detail="Invalid token")
-
-    return payload
+    return None
 
 
-def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
+def _user_id(user: Any) -> Optional[str]:
+    if user is None:
+        return None
+    if isinstance(user, dict):
+        value = user.get("id")
+    else:
+        value = getattr(user, "id", None)
+    if not value:
+        return None
+    return str(value)
+
+
+def get_current_user(authorization: Optional[str] = Header(None)) -> Any:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
+
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not token:
         raise HTTPException(status_code=401, detail="Invalid Authorization header")
 
-    payload = _verify_supabase_jwt(token)
-    user_id = payload.get("sub")
+    sb = get_supabase()
+    if sb is None:
+        raise HTTPException(status_code=503, detail="Supabase client unavailable")
+
+    try:
+        resp = sb.auth.get_user(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = _extract_user(resp)
+    if not _user_id(user):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    return user
+
+
+def get_current_user_id(user: Any = Depends(get_current_user)) -> str:
+    user_id = _user_id(user)
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token")
-    return str(user_id)
+    return user_id

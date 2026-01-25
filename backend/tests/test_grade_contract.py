@@ -1,32 +1,10 @@
-import base64
-import hashlib
-import hmac
-import json
-import os
-import time
-
 from fastapi.testclient import TestClient
 
 from backend.app import app
 
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
-
-
-def _make_token(user_id="owner-1"):
-    secret = os.environ.get("SUPABASE_JWT_SECRET", "")
-    header = {"alg": "HS256", "typ": "JWT"}
-    payload = {"sub": user_id, "exp": int(time.time()) + 3600}
-    header_b64 = _b64url(json.dumps(header).encode("utf-8"))
-    payload_b64 = _b64url(json.dumps(payload).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
-    sig = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    return f"{header_b64}.{payload_b64}.{_b64url(sig)}"
-
-
 def _auth_headers(user_id="owner-1"):
-    return {"Authorization": f"Bearer {_make_token(user_id)}"}
+    return {"Authorization": f"Bearer user:{user_id}"}
 
 
 def test_grade_requires_auth():
