@@ -1,346 +1,454 @@
-﻿import React, { useEffect, useMemo, useState } from "react";
-import supa, { previewUrl } from "../lib/supa";
-  import { API_BASE } from "../lib/apiBase";
-import FileRow from "../components/FileRow.jsx";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { useToast } from "@/hooks/use-toast";
+import { apiFetch } from "../lib/apiBase";
 
-const BUCKET = "submissions";
+const ACCEPTED_MIME = ["image/png", "image/jpeg", "application/pdf"];
+const ACCEPTED_EXT = [".png", ".jpg", ".jpeg", ".pdf"];
 
-export default function AssignmentsPage() {
-  const [email, setEmail] = useState(null);
+function isAllowedFile(file) {
+  if (!file) return false;
+  if (ACCEPTED_MIME.includes(file.type)) return true;
+  const name = String(file.name || "").toLowerCase();
+  return ACCEPTED_EXT.some((ext) => name.endsWith(ext));
+}
 
-  // folders
-  const [assignments, setAssignments] = useState([]);
-  const [loadingAssignments, setLoadingAssignments] = useState(false);
+function statusLabel(status) {
+  const normalized = String(status || "uploaded").toLowerCase();
+  if (normalized === "pending" || normalized === "uploaded") return "Uploaded";
+  if (normalized === "processing" || normalized === "running") return "Processing";
+  if (normalized === "failed" || normalized === "error") return "Needs review";
+  return normalized.replace(/_/g, " ");
+}
 
-  // which “folder” is open? null = Unassigned
-  const [selectedAssignmentId, setSelectedAssignmentId] = useState(
-    new URLSearchParams(window.location.search).get("assignmentId") || null
-  );
-  const forcedUnassigned =
-    new URLSearchParams(window.location.search).get("filter") === "unassigned";
-
-  // files for current folder
-  const [files, setFiles] = useState([]);
-  const [loadingFiles, setLoadingFiles] = useState(false);
-
-  // create folder (assignment)
-  const [newTitle, setNewTitle] = useState("");
-  const [newDue, setNewDue] = useState("");
-  const [creating, setCreating] = useState(false);
-
-  // selection for bulk actions
-  const [checked, setChecked] = useState({}); // { id: true }
-  const selectedIds = useMemo(
-    () => Object.entries(checked).filter(([, v]) => v).map(([k]) => k),
-    [checked]
-  );
-
-  useEffect(() => {
-    supa.auth.getUser().then(({ data }) => setEmail(data.user?.email ?? null));
-  }, []);
-
-  // load folders
-  async function loadAssignments() {
-    setLoadingAssignments(true);
-    try {
-      const { data: userData } = await supa.auth.getUser();
-      const userId = userData?.user?.id;
-      if (!userId) { setAssignments([]); return; }
-
-      const { data, error } = await supa
-        .from("assignments")
-        .select("id,title,due_date,created_at")
-        .eq("owner_id", userId)
-        .order("created_at", { ascending: false });
-
-      if (error) throw error;
-      setAssignments(data || []);
-
-      // if we came from /assignments?filter=unassigned keep null
-      if (!forcedUnassigned && !selectedAssignmentId && (data?.length ?? 0) > 0) {
-        setSelectedAssignmentId(data[0].id);
-      }
-    } catch (e) {
-      console.error(e);
-      setAssignments([]);
-    } finally {
-      setLoadingAssignments(false);
-    }
-  }
-
-  // load files for current folder (or unassigned)
-  async function loadFiles() {
-    setLoadingFiles(true);
-    setChecked({});
-    try {
-      const { data: userData } = await supa.auth.getUser();
-      const userId = userData?.user?.id;
-      if (!userId) { setFiles([]); return; }
-
-      let query = supa
-        .from("uploads")
-        .select("id,storage_path,original_name,mime_type,size_bytes,uploaded_at,assignment_id,status,extracted_text,ocr_error,graded_pdf_path,verdicts")
-        .eq("owner_id", userId)
-        .order("uploaded_at", { ascending: false });
-
-      if (selectedAssignmentId) query = query.eq("assignment_id", selectedAssignmentId);
-      else query = query.is("assignment_id", null);
-
-      const { data, error } = await query;
-      if (error) throw error;
-
-      const withUrls = await Promise.all(
-        (data || []).map(async (row) => {
-          const key = row.storage_path?.startsWith(`${BUCKET}/`) ? row.storage_path.slice(BUCKET.length + 1) : row.storage_path;
-          const urlRes = await previewUrl(BUCKET, key, 3600);
-
-          return {
-            id: row.id,
-            storage_path: row.storage_path,
-            name: row.original_name || row.storage_path.split("/").pop(),
-            signedUrl: urlRes.ok ? urlRes.url : null,
-            isImage: /\.(png|jpe?g|gif|webp)$/i.test(row.original_name || ""),
-            isPDF: /\.pdf$/i.test(row.original_name || ""),
-            status: row.status || "pending",
-            extracted_text: row.extracted_text || "",
-            ocr_error: row.ocr_error || null,
-            graded_pdf_path: row.graded_pdf_path || null,
-            verdicts: row.verdicts || null,
-          };
-        })
-      );
-      setFiles(withUrls);
-    } catch (e) {
-      console.error(e);
-      setFiles([]);
-    } finally {
-      setLoadingFiles(false);
-    }
-  }
-
-  useEffect(() => { loadAssignments(); }, []);
-  useEffect(() => { loadFiles(); }, [selectedAssignmentId, forcedUnassigned]);
-
-  // normalize "submissions/owner-1/file.jpg" -> "owner-1/file.jpg"
-  const stripBucketPrefix = (p, bucket = "submissions") =>
-    !p ? p : p.startsWith(bucket + "/") ? p.slice(bucket.length + 1) : p.replace(/^\/+/, "");
-
-  async function handleDelete(upload) {
-    try {
-      // 1) delete from Storage (SDK, not manual REST)
-      const objectPath = stripBucketPrefix(upload.storage_path, "submissions");
-      const { error: storageError } = await supa.storage.from("submissions").remove([objectPath]);
-      if (storageError) throw new Error(`Storage delete failed: ${storageError.message}`);
-
-      // 2) delete the DB row via backend API
-      const resp = await fetch(`${API_BASE}/api/uploads/${upload.id}`, { method: "DELETE" });
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        throw new Error(`DB delete failed: ${resp.status} ${text}`);
-      }
-
-      // 3) update UI
-      setFiles((rows) => rows.filter((r) => r.id !== upload.id));
-    } catch (err) {
-      console.error("Delete failed:", err);
-      // show a toast/alert if you have one
-    }
-  }
-
-  // create new folder
-  async function createAssignment() {
-    const title = newTitle.trim();
-    if (!title) return;
-    setCreating(true);
-    try {
-      const { data: userData } = await supa.auth.getUser();
-      const userId = userData?.user?.id;
-      const { data, error } = await supa
-        .from("assignments")
-        .insert({ owner_id: userId, title, due_date: newDue || null })
-        .select("id,title,due_date,created_at")
-        .single();
-      if (error) throw error;
-      setNewTitle(""); setNewDue("");
-      setAssignments((prev) => [data, ...prev]);
-      setSelectedAssignmentId(data.id);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setCreating(false);
-    }
-  }
-
-  // actions: move, rename, delete
-  async function moveSelected(toAssignmentId) {
-    if (selectedIds.length === 0) return;
-    const { error } = await supa
-      .from("uploads")
-      .update({ assignment_id: toAssignmentId ?? null })
-      .in("id", selectedIds);
-    if (error) { console.error(error); return; }
-    await loadFiles();
-  }
-
-  // inline per-item delete (Storage -> DB)
-  async function deleteOne(upload) {
-    const storagePath = upload.storage_path;
-    const res = await supa.storage.from("submissions").remove([storagePath]);
-    console.log("Storage remove →", { storagePath, res });
-    if (res?.error && !/Not Found|not exist/i.test(res.error.message)) {
-      throw new Error(`Storage delete failed: ${res.error.message}`);
-    }
-
-    const { error: dbErr } = await supa
-      .from("uploads")
-      .delete()
-      .eq("id", upload.id);
-    if (dbErr) throw new Error(`DB delete failed: ${dbErr.message}`);
-  }
-
-  async function renameOne(fileId, newName) {
-    const clean = newName.trim();
-    if (!clean) return;
-    const { error } = await supa
-      .from("uploads")
-      .update({ original_name: clean })
-      .eq("id", fileId);
-    // Note: we’re renaming the display name only; storage key remains stable (best practice).
-    if (error) { console.error(error); return; }
-    await loadFiles();
-  }
-
-  async function deleteSelected() {
-    if (selectedIds.length === 0) return;
-    const { data, error } = await supa
-      .from("uploads")
-      .select("id,storage_path")
-      .in("id", selectedIds);
-    if (error) { console.error(error); return; }
-
-    const rows = data || [];
-    const results = await Promise.allSettled(rows.map(handleDelete));
-
-    const failures = results
-      .map((r, i) => (r.status === "rejected" ? { row: rows[i], reason: r.reason } : null))
-      .filter(Boolean);
-
-    if (failures.length > 0) {
-      const msg = failures
-        .map((f) => `${f.row.id}: ${f.reason?.message || String(f.reason)}`)
-        .join("\n");
-      // Replace with your toast lib if available
-      alert(`Some items failed to delete:\n${msg}`);
-    }
-
-    await loadFiles();
-  }
-
-  const otherFolders = [{ id: null, label: "Unassigned" }, ...assignments.map(a => ({ id: a.id, label: a.title }))];
-
+function isPdf(upload) {
   return (
-    <div style={{ padding: 24 }}>
-      <header style={{ display: "flex", justifyContent: "space-between" }}>
-        <h2>Assignments</h2>
-        <div><span style={{ marginRight: 12 }}>{email}</span></div>
-      </header>
-
-      {/* Folders bar */}
-      <section style={{ marginTop: 12, marginBottom: 16 }}>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button
-            onClick={() => setSelectedAssignmentId(null)}
-            className="btn btn-ghost"
-            style={{ background: selectedAssignmentId ? "#fff" : "#eef2ff" }}
-          >
-            Unassigned
-          </button>
-          {assignments.map((a) => (
-            <button
-              key={a.id}
-              onClick={() => setSelectedAssignmentId(a.id)}
-              className="btn btn-ghost"
-              style={{ background: selectedAssignmentId === a.id ? "#eef2ff" : "#fff" }}
-            >
-              {a.title}{a.due_date ? ` (${a.due_date})` : ""}
-            </button>
-          ))}
-        </div>
-      </section>
-
-      {/* Create folder */}
-      <section style={{ marginBottom: 16 }}>
-        <div style={{ display: "flex", gap: 8, alignItems: "end", flexWrap: "wrap" }}>
-          <div>
-            <label style={{ fontSize: 13, color: "#667085" }}>New folder (assignment)</label><br/>
-            <input
-              value={newTitle}
-              onChange={(e) => setNewTitle(e.target.value)}
-              placeholder="Assignment 1"
-              style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #e4e7ec" }}
-            />
-          </div>
-          <div>
-            <label style={{ fontSize: 13, color: "#667085" }}>Due date (optional)</label><br/>
-            <input
-              type="date"
-              value={newDue}
-              onChange={(e) => setNewDue(e.target.value)}
-              style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #e4e7ec" }}
-            />
-          </div>
-          <button onClick={createAssignment} disabled={creating} className="btn btn-primary">
-            {creating ? "Adding…" : "Add"}
-          </button>
-        </div>
-      </section>
-
-      {/* Files list for current folder */}
-      <section>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-          <h3 style={{ margin: 0 }}>
-            {selectedAssignmentId ? "Files in folder" : "Loose files (Unassigned)"}
-          </h3>
-
-          {/* Bulk actions */}
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <select
-              onChange={(e) => {
-                const val = e.target.value || null;
-                if (val === "__noop__") return;
-                moveSelected(val || null);
-                e.target.value = "__noop__";
-              }}
-              defaultValue="__noop__"
-              style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #e4e7ec" }}
-            >
-              <option value="__noop__">Move to…</option>
-              {otherFolders.map(f => (
-                <option key={String(f.id)} value={f.id || ""}>{f.label}</option>
-              ))}
-            </select>
-
-            <button onClick={deleteSelected} className="btn btn-ghost" disabled={selectedIds.length === 0}>
-              Delete
-            </button>
-          </div>
-        </div>
-
-        {loadingFiles && <div>Loading…</div>}
-        {!loadingFiles && files.length === 0 && <div>No files yet.</div>}
-
-        {!loadingFiles && files.length > 0 && (
-          <div style={{ display: "grid", gap: 12 }}>
-            {files.map((f) => (
-              <div key={f.id} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                <FileRow file={f} />
-                <button className="btn btn-ghost" onClick={() => handleDelete(f)}>Delete</button>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-    </div>
+    String(upload?.mime_type || "").includes("pdf") ||
+    String(upload?.original_name || "").toLowerCase().endsWith(".pdf")
   );
 }
 
+function isImage(upload) {
+  const name = String(upload?.original_name || "").toLowerCase();
+  if (name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")) return true;
+  return String(upload?.mime_type || "").startsWith("image/");
+}
+
+export default function AssignmentsPage() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { toast } = useToast();
+
+  const assignmentId = useMemo(() => {
+    return new URLSearchParams(location.search).get("assignmentId");
+  }, [location.search]);
+
+  const [assignment, setAssignment] = useState(null);
+  const [uploads, setUploads] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [files, setFiles] = useState([]);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [previewFile, setPreviewFile] = useState(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+
+  useEffect(() => {
+    if (!uploadOpen) {
+      setFiles([]);
+      setUploading(false);
+    }
+  }, [uploadOpen]);
+
+  useEffect(() => {
+    if (!assignmentId) return;
+    loadAssignment();
+    loadUploads();
+  }, [assignmentId]);
+
+  async function loadAssignment() {
+    try {
+      const resp = await apiFetch("/api/assignments");
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `Failed: ${resp.status}`);
+      }
+      const data = await resp.json();
+      const match = (data.assignments || []).find((row) => row.id === assignmentId);
+      setAssignment(match || null);
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Failed to load assignment",
+        description: err?.message || "Try again.",
+      });
+    }
+  }
+
+  async function loadUploads() {
+    if (!assignmentId) return;
+    setLoading(true);
+    try {
+      const resp = await apiFetch(`/api/assignments/${assignmentId}/uploads`);
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `Failed: ${resp.status}`);
+      }
+      const data = await resp.json();
+      setUploads(data.uploads || []);
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Failed to load uploads",
+        description: err?.message || "Try again.",
+      });
+      setUploads([]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const addFiles = (incoming) => {
+    const list = Array.from(incoming || []);
+    if (!list.length) return;
+    const rejected = list.filter((file) => !isAllowedFile(file));
+    if (rejected.length) {
+      toast({
+        variant: "destructive",
+        title: "Unsupported file type",
+        description: rejected.map((f) => f.name).join(", "),
+      });
+    }
+    const accepted = list.filter(isAllowedFile);
+    setFiles((prev) => {
+      const existing = new Set(prev.map((f) => `${f.name}-${f.size}`));
+      const merged = [...prev];
+      accepted.forEach((file) => {
+        const key = `${file.name}-${file.size}`;
+        if (!existing.has(key)) merged.push(file);
+      });
+      return merged;
+    });
+  };
+
+  const removeFileAt = (index) => {
+    setFiles((prev) => prev.filter((_, idx) => idx !== index));
+  };
+
+  const openPicker = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+      fileInputRef.current.click();
+    }
+  };
+
+  async function handleUpload() {
+    if (!assignmentId) return;
+    if (files.length === 0) {
+      toast({ variant: "destructive", title: "Add at least one file" });
+      return;
+    }
+    setUploading(true);
+    try {
+      const formData = new FormData();
+      files.forEach((file) => formData.append("files", file));
+      const resp = await apiFetch(`/api/assignments/${assignmentId}/uploads`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `Upload failed: ${resp.status}`);
+      }
+      toast({
+        title: "Uploads added",
+        description: `Uploaded ${files.length} file${files.length > 1 ? "s" : ""}.`,
+      });
+      setUploadOpen(false);
+      await loadUploads();
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Upload failed",
+        description: err?.message || "Try again.",
+      });
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function handlePreview(upload) {
+    setPreviewFile(upload);
+    setPreviewUrl("");
+    setPreviewLoading(true);
+    setPreviewOpen(true);
+    try {
+      const resp = await apiFetch(`/api/uploads/${upload.id}/preview`);
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `Preview failed: ${resp.status}`);
+      }
+      const data = await resp.json();
+      setPreviewUrl(data.url || "");
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Preview failed",
+        description: err?.message || "Try again.",
+      });
+      setPreviewOpen(false);
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
+
+  async function handleDelete() {
+    if (!deleteTarget) return;
+    try {
+      const resp = await apiFetch(`/api/uploads/${deleteTarget.id}`, { method: "DELETE" });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `Delete failed: ${resp.status}`);
+      }
+      toast({ title: "Upload deleted" });
+      setDeleteOpen(false);
+      setDeleteTarget(null);
+      await loadUploads();
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Delete failed",
+        description: err?.message || "Try again.",
+      });
+    }
+  }
+
+  if (!assignmentId) {
+    return (
+      <div className="p-6 space-y-4">
+        <h1 className="text-2xl font-semibold">Assignment uploads</h1>
+        <p className="text-sm text-muted-foreground">
+          Choose an assignment from the dashboard to view uploads.
+        </p>
+        <Button variant="outline" onClick={() => navigate("/")}>Back to dashboard</Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6 space-y-6">
+      <header className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <Button variant="ghost" size="sm" onClick={() => navigate("/")}>Back</Button>
+          <h1 className="text-2xl font-semibold mt-2">{assignment?.title || "Assignment"}</h1>
+          {assignment?.description && (
+            <p className="text-sm text-muted-foreground">{assignment.description}</p>
+          )}
+        </div>
+        <Dialog open={uploadOpen} onOpenChange={setUploadOpen}>
+          <DialogTrigger asChild>
+            <Button>Upload files</Button>
+          </DialogTrigger>
+          <DialogContent className="sm:max-w-[520px]">
+            <DialogHeader>
+              <DialogTitle>Upload files</DialogTitle>
+              <DialogDescription>
+                Add more student files to this assignment.
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="space-y-3">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept={ACCEPTED_MIME.join(",")}
+                className="hidden"
+                onChange={(e) => addFiles(e.target.files)}
+              />
+              <Button variant="secondary" type="button" onClick={openPicker}>
+                Add files
+              </Button>
+
+              {files.length > 0 ? (
+                <div className="max-h-48 overflow-auto rounded-md border border-border p-2">
+                  <div className="space-y-2">
+                    {files.map((file, idx) => (
+                      <div key={`${file.name}-${file.size}`} className="flex items-center justify-between gap-2 text-sm">
+                        <div className="truncate">{file.name}</div>
+                        <Button size="sm" variant="ghost" onClick={() => removeFileAt(idx)}>
+                          Remove
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
+                  PNG, JPG, or PDF only.
+                </div>
+              )}
+            </div>
+
+            <DialogFooter className="gap-2 sm:gap-0">
+              <Button variant="outline" onClick={() => setUploadOpen(false)} disabled={uploading}>
+                Cancel
+              </Button>
+              <Button onClick={handleUpload} disabled={files.length === 0 || uploading}>
+                {uploading ? "Uploading..." : "Upload"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </header>
+
+      <div className="rounded-lg border border-border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Filename</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead className="text-right">Actions</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {loading && (
+              <TableRow>
+                <TableCell colSpan={3} className="text-center text-muted-foreground">
+                  Loading uploads...
+                </TableCell>
+              </TableRow>
+            )}
+            {!loading && uploads.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={3} className="text-center text-muted-foreground">
+                  No uploads yet.
+                </TableCell>
+              </TableRow>
+            )}
+            {uploads.map((upload) => (
+              <TableRow key={upload.id}>
+                <TableCell className="font-medium">{upload.original_name || "Untitled"}</TableCell>
+                <TableCell>
+                  <Badge variant="secondary">{statusLabel(upload.status)}</Badge>
+                </TableCell>
+                <TableCell className="text-right">
+                  <div className="flex justify-end gap-2">
+                    <Button size="sm" variant="outline" onClick={() => handlePreview(upload)}>
+                      Preview
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      onClick={() => {
+                        setDeleteTarget(upload);
+                        setDeleteOpen(true);
+                      }}
+                    >
+                      Delete
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+
+      <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
+        <DialogContent className="sm:max-w-[520px]">
+          <DialogHeader>
+            <DialogTitle>Preview</DialogTitle>
+            <DialogDescription>{previewFile?.original_name}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            {previewLoading && (
+              <div className="text-sm text-muted-foreground">Loading preview...</div>
+            )}
+            {!previewLoading && previewUrl && isImage(previewFile) && (
+              <img
+                src={previewUrl}
+                alt={previewFile?.original_name || "Preview"}
+                className="max-h-60 w-full rounded-md object-contain"
+              />
+            )}
+            {!previewLoading && previewUrl && isPdf(previewFile) && (
+              <a
+                className="text-sm text-primary underline"
+                href={previewUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Open PDF in new tab
+              </a>
+            )}
+            {!previewLoading && previewUrl && !isImage(previewFile) && !isPdf(previewFile) && (
+              <a
+                className="text-sm text-primary underline"
+                href={previewUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Open file
+              </a>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPreviewOpen(false)}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete upload?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This removes the file and its record. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setDeleteTarget(null)}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDelete}>Delete</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}

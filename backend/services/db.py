@@ -19,6 +19,17 @@ def owner_matches(row: dict, caller_id: Optional[str]) -> bool:
     return str(caller_id) in {str(row.get("owner_id")), str(row.get("user_id"))}
 
 
+def get_assignment(assignment_id: str, caller_id: Optional[str], columns: str = "*") -> dict:
+    sb = require_supabase()
+    resp = sb.table("assignments").select(columns).eq("id", assignment_id).maybe_single().execute()
+    row = resp.data
+    if not row:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    if REQUIRE_OWNER and caller_id and not owner_matches(row, caller_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return row
+
+
 def get_upload(upload_id: str, caller_id: Optional[str], columns: str = "*") -> dict:
     sb = require_supabase()
     resp = sb.table("uploads").select(columns).eq("id", upload_id).maybe_single().execute()

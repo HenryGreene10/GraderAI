@@ -4,6 +4,7 @@ import AuthPage from "./pages/AuthPage.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
 import ClassesPage from "./pages/ClassesPage.jsx";
 import AssignmentsPage from "./pages/AssignmentsPage.jsx";
+import { Toaster } from "@/components/ui/toaster";
 
 export default function App() {
   return (
@@ -20,6 +21,7 @@ export default function App() {
         <Route path="/classes" element={<ProtectedRoute><ClassesPage /></ProtectedRoute>} />
         <Route path="/assignments" element={<ProtectedRoute><AssignmentsPage /></ProtectedRoute>} />
       </Routes>
+      <Toaster />
     </>
   );
 }

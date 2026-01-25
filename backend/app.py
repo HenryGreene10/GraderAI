@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import grade, ocr, overrides, uploads
+from .api import assignments, grade, ocr, overrides, uploads
 from .config import CORS_ALLOW_ORIGINS, summary
 
 logger = logging.getLogger("backend")
@@ -29,6 +29,7 @@ app.include_router(ocr.router)
 app.include_router(grade.router)
 app.include_router(uploads.router)
 app.include_router(overrides.router)
+app.include_router(assignments.router)
 
 
 @app.get("/health")

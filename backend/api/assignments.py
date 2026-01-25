@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+import os
+from datetime import date
+from typing import Optional
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel
+
+from ..auth import get_current_user_id
+from ..config import SUBMISSIONS_BUCKET
+from ..services.db import get_assignment, require_supabase
+from ..services.storage import upload_bytes
+
+router = APIRouter(prefix="/api/assignments", tags=["assignments"])
+
+ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".pdf"}
+ALLOWED_MIME = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "application/pdf": ".pdf",
+}
+
+
+class AssignmentCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    due_date: Optional[date] = None
+
+
+def _assignment_payload(row: dict, uploads_count: int = 0) -> dict:
+    rubric = row.get("rubric_json") or {}
+    return {
+        "id": row.get("id"),
+        "title": row.get("title"),
+        "description": rubric.get("description"),
+        "due_date": row.get("due_date"),
+        "created_at": row.get("created_at"),
+        "uploads_count": uploads_count,
+    }
+
+
+def _file_extension(filename: Optional[str], content_type: Optional[str]) -> str:
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext in ALLOWED_EXTS:
+        return ext
+    if content_type in ALLOWED_MIME:
+        return ALLOWED_MIME[content_type]
+    return ""
+
+
+@router.get("")
+def list_assignments(user_id: str = Depends(get_current_user_id)):
+    sb = require_supabase()
+    resp = (
+        sb.table("assignments")
+        .select("id,title,due_date,created_at,rubric_json")
+        .eq("owner_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    rows = resp.data or []
+
+    counts: dict[str, int] = {}
+    try:
+        uploads_resp = (
+            sb.table("uploads")
+            .select("assignment_id")
+            .eq("owner_id", user_id)
+            .execute()
+        )
+        for row in uploads_resp.data or []:
+            aid = row.get("assignment_id")
+            if aid:
+                counts[str(aid)] = counts.get(str(aid), 0) + 1
+    except Exception:
+        counts = {}
+
+    return {
+        "assignments": [
+            _assignment_payload(row, counts.get(str(row.get("id")), 0))
+            for row in rows
+        ]
+    }
+
+
+@router.post("")
+def create_assignment(
+    body: AssignmentCreate,
+    user_id: str = Depends(get_current_user_id),
+):
+    title = (body.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title_required")
+
+    payload = {
+        "owner_id": user_id,
+        "title": title,
+        "due_date": body.due_date,
+    }
+    if body.description:
+        payload["rubric_json"] = {"description": body.description.strip()}
+
+    sb = require_supabase()
+    try:
+        resp = sb.table("assignments").insert(payload).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"db_insert_failed: {exc}")
+
+    row = None
+    if isinstance(resp.data, list) and resp.data:
+        row = resp.data[0]
+    if not row:
+        row = payload
+
+    return {"assignment": _assignment_payload(row, uploads_count=0)}
+
+
+@router.get("/{assignment_id}/uploads")
+def list_assignment_uploads(
+    assignment_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    get_assignment(assignment_id, user_id, columns="id,owner_id")
+    sb = require_supabase()
+    resp = (
+        sb.table("uploads")
+        .select("id,storage_path,original_name,mime_type,size_bytes,status,created_at")
+        .eq("owner_id", user_id)
+        .eq("assignment_id", assignment_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    rows = resp.data or []
+    uploads = []
+    for row in rows:
+        uploads.append(
+            {
+                "id": row.get("id"),
+                "storage_path": row.get("storage_path"),
+                "original_name": row.get("original_name"),
+                "mime_type": row.get("mime_type"),
+                "size_bytes": row.get("size_bytes"),
+                "status": row.get("status"),
+                "created_at": row.get("created_at"),
+            }
+        )
+    return {"uploads": uploads}
+
+
+@router.post("/{assignment_id}/uploads")
+async def upload_assignment_files(
+    assignment_id: str,
+    files: list[UploadFile] = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    get_assignment(assignment_id, user_id, columns="id,owner_id")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="files_required")
+
+    sb = require_supabase()
+    rows = []
+    rel_keys: list[str] = []
+
+    for file in files:
+        ext = _file_extension(file.filename, file.content_type)
+        if ext not in ALLOWED_EXTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported_file_type: {file.filename}",
+            )
+        upload_id = str(uuid4())
+        rel_key = f"{user_id}/{assignment_id}/{upload_id}{ext}"
+        storage_path = f"{SUBMISSIONS_BUCKET}/{rel_key}"
+
+        blob = await file.read()
+        size_bytes = len(blob or b"")
+        if size_bytes == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"empty_file: {file.filename}",
+            )
+
+        try:
+            upload_bytes(
+                SUBMISSIONS_BUCKET,
+                rel_key,
+                blob,
+                file.content_type or "application/octet-stream",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"upload_failed: {exc}")
+
+        rel_keys.append(rel_key)
+        rows.append(
+            {
+                "id": upload_id,
+                "owner_id": user_id,
+                "assignment_id": assignment_id,
+                "storage_path": storage_path,
+                "original_name": file.filename,
+                "mime_type": file.content_type,
+                "size_bytes": size_bytes,
+                "status": "pending",
+            }
+        )
+
+    try:
+        resp = sb.table("uploads").insert(rows).execute()
+    except Exception as exc:
+        try:
+            sb.storage.from_(SUBMISSIONS_BUCKET).remove(rel_keys)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"db_insert_failed: {exc}")
+
+    return {"uploads": resp.data or rows}
