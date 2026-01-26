@@ -129,7 +129,10 @@ def list_assignment_uploads(
     sb = require_supabase()
     resp = (
         sb.table("uploads")
-        .select("id,storage_path,original_name,mime_type,size_bytes,status,created_at")
+        .select(
+            "id,storage_path,original_name,mime_type,size_bytes,status,created_at,"
+            "ocr_status,ocr_error,graded_pdf_path,needs_review"
+        )
         .eq("owner_id", user_id)
         .eq("assignment_id", assignment_id)
         .order("created_at", desc=True)
@@ -146,6 +149,10 @@ def list_assignment_uploads(
                 "mime_type": row.get("mime_type"),
                 "size_bytes": row.get("size_bytes"),
                 "status": row.get("status"),
+                "ocr_status": row.get("ocr_status"),
+                "ocr_error": row.get("ocr_error"),
+                "graded_pdf_path": row.get("graded_pdf_path"),
+                "needs_review": row.get("needs_review"),
                 "created_at": row.get("created_at"),
             }
         )

@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
 import { apiFetch } from "../lib/apiBase";
+import { previewUrl } from "../lib/supa";
 
 const ACCEPTED_MIME = ["image/png", "image/jpeg", "application/pdf"];
 const ACCEPTED_EXT = [".png", ".jpg", ".jpeg", ".pdf"];
@@ -88,6 +89,7 @@ export default function AssignmentsPage() {
 
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [grading, setGrading] = useState({});
 
   useEffect(() => {
     if (!uploadOpen) {
@@ -259,6 +261,50 @@ export default function AssignmentsPage() {
     }
   }
 
+  async function handleGenerateMarked(upload) {
+    const key = upload?.id;
+    if (!key) return;
+    setGrading((prev) => ({ ...prev, [key]: true }));
+    try {
+      const resp = await apiFetch(`/api/uploads/${upload.id}/grade`, { method: "POST" });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data?.detail || `Failed: ${resp.status}`;
+        throw new Error(detail);
+      }
+      toast({ title: "Marked PDF generated" });
+      await loadUploads();
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Generate failed",
+        description: err?.message || "Try again.",
+      });
+    } finally {
+      setGrading((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    }
+  }
+
+  async function handleOpenMarked(upload) {
+    const key = upload?.graded_pdf_path;
+    if (!key) return;
+    try {
+      const res = await previewUrl("graded-pdfs", key, 3600);
+      if (!res.ok || !res.url) throw new Error(res.error || "Missing preview URL");
+      window.open(res.url, "_blank");
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Open marked PDF failed",
+        description: err?.message || "Try again.",
+      });
+    }
+  }
+
   if (!assignmentId) {
     return (
       <div className="p-6 space-y-4">
@@ -373,6 +419,24 @@ export default function AssignmentsPage() {
                     <Button size="sm" variant="outline" onClick={() => handlePreview(upload)}>
                       Preview
                     </Button>
+                    {upload.graded_pdf_path && (
+                      <Button size="sm" variant="outline" onClick={() => handleOpenMarked(upload)}>
+                        Open marked PDF
+                      </Button>
+                    )}
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={grading[upload.id] || String(upload.ocr_status || "").toLowerCase() !== "done"}
+                      onClick={() => handleGenerateMarked(upload)}
+                      title={
+                        String(upload.ocr_status || "").toLowerCase() !== "done"
+                          ? "OCR not complete"
+                          : undefined
+                      }
+                    >
+                      {grading[upload.id] ? "Generating..." : "Generate marked PDF"}
+                    </Button>
                     <Button
                       size="sm"
                       variant="destructive"
@@ -449,6 +513,7 @@ export default function AssignmentsPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
     </div>
   );
 }
