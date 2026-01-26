@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import List
+from typing import List, Tuple
+
+from reportlab.lib.utils import ImageReader
+
+try:
+    from pypdf import PdfReader, PdfWriter
+except Exception:  # pragma: no cover - optional dependency
+    PdfReader = None  # type: ignore
+    PdfWriter = None  # type: ignore
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -61,3 +69,80 @@ def flatten_to_pdf(summary_text: str, overlay: Overlay) -> bytes:
     c.save()
     return buf.getvalue()
 
+
+def get_page_sizes(original_bytes: bytes, mime_type: str | None) -> List[Tuple[float, float]]:
+    if (mime_type or "").lower().endswith("pdf") or original_bytes.startswith(b"%PDF"):
+        if PdfReader is None:
+            raise RuntimeError("pypdf is required for PDF overlays")
+        reader = PdfReader(BytesIO(original_bytes))
+        sizes = []
+        for page in reader.pages:
+            box = page.mediabox
+            sizes.append((float(box.width), float(box.height)))
+        return sizes
+
+    img = ImageReader(BytesIO(original_bytes))
+    width, height = img.getSize()
+    return [(float(width), float(height))]
+
+
+def _draw_marks(c: canvas.Canvas, overlay: Overlay) -> None:
+    for mark in overlay.marks:
+        x, y = mark.coords[:2]
+        if mark.tool == "check":
+            c.setFont("Helvetica-Bold", 18)
+            c.drawString(x, y, "✓")
+        elif mark.tool == "cross":
+            c.setFont("Helvetica-Bold", 18)
+            c.drawString(x, y, "✗")
+        elif mark.tool == "note":
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(x, y, mark.text or "")
+        elif mark.tool == "bubble":
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(x, y, mark.text or "")
+        elif mark.tool == "highlight" and len(mark.coords) >= 4:
+            _, _, w, h = mark.coords[:4]
+            c.setFillColorRGB(1, 1, 0)
+            c.rect(x, y, w, h, stroke=0, fill=1)
+            c.setFillColorRGB(0, 0, 0)
+
+
+def _overlay_pdf_bytes(page_width: float, page_height: float, overlay: Overlay) -> bytes:
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_width, page_height))
+    _draw_marks(c, overlay)
+    c.save()
+    return buf.getvalue()
+
+
+def render_marked_pdf(
+    original_bytes: bytes,
+    mime_type: str | None,
+    overlay: Overlay,
+) -> bytes:
+    if (mime_type or "").lower().endswith("pdf") or original_bytes.startswith(b"%PDF"):
+        if PdfReader is None or PdfWriter is None:
+            raise RuntimeError("pypdf is required for PDF overlays")
+        reader = PdfReader(BytesIO(original_bytes))
+        writer = PdfWriter()
+        for page_index, page in enumerate(reader.pages):
+            if page_index == 0:
+                page_width = float(page.mediabox.width)
+                page_height = float(page.mediabox.height)
+                overlay_bytes = _overlay_pdf_bytes(page_width, page_height, overlay)
+                overlay_reader = PdfReader(BytesIO(overlay_bytes))
+                page.merge_page(overlay_reader.pages[0])
+            writer.add_page(page)
+        output = BytesIO()
+        writer.write(output)
+        return output.getvalue()
+
+    img = ImageReader(BytesIO(original_bytes))
+    width, height = img.getSize()
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=(width, height))
+    c.drawImage(img, 0, 0, width=width, height=height)
+    _draw_marks(c, overlay)
+    c.save()
+    return buf.getvalue()

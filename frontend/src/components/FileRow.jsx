@@ -190,10 +190,9 @@ function FileRow({ file }) {
   const createPdf = async () => {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(`${API_BASE}/api/grade`, {
+      const res = await fetch(`${API_BASE}/api/uploads/${file.id}/grade`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...headers },
-        body: JSON.stringify({ upload_id: String(file.id) }),
+        headers,
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -264,7 +263,7 @@ function FileRow({ file }) {
             Set verdicts
           </button>
           <button type="button" className="btn btn-ghost" onClick={createPdf}>
-            Create graded PDF
+            Generate marked PDF
           </button>
           {(gradedSigned || gradedPath || row.graded_pdf_path) && (
             <a
