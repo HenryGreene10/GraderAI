@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from ..auth import get_current_user_id
 from ..config import SUBMISSIONS_BUCKET
 from ..services.db import get_assignment, require_supabase
 from ..services.storage import upload_bytes
+from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
+logger = logging.getLogger(__name__)
 
 ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".pdf"}
 ALLOWED_MIME = {
@@ -154,6 +157,7 @@ async def upload_assignment_files(
     assignment_id: str,
     files: list[UploadFile] = File(...),
     user_id: str = Depends(get_current_user_id),
+    background_tasks: BackgroundTasks,
 ):
     get_assignment(assignment_id, user_id, columns="id,owner_id")
 
@@ -204,6 +208,7 @@ async def upload_assignment_files(
                 "mime_type": file.content_type,
                 "size_bytes": size_bytes,
                 "status": "pending",
+                "ocr_status": "pending",
             }
         )
 
@@ -216,4 +221,18 @@ async def upload_assignment_files(
             pass
         raise HTTPException(status_code=500, detail=f"db_insert_failed: {exc}")
 
-    return {"uploads": resp.data or rows}
+    saved_rows = resp.data or rows
+
+    for row in saved_rows:
+        background_tasks.add_task(_run_ocr_in_background, row["id"], user_id)
+
+    return {"uploads": saved_rows}
+
+
+async def _run_ocr_in_background(upload_id: str, user_id: str) -> None:
+    try:
+        await run_ocr_for_upload(upload_id, user_id)
+    except HTTPException as exc:
+        logger.warning("OCR failed for upload %s: %s", upload_id, exc.detail)
+    except Exception:
+        logger.exception("OCR failed for upload %s", upload_id)
