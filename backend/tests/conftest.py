@@ -50,18 +50,83 @@ class FakeTable:
 
     def execute(self):
         if self.name == "uploads":
+            if self._op == "insert":
+                payload = self._payload or {}
+                if isinstance(payload, list):
+                    for row in payload:
+                        self.db["uploads"][row["id"]] = row
+                    return _Resp(payload)
+                self.db["uploads"][payload["id"]] = payload
+                return _Resp(payload)
+
+            if self._op == "delete":
+                uid = self._where.get("id")
+                if uid and uid in self.db["uploads"]:
+                    del self.db["uploads"][uid]
+                    return _Resp(None)
+                assignment_id = self._where.get("assignment_id")
+                owner_id = self._where.get("owner_id")
+                if assignment_id:
+                    to_delete = [
+                        key
+                        for key, row in self.db["uploads"].items()
+                        if row.get("assignment_id") == assignment_id
+                        and (not owner_id or row.get("owner_id") == owner_id)
+                    ]
+                    for key in to_delete:
+                        del self.db["uploads"][key]
+                    return _Resp(None)
+
             uid = self._where.get("id")
-            if self._op == "delete" and uid in self.db["uploads"]:
-                del self.db["uploads"][uid]
-                return _Resp(None)
-            row = self.db["uploads"].get(uid)
-            if self._op == "update" and row is not None:
-                row.update(self._payload or {})
-            return _Resp(row)
+            if uid:
+                row = self.db["uploads"].get(uid)
+                if self._op == "update" and row is not None:
+                    row.update(self._payload or {})
+                return _Resp(row)
+
+            rows = []
+            for row in self.db["uploads"].values():
+                match = True
+                for key, value in self._where.items():
+                    if row.get(key) != value:
+                        match = False
+                        break
+                if match:
+                    rows.append(row)
+            return _Resp(rows)
         if self.name == "overrides":
             if self._op == "insert":
                 self.db["overrides"].append(self._payload or {})
             return _Resp(self._payload)
+        if self.name == "assignments":
+            if self._op == "insert":
+                payload = self._payload or {}
+                if isinstance(payload, list):
+                    for row in payload:
+                        self.db["assignments"][row["id"]] = row
+                    return _Resp(payload)
+                self.db["assignments"][payload["id"]] = payload
+                return _Resp(payload)
+            if self._op == "delete":
+                aid = self._where.get("id")
+                if aid and aid in self.db["assignments"]:
+                    del self.db["assignments"][aid]
+                return _Resp(None)
+
+            aid = self._where.get("id")
+            if aid:
+                return _Resp(self.db["assignments"].get(aid))
+
+            rows = []
+            for row in self.db["assignments"].values():
+                match = True
+                for key, value in self._where.items():
+                    if row.get(key) != value:
+                        match = False
+                        break
+                if match:
+                    rows.append(row)
+            return _Resp(rows)
         return _Resp(None)
 
 
@@ -130,7 +195,7 @@ def test_env(monkeypatch):
 
 @pytest.fixture()
 def fake_supabase():
-    db = {"uploads": {}, "overrides": []}
+    db = {"uploads": {}, "overrides": [], "assignments": {}}
     client = FakeSupabase(db)
     set_supabase(client)
     try:

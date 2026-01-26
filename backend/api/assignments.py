@@ -10,9 +10,9 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Up
 from pydantic import BaseModel
 
 from ..auth import get_current_user_id
-from ..config import SUBMISSIONS_BUCKET
+from ..config import GRADED_BUCKET, OVERLAYS_BUCKET, SUBMISSIONS_BUCKET
 from ..services.db import get_assignment, require_supabase
-from ..services.storage import upload_bytes
+from ..services.storage import strip_bucket_prefix, upload_bytes
 from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
@@ -157,6 +157,61 @@ def list_assignment_uploads(
             }
         )
     return {"uploads": uploads}
+
+
+@router.delete("/{assignment_id}")
+def delete_assignment(
+    assignment_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    get_assignment(assignment_id, user_id, columns="id,owner_id")
+    sb = require_supabase()
+
+    resp = (
+        sb.table("uploads")
+        .select("id,storage_path,graded_pdf_path,overlay_path")
+        .eq("owner_id", user_id)
+        .eq("assignment_id", assignment_id)
+        .execute()
+    )
+    rows = resp.data or []
+
+    submission_keys = []
+    graded_keys = []
+    overlay_keys = []
+
+    for row in rows:
+        storage_path = row.get("storage_path")
+        if storage_path:
+            submission_keys.append(strip_bucket_prefix(storage_path, SUBMISSIONS_BUCKET))
+        graded_path = row.get("graded_pdf_path")
+        if graded_path:
+            graded_keys.append(strip_bucket_prefix(graded_path, GRADED_BUCKET))
+        overlay_path = row.get("overlay_path")
+        if overlay_path:
+            overlay_keys.append(strip_bucket_prefix(overlay_path, OVERLAYS_BUCKET))
+
+    try:
+        if submission_keys:
+            sb.storage.from_(SUBMISSIONS_BUCKET).remove(submission_keys)
+        if graded_keys:
+            sb.storage.from_(GRADED_BUCKET).remove(graded_keys)
+        if overlay_keys:
+            sb.storage.from_(OVERLAYS_BUCKET).remove(overlay_keys)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"storage_delete_failed: {exc}")
+
+    try:
+        sb.table("uploads").delete().eq("assignment_id", assignment_id).eq("owner_id", user_id).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"uploads_delete_failed: {exc}")
+
+    try:
+        sb.table("assignments").delete().eq("id", assignment_id).eq("owner_id", user_id).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"assignment_delete_failed: {exc}")
+
+    return {"ok": True, "assignment_id": assignment_id, "uploads_deleted": len(rows)}
 
 
 @router.post("/{assignment_id}/uploads")

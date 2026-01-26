@@ -89,6 +89,8 @@ export default function AssignmentsPage() {
 
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteAssignmentOpen, setDeleteAssignmentOpen] = useState(false);
+  const [deletingAssignment, setDeletingAssignment] = useState(false);
   const [grading, setGrading] = useState({});
 
   useEffect(() => {
@@ -305,6 +307,29 @@ export default function AssignmentsPage() {
     }
   }
 
+  async function handleDeleteAssignment() {
+    if (!assignmentId || deletingAssignment) return;
+    setDeletingAssignment(true);
+    try {
+      const resp = await apiFetch(`/api/assignments/${assignmentId}`, { method: "DELETE" });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `Delete failed: ${resp.status}`);
+      }
+      toast({ title: "Assignment deleted" });
+      setDeleteAssignmentOpen(false);
+      navigate("/");
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Delete assignment failed",
+        description: err?.message || "Try again.",
+      });
+    } finally {
+      setDeletingAssignment(false);
+    }
+  }
+
   if (!assignmentId) {
     return (
       <div className="p-6 space-y-4">
@@ -327,61 +352,66 @@ export default function AssignmentsPage() {
             <p className="text-sm text-muted-foreground">{assignment.description}</p>
           )}
         </div>
-        <Dialog open={uploadOpen} onOpenChange={setUploadOpen}>
-          <DialogTrigger asChild>
-            <Button>Upload files</Button>
-          </DialogTrigger>
-          <DialogContent className="sm:max-w-[520px]">
-            <DialogHeader>
-              <DialogTitle>Upload files</DialogTitle>
-              <DialogDescription>
-                Add more student files to this assignment.
-              </DialogDescription>
-            </DialogHeader>
+        <div className="flex items-center gap-2">
+          <Dialog open={uploadOpen} onOpenChange={setUploadOpen}>
+            <DialogTrigger asChild>
+              <Button>Upload files</Button>
+            </DialogTrigger>
+            <DialogContent className="sm:max-w-[520px]">
+              <DialogHeader>
+                <DialogTitle>Upload files</DialogTitle>
+                <DialogDescription>
+                  Add more student files to this assignment.
+                </DialogDescription>
+              </DialogHeader>
 
-            <div className="space-y-3">
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                accept={ACCEPTED_MIME.join(",")}
-                className="hidden"
-                onChange={(e) => addFiles(e.target.files)}
-              />
-              <Button variant="secondary" type="button" onClick={openPicker}>
-                Add files
-              </Button>
+              <div className="space-y-3">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  accept={ACCEPTED_MIME.join(",")}
+                  className="hidden"
+                  onChange={(e) => addFiles(e.target.files)}
+                />
+                <Button variant="secondary" type="button" onClick={openPicker}>
+                  Add files
+                </Button>
 
-              {files.length > 0 ? (
-                <div className="max-h-48 overflow-auto rounded-md border border-border p-2">
-                  <div className="space-y-2">
-                    {files.map((file, idx) => (
-                      <div key={`${file.name}-${file.size}`} className="flex items-center justify-between gap-2 text-sm">
-                        <div className="truncate">{file.name}</div>
-                        <Button size="sm" variant="ghost" onClick={() => removeFileAt(idx)}>
-                          Remove
-                        </Button>
-                      </div>
-                    ))}
+                {files.length > 0 ? (
+                  <div className="max-h-48 overflow-auto rounded-md border border-border p-2">
+                    <div className="space-y-2">
+                      {files.map((file, idx) => (
+                        <div key={`${file.name}-${file.size}`} className="flex items-center justify-between gap-2 text-sm">
+                          <div className="truncate">{file.name}</div>
+                          <Button size="sm" variant="ghost" onClick={() => removeFileAt(idx)}>
+                            Remove
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ) : (
-                <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
-                  PNG, JPG, or PDF only.
-                </div>
-              )}
-            </div>
+                ) : (
+                  <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
+                    PNG, JPG, or PDF only.
+                  </div>
+                )}
+              </div>
 
-            <DialogFooter className="gap-2 sm:gap-0">
-              <Button variant="outline" onClick={() => setUploadOpen(false)} disabled={uploading}>
-                Cancel
-              </Button>
-              <Button onClick={handleUpload} disabled={files.length === 0 || uploading}>
-                {uploading ? "Uploading..." : "Upload"}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+              <DialogFooter className="gap-2 sm:gap-0">
+                <Button variant="outline" onClick={() => setUploadOpen(false)} disabled={uploading}>
+                  Cancel
+                </Button>
+                <Button onClick={handleUpload} disabled={files.length === 0 || uploading}>
+                  {uploading ? "Uploading..." : "Upload"}
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          <Button variant="destructive" onClick={() => setDeleteAssignmentOpen(true)}>
+            Delete assignment
+          </Button>
+        </div>
       </header>
 
       <div className="rounded-lg border border-border">
@@ -510,6 +540,25 @@ export default function AssignmentsPage() {
           <AlertDialogFooter>
             <AlertDialogCancel onClick={() => setDeleteTarget(null)}>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={handleDelete}>Delete</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={deleteAssignmentOpen} onOpenChange={setDeleteAssignmentOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Delete assignment “{assignment?.title || "Assignment"}”?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This will delete all uploads inside it. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingAssignment}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDeleteAssignment} disabled={deletingAssignment}>
+              {deletingAssignment ? "Deleting..." : "Delete assignment"}
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
