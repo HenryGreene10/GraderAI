@@ -43,33 +43,35 @@ Acceptance checks
 - `VITE_API_BASE_URL` routes frontend to local backend.
 - App no longer shows "Missing Supabase env" when vars are present.
 
-### Ticket 3 — Uploads UI becomes source of truth (NEXT)
+### Ticket 3 — Uploads UI becomes source of truth (DONE)
 Scope: the uploads list is the canonical view for storage + DB state.
 Acceptance checks
 - Uploaded items appear in the UI list.
 - Preview works for each upload.
 - Delete removes the storage object and its DB row.
+Notes
+- Upload succeeds and preview shows the original file.
+- Delete is available.
+- Known non-blocking toast issue deferred.
 
-### Ticket 4 — OCR pipeline (auto) (TODO)
-Scope: auto-trigger OCR and surface minimal status/results in the UI.
+### Ticket 4 — OCR pipeline (internal only) (TODO)
+Scope: auto-run OCR after upload for downstream grading only.
 Acceptance checks
-- Upload triggers `POST /api/ocr/start` automatically.
-- Polling updates status in the list/details view.
-- OCR result is stored and minimally displayed.
+- Upload triggers OCR automatically.
+- OCR result is persisted and accessible to backend grading logic.
+- No frontend UI added for viewing OCR output.
 
 ### Ticket 5 — Grade + PDF (TODO)
-Scope: UI can run grading and open the produced PDF.
+Scope: use OCR output to identify questions/answers and generate a marked PDF.
 Acceptance checks
-- `POST /api/grade` works from the UI with auth headers.
-- Grade result is stored and visible in the UI.
-- PDF link renders and opens.
+- Teacher sees the original uploaded file and the marked PDF.
+Note
+- Layout/region accuracy is approximate in MVP; refinement deferred.
 
 ### Ticket 6 — Overrides (TODO)
-Scope: teacher overrides persist and re-render outputs.
+Scope: teacher can adjust grading via a later workflow (chat-based or manual edits to marked PDF).
 Acceptance checks
-- `POST /api/override` persists changes.
-- Overrides re-render overlay and PDF.
-- UI shows override state.
+- Do not design override UI yet.
 
 ### Ticket 7 — Frontend polish / encoding fixes (LATER)
 Scope: UI cleanup, encoding warnings removed, and small UX refinements.
