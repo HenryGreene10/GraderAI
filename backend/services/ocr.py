@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from typing import Any, Optional
 
 import httpx
@@ -45,6 +46,63 @@ class HFInferenceOCRProvider(BaseOCRProvider):
         return {"text": text, "pages": data, "confidence": None}
 
 
+class AzureReadOCRProvider(BaseOCRProvider):
+    def __init__(self, endpoint: str | None = None, key: str | None = None):
+        self.endpoint = (endpoint or os.getenv("AZURE_OCR_ENDPOINT") or "").strip()
+        if not self.endpoint:
+            raise ValueError("AZURE_OCR_ENDPOINT is required when OCR_PROVIDER=azure")
+        self.key = (key or os.getenv("AZURE_OCR_KEY") or "").strip()
+        if not self.key:
+            raise ValueError("AZURE_OCR_KEY is required when OCR_PROVIDER=azure")
+
+    async def extract_text(self, image_bytes: Optional[bytes] = None, image_url: Optional[str] = None) -> dict:
+        if image_bytes is None and not image_url:
+            raise ValueError("Either image_bytes or image_url must be provided")
+
+        analyze_url = self.endpoint.rstrip("/") + "/vision/v3.2/read/analyze"
+        headers = {
+            "Ocp-Apim-Subscription-Key": self.key,
+        }
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            if image_url:
+                resp = await client.post(analyze_url, headers=headers, json={"url": image_url})
+            else:
+                resp = await client.post(
+                    analyze_url,
+                    headers={**headers, "Content-Type": "application/octet-stream"},
+                    content=image_bytes,
+                )
+
+            op_location = (
+                resp.headers.get("Operation-Location")
+                or resp.headers.get("operation-location")
+                or resp.headers.get("OPERATION-LOCATION")
+            )
+            if not op_location:
+                body = resp.text or ""
+                snippet = body[:300]
+                raise RuntimeError(
+                    f"Azure OCR missing Operation-Location (status={resp.status_code} body={snippet})"
+                )
+
+            for attempt in range(1, 11):
+                poll = await client.get(op_location, headers=headers)
+                data = poll.json() if poll.content else {}
+                status = str(data.get("status") or "").lower()
+                if status == "succeeded":
+                    text = _normalize_azure_read(data)
+                    return {"text": text, "pages": data, "confidence": None}
+                if status == "failed":
+                    err = data.get("error") or {}
+                    code = err.get("code") or "failed"
+                    message = err.get("message") or ""
+                    raise RuntimeError(f"Azure OCR failed: {code} {message}".strip())
+                await asyncio.sleep(0.6)
+
+            raise RuntimeError("Azure OCR timeout waiting for result")
+
+
 
 def _normalize_hf(json_obj: Any) -> str:
     try:
@@ -66,6 +124,23 @@ def _normalize_hf(json_obj: Any) -> str:
     return ""
 
 
+def _normalize_azure_read(json_obj: Any) -> str:
+    try:
+        read_results = (
+            (json_obj or {}).get("analyzeResult", {}).get("readResults", [])
+        )
+        lines = []
+        for page in read_results:
+            for line in page.get("lines", []):
+                text = line.get("text")
+                if isinstance(text, str) and text.strip():
+                    lines.append(text.strip())
+        return "\n".join(lines).strip()
+    except Exception:
+        logger.exception("Failed to normalize Azure Read response")
+    return ""
+
+
 def _provider() -> BaseOCRProvider:
     # Mock override takes precedence
     if os.getenv("OCR_MOCK") == "1":
@@ -81,6 +156,10 @@ def _provider() -> BaseOCRProvider:
         token = os.environ.get("HF_TOKEN", "").strip() or None
         # HF provider will raise KeyError if required pieces are missing
         return HFInferenceOCRProvider(api_url=api_url, token=token)
+    if provider == "azure":
+        endpoint = os.environ.get("AZURE_OCR_ENDPOINT", "").strip()
+        key = os.environ.get("AZURE_OCR_KEY", "").strip()
+        return AzureReadOCRProvider(endpoint=endpoint, key=key)
     if provider == "mock":
         return MockOCRProvider()
 
