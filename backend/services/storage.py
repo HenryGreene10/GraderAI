@@ -27,7 +27,7 @@ def upload_bytes(bucket: str, key: str, data: bytes, content_type: str) -> None:
     sb = get_supabase()
     if sb is None:
         raise RuntimeError("Supabase client unavailable")
-    sb.storage.from_(bucket).upload(key, data, {"content-type": content_type, "upsert": True})
+    sb.storage.from_(bucket).upload(key, data, {"content-type": content_type, "upsert": "true"})
 
 
 def upload_json(bucket: str, key: str, payload: Any) -> None:
