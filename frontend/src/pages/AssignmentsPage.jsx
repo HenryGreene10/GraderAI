@@ -45,6 +45,8 @@ function isAllowedFile(file) {
 
 function statusLabel(status) {
   const normalized = String(status || "uploaded").toLowerCase();
+  if (normalized === "overridden") return "Overridden";
+  if (normalized === "reviewed") return "Reviewed";
   if (normalized === "pending" || normalized === "uploaded") return "Uploaded";
   if (normalized === "processing" || normalized === "running") return "Processing";
   if (normalized === "failed" || normalized === "error") return "Needs review";
@@ -92,6 +94,11 @@ export default function AssignmentsPage() {
   const [deleteAssignmentOpen, setDeleteAssignmentOpen] = useState(false);
   const [deletingAssignment, setDeletingAssignment] = useState(false);
   const [grading, setGrading] = useState({});
+  const [overrideOpen, setOverrideOpen] = useState(false);
+  const [overrideTarget, setOverrideTarget] = useState(null);
+  const [overrideStatus, setOverrideStatus] = useState("correct");
+  const [overrideNote, setOverrideNote] = useState("");
+  const [overrideSaving, setOverrideSaving] = useState(false);
 
   useEffect(() => {
     if (!uploadOpen) {
@@ -335,6 +342,52 @@ export default function AssignmentsPage() {
     }
   }
 
+  function openOverride(upload) {
+    setOverrideTarget(upload);
+    setOverrideStatus("correct");
+    setOverrideNote("");
+    setOverrideOpen(true);
+  }
+
+  async function handleSaveOverride() {
+    if (!overrideTarget || overrideSaving) return;
+    setOverrideSaving(true);
+    try {
+      const resp = await apiFetch(`/api/uploads/${overrideTarget.id}/override`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          overall_status: overrideStatus,
+          note: overrideNote.trim() || null,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data?.detail || `Failed: ${resp.status}`;
+        throw new Error(detail);
+      }
+      const nextStatus = data.status || (overrideStatus === "reviewed" ? "reviewed" : "overridden");
+      setUploads((prev) =>
+        prev.map((row) =>
+          row.id === overrideTarget.id
+            ? { ...row, status: nextStatus }
+            : row
+        )
+      );
+      toast({ title: "Override saved" });
+      setOverrideOpen(false);
+      setOverrideTarget(null);
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Override failed",
+        description: err?.message || "Try again.",
+      });
+    } finally {
+      setOverrideSaving(false);
+    }
+  }
+
   if (!assignmentId) {
     return (
       <div className="p-6 space-y-4">
@@ -459,6 +512,11 @@ export default function AssignmentsPage() {
                         Open marked PDF
                       </Button>
                     )}
+                    {upload.graded_pdf_path && (
+                      <Button size="sm" variant="outline" onClick={() => openOverride(upload)}>
+                        Override
+                      </Button>
+                    )}
                     <Button
                       size="sm"
                       variant="outline"
@@ -567,6 +625,49 @@ export default function AssignmentsPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <Dialog open={overrideOpen} onOpenChange={setOverrideOpen}>
+        <DialogContent className="sm:max-w-[420px]">
+          <DialogHeader>
+            <DialogTitle>Override grade</DialogTitle>
+            <DialogDescription>
+              Adjust the overall result for this upload.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Status</label>
+              <select
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                value={overrideStatus}
+                onChange={(e) => setOverrideStatus(e.target.value)}
+              >
+                <option value="correct">Correct</option>
+                <option value="partial">Partial</option>
+                <option value="incorrect">Incorrect</option>
+                <option value="reviewed">Reviewed</option>
+              </select>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Note (optional)</label>
+              <textarea
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                rows={3}
+                value={overrideNote}
+                onChange={(e) => setOverrideNote(e.target.value)}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOverrideOpen(false)} disabled={overrideSaving}>
+              Cancel
+            </Button>
+            <Button onClick={handleSaveOverride} disabled={overrideSaving}>
+              {overrideSaving ? "Saving..." : "Save override"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
     </div>
   );
