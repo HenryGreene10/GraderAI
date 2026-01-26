@@ -1,7 +1,8 @@
 import datetime as dt
-from typing import Optional
+from typing import Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from ..auth import get_current_user_id
 from ..config import GRADED_BUCKET, OVERLAYS_BUCKET, SUBMISSIONS_BUCKET
@@ -93,6 +94,11 @@ def _utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
+class OverridePayload(BaseModel):
+    overall_status: Literal["correct", "partial", "incorrect", "reviewed"]
+    note: Optional[str] = None
+
+
 @router.post("/{upload_id}/grade")
 async def grade_upload(
     upload_id: str,
@@ -170,3 +176,45 @@ async def grade_upload(
         "needs_review": needs_review,
         "graded_pdf_path": pdf_key,
     }
+
+
+@router.post("/{upload_id}/override")
+def override_upload(
+    upload_id: str,
+    body: OverridePayload,
+    user_id: str = Depends(get_current_user_id),
+):
+    row = get_upload(upload_id, user_id, columns="id,owner_id")
+
+    sb = get_supabase()
+    if sb is None:
+        raise HTTPException(status_code=503, detail="Supabase client unavailable")
+
+    overrides_json = {"overall_status": body.overall_status}
+    note = (body.note or "").strip()
+    if note:
+        overrides_json["note"] = note
+
+    try:
+        sb.table("overrides").insert(
+            {
+                "upload_id": row["id"],
+                "owner_id": row.get("owner_id") or user_id,
+                "overrides_json": overrides_json,
+                "created_at": _utc_iso(),
+                "updated_at": _utc_iso(),
+            }
+        ).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"override_insert_failed: {exc}")
+
+    status = "reviewed" if body.overall_status == "reviewed" else "overridden"
+    update_upload(
+        row["id"],
+        {
+            "status": status,
+            "updated_at": _utc_iso(),
+        },
+    )
+
+    return {"ok": True, "upload_id": row["id"], "status": status}
