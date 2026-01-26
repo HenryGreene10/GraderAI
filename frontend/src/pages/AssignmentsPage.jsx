@@ -31,7 +31,7 @@ import {
 } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
 import { apiFetch } from "../lib/apiBase";
-import { previewUrl as getPreviewUrl } from "../lib/supa";
+import supa from "../lib/supa";
 
 const ACCEPTED_MIME = ["image/png", "image/jpeg", "application/pdf"];
 const ACCEPTED_EXT = [".png", ".jpg", ".jpeg", ".pdf"];
@@ -295,9 +295,14 @@ export default function AssignmentsPage() {
     const key = upload?.graded_pdf_path;
     if (!key) return;
     try {
-      const res = await getPreviewUrl("graded-pdfs", key, 3600);
-      if (!res.ok || !res.url) throw new Error(res.error || "Missing preview URL");
-      window.open(res.url, "_blank");
+      const normalized = String(key).replace(/^\/+/, "");
+      const path = normalized.startsWith("graded-pdfs/")
+        ? normalized.slice("graded-pdfs/".length)
+        : normalized;
+      const { data, error } = await supa.storage.from("graded-pdfs").createSignedUrl(path, 3600);
+      if (error) throw new Error(error.message || "Signed URL failed");
+      if (!data?.signedUrl) throw new Error("Missing signed URL");
+      window.open(data.signedUrl, "_blank");
     } catch (err) {
       toast({
         variant: "destructive",
