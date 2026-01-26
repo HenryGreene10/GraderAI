@@ -54,12 +54,16 @@ Notes
 - Delete is available.
 - Known non-blocking toast issue deferred.
 
-### Ticket 4 — OCR pipeline (internal only) (TODO)
+### Ticket 4 — OCR pipeline (internal only) (DONE)
 Scope: auto-run OCR after upload for downstream grading only.
 Acceptance checks
 - Upload triggers OCR automatically.
 - OCR result is persisted and accessible to backend grading logic.
 - No frontend UI added for viewing OCR output.
+Evidence
+- Uploads row `d818c641-af5e-4dcf-8369-78b991b1823f` shows `ocr_status=done`, `ocr_text` populated, `ocr_error` null, `ocr_boxes` populated (Azure Read).
+Known OCR quirks
+- OCR may confuse commas/periods and spelling; grading must be tolerant and rely on rubric rules + context rather than exact string match.
 
 ### Ticket 5 — Grade + PDF (TODO)
 Scope: use OCR output to identify questions/answers and generate a marked PDF.
