@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv("backend/.env")
+
 import logging
 
 from fastapi import FastAPI

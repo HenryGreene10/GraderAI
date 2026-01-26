@@ -155,9 +155,9 @@ def list_assignment_uploads(
 @router.post("/{assignment_id}/uploads")
 async def upload_assignment_files(
     assignment_id: str,
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     user_id: str = Depends(get_current_user_id),
-    background_tasks: BackgroundTasks,
 ):
     get_assignment(assignment_id, user_id, columns="id,owner_id")
 

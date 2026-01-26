@@ -12,9 +12,8 @@ from ..services.storage import download_submission_bytes
 router = APIRouter(prefix="/api/ocr", tags=["ocr"])
 
 OCR_PENDING = "pending"
-OCR_PROCESSING = "processing"
 OCR_DONE = "done"
-OCR_FAILED = "failed"
+OCR_ERROR = "error"
 
 
 class StartOCRBody(BaseModel):
@@ -25,12 +24,8 @@ def _utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-@router.post("/start")
-async def start_ocr(
-    body: StartOCRBody,
-    user_id: str = Depends(get_current_user_id),
-):
-    row = get_upload(body.upload_id, user_id, columns="id,owner_id,storage_path")
+async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
+    row = get_upload(upload_id, user_id, columns="id,owner_id,storage_path")
     storage_path = row.get("storage_path")
     if not storage_path:
         raise HTTPException(status_code=400, detail="Missing storage_path")
@@ -38,8 +33,8 @@ async def start_ocr(
     update_upload(
         row["id"],
         {
-            "ocr_status": OCR_PROCESSING,
-            "status": OCR_PROCESSING,
+            "ocr_status": OCR_PENDING,
+            "status": OCR_PENDING,
             "ocr_error": None,
             "updated_at": _utc_iso(),
         },
@@ -77,13 +72,21 @@ async def start_ocr(
         update_upload(
             row["id"],
             {
-                "ocr_status": OCR_FAILED,
-                "status": OCR_FAILED,
+                "ocr_status": OCR_ERROR,
+                "status": OCR_ERROR,
                 "ocr_error": str(exc),
                 "updated_at": _utc_iso(),
             },
         )
         raise HTTPException(status_code=500, detail=f"OCR failed: {exc}")
+
+
+@router.post("/start")
+async def start_ocr(
+    body: StartOCRBody,
+    user_id: str = Depends(get_current_user_id),
+):
+    return await run_ocr_for_upload(body.upload_id, user_id)
 
 
 @router.get("/status/{upload_id}")
@@ -99,7 +102,7 @@ def ocr_status(
     text = (row.get("ocr_text") or row.get("extracted_text") or "").strip()
     status = (row.get("ocr_status") or "").strip().lower()
     if row.get("ocr_error"):
-        status = OCR_FAILED
+        status = OCR_ERROR
     elif status:
         status = status
     elif text:
@@ -108,6 +111,6 @@ def ocr_status(
         status = OCR_PENDING
 
     payload = {"status": status, "text_len": len(text) if text else 0}
-    if status == OCR_FAILED and row.get("ocr_error"):
+    if status == OCR_ERROR and row.get("ocr_error"):
         payload["error"] = row.get("ocr_error")
     return payload
