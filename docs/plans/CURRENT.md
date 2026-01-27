@@ -1,7 +1,7 @@
 # Current Plan (GraderAI MVP)
 
 ## Current objective
-Automate the end-to-end workflow and review UX: upload → auto OCR → auto grade → auto marked PDF → view in-app → review/override.
+Beta-ready reliability + consistency: upload → OCR → grade → marked artifact → teacher review/override → export. Ensure viewer consistency (Original vs Marked) and never silently skip mark placement.
 
 ## Supabase setup checklist
 - Status: DONE / verified for local dev.
@@ -73,20 +73,26 @@ Note
 - Layout/region accuracy is approximate in MVP; refinement deferred.
 
 ### Ticket 6A — Review state (DONE)
-Scope: teacher can mark graded uploads as Reviewed/Overridden with a note; does NOT change grades or PDFs.
+Scope: teacher can set status to Reviewed / Flagged / Overridden (review-level) with a note; does NOT change grades or PDFs.
 Acceptance checks
 - State + note persist in DB and survive refresh.
-- Badge updates to Reviewed/Overridden in the uploads list.
-- Review controls only show for graded uploads.
+- Badge updates to Reviewed/Flagged/Overridden in the uploads list.
+- Badge persists; controls only show when `pdf_ready`.
 
-### Ticket 6B — Real overrides (DESIGN LATER)
-Scope: “fix misgrade” without editable PDFs (MVP approach).
-Acceptance checks (TBD — design later)
-- Teacher can set final score and/or per-question correctness + note.
-- UI displays overridden score/state clearly.
-- Optional later: regenerate PDF with a small “override stamp” box (no full PDF editing).
+### Ticket 6B — Real overrides (no PDF editor) (NEXT — Beta-ready minimal)
+Scope
+- Teacher sets final score override (e.g., 3/4).
+- Optional per-question toggles (correct/incorrect) in a simple list; no drawing.
+- Note required when overriding score.
+- Store who/when/note; UI shows “Final: 3/4 (Overridden)”.
+- Optional later (explicitly not required now): regenerate marked PDF with a small “override stamp” box (do not redraw all marks).
+Acceptance checks
+- Override changes the displayed final score (and exported metadata if present).
+- Per-question toggles persist and are visible on refresh.
+- Clear state in uploads list + viewer; tooltip shows note + timestamp.
+- No PDF editing UI.
 
-### Ticket 7 — Frontend polish + automated workflow (NEXT)
+### Ticket 7 — Frontend polish + automated workflow (DONE)
 Scope
 1) Workflow automation (Option A)
    - Auto-run grade + marked PDF generation after OCR completes.
@@ -115,3 +121,35 @@ Acceptance checks
 - Row actions are simplified (View + overflow); no more 5-button row clusters.
 - Status/progress chips update correctly and persist after refresh.
 - No obvious console warnings; key flows show clear success/error messaging.
+Evidence
+- Auto-run grade + PDF after OCR.
+- In-app viewer with Original/Marked tabs.
+- Actions simplified: View + overflow menu.
+- Status chips / processing states are visible and consistent.
+
+### Ticket 8 — Viewer consistency (NEXT)
+Goal: make Original and Marked use the same rendering surface so the before/after experience is clean.
+Preferred approach: normalize Originals to PDF for viewing.
+- If upload is image/*, generate “normalized original PDF” (single-page) for viewer so both tabs are PDFs.
+- Viewer uses the same PDF renderer for both.
+- “Download original” still downloads the true original file.
+Acceptance checks
+- Original and Marked tabs have consistent chrome/zoom behavior and layout.
+- No new-tab by default; keep optional “Open in new tab” as secondary.
+- Works for image uploads and pdf uploads.
+
+### Ticket 9 — Mark placement reliability + better mark style (NEXT)
+Reliability
+- Never silently skip a question mark placement.
+- If any grade item cannot be placed (missing anchor/box), set `needs_review=true` and include `unplaced_items` metadata (e.g., ["Q4"]).
+- UI shows a small warning in viewer: “1 unplaced mark: Q4” (or similar), and row status indicates needs_review.
+Style
+- Add a small score box at top-right: “Score: X/Y” and “Needs review” if applicable.
+- Use consistent ✓/✗ glyphs at target locations; keep it minimal.
+Acceptance checks
+- For a known case where the last question previously lacked a mark, system now flags needs_review and lists the unplaced item.
+- Marked output includes score box and consistent ✓/✗.
+
+## Engineering notes / CI
+- User pushed; GitHub Actions checks are running but may be outdated.
+- TODO: Audit `.github/workflows`; remove/disable deprecated checks or align them with current backend/frontend commands.
