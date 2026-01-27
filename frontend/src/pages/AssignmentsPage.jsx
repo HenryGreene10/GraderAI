@@ -592,6 +592,7 @@ export default function AssignmentsPage() {
                       size="sm"
                       onClick={() => openViewer(upload)}
                       disabled={isProcessing(baseStatus(upload))}
+                      title={isProcessing(baseStatus(upload)) ? "Processing" : "View submission"}
                     >
                       View
                     </Button>
@@ -601,6 +602,7 @@ export default function AssignmentsPage() {
                           size="sm"
                           variant="outline"
                           disabled={isProcessing(baseStatus(upload))}
+                          aria-label="More actions"
                         >
                           ...
                         </Button>
