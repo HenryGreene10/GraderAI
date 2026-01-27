@@ -1,7 +1,7 @@
 # Current Plan (GraderAI MVP)
 
 ## Current objective
-Make the UI the source of truth and validate the real workflow: upload -> auto OCR -> grade -> PDF -> override.
+Automate the end-to-end workflow and review UX: upload → auto OCR → auto grade → auto marked PDF → view in-app → review/override.
 
 ## Supabase setup checklist
 - Status: DONE / verified for local dev.
@@ -65,21 +65,53 @@ Evidence
 Known OCR quirks
 - OCR may confuse commas/periods and spelling; grading must be tolerant and rely on rubric rules + context rather than exact string match.
 
-### Ticket 5 — Grade + PDF (TODO)
+### Ticket 5 — Grade + PDF (DONE)
 Scope: use OCR output to identify questions/answers and generate a marked PDF.
 Acceptance checks
 - Teacher sees the original uploaded file and the marked PDF.
 Note
 - Layout/region accuracy is approximate in MVP; refinement deferred.
 
-### Ticket 6 — Overrides (TODO)
-Scope: teacher can adjust grading via a later workflow (chat-based or manual edits to marked PDF).
+### Ticket 6A — Review state (DONE)
+Scope: teacher can mark graded uploads as Reviewed/Overridden with a note; does NOT change grades or PDFs.
 Acceptance checks
-- Do not design override UI yet.
+- State + note persist in DB and survive refresh.
+- Badge updates to Reviewed/Overridden in the uploads list.
+- Review controls only show for graded uploads.
 
-### Ticket 7 — Frontend polish / encoding fixes (LATER)
-Scope: UI cleanup, encoding warnings removed, and small UX refinements.
+### Ticket 6B — Real overrides (DESIGN LATER)
+Scope: “fix misgrade” without editable PDFs (MVP approach).
+Acceptance checks (TBD — design later)
+- Teacher can set final score and/or per-question correctness + note.
+- UI displays overridden score/state clearly.
+- Optional later: regenerate PDF with a small “override stamp” box (no full PDF editing).
+
+### Ticket 7 — Frontend polish + automated workflow (NEXT)
+Scope
+1) Workflow automation (Option A)
+   - Auto-run grade + marked PDF generation after OCR completes.
+   - Remove or hide per-row “Generate marked PDF” button (deprecated).
+   - Row states reflect progress: Uploading → OCR… → Grading… → PDF ready (or Error).
+   - Disable actions during processing; show loading indicators.
+2) In-app document viewer (same window)
+   - Replace “Open marked PDF” new tab behavior with an in-app viewer (modal/drawer).
+   - Viewer supports Original + Marked PDF (tabs/toggle).
+   - Download controls inside viewer; optional “Open in new tab” link is secondary.
+3) Actions cleanup (reduce button clutter)
+   - One primary per-row action: “View”.
+   - Secondary actions in overflow menu (⋯): Review/Override (6A), Download original, Download marked PDF, Delete (confirm).
+   - Delete is destructive and always confirmed.
+4) UX quality / consistency
+   - Fix console warnings / encoding issues.
+   - Improve empty states (no assignments / no uploads).
+   - Consistent toast messages for success/failure.
+   - Better responsive spacing for action area.
+5) Safety / correctness guards
+   - If PDF not ready, hide/disable view-marked and review actions.
+   - Show clear error status + “Retry” action for failed OCR/grade/PDF (retry can be stubbed initially).
 Acceptance checks
-- No console warnings related to invalid characters/encoding.
-- Dashboard and Assignments pages render cleanly.
-- Visual polish pass applied to upload + results views.
+- Uploading a file automatically results in a marked PDF without any manual “Generate” action.
+- Marked PDF can be viewed in-app without opening a new browser tab/window.
+- Row actions are simplified (View + overflow); no more 5-button row clusters.
+- Status/progress chips update correctly and persist after refresh.
+- No obvious console warnings; key flows show clear success/error messaging.
