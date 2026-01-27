@@ -1,5 +1,7 @@
 import datetime as dt
 import logging
+import os
+from io import BytesIO
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -10,6 +12,7 @@ from ..services.db import get_upload, update_upload
 from ..services.ocr import normalize_ocr_result
 from ..services.scan_pipeline import prepare_ocr_image
 from ..services.storage import download_submission_bytes
+from PIL import Image
 
 router = APIRouter(prefix="/api/ocr", tags=["ocr"])
 logger = logging.getLogger(__name__)
@@ -27,11 +30,19 @@ def _utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
+def _log_ocr_image_size(tag: str, image_bytes: bytes) -> None:
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            logger.info("%s OCR input size: %sx%s px", tag, img.width, img.height)
+    except Exception:
+        return
+
+
 async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
     row = get_upload(
         upload_id,
         user_id,
-        columns="id,owner_id,storage_path,mime_type,needs_review",
+        columns="id,owner_id,storage_path,mime_type,needs_review,normalized_image_path",
     )
     storage_path = row.get("storage_path")
     if not storage_path:
@@ -65,6 +76,19 @@ async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
             logger.warning("Scan normalization failed for %s: %s", row["id"], exc)
             ocr_bytes = blob
 
+        provider = os.getenv("OCR_PROVIDER", "").strip().lower()
+        if provider == "azure":
+            if scan_artifacts:
+                ocr_bytes = scan_artifacts.normalized_image_bytes
+            else:
+                normalized_path = row.get("normalized_image_path")
+                if normalized_path:
+                    try:
+                        ocr_bytes = download_submission_bytes(normalized_path)
+                    except Exception:
+                        ocr_bytes = blob
+
+        _log_ocr_image_size("run_ocr_for_upload", ocr_bytes)
         raw = await ocr.extract_text(image_bytes=ocr_bytes)
         norm = normalize_ocr_result(raw)
         text = (norm.get("text") or "").strip()

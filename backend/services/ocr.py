@@ -74,14 +74,21 @@ class AzureReadOCRProvider(BaseOCRProvider):
                     content=image_bytes,
                 )
 
+            if resp.status_code != 202:
+                body = (resp.text or "").strip()
+                snippet = body[:500]
+                raise RuntimeError(
+                    f"Azure OCR request failed (status={resp.status_code} body={snippet})"
+                )
+
             op_location = (
                 resp.headers.get("Operation-Location")
                 or resp.headers.get("operation-location")
                 or resp.headers.get("OPERATION-LOCATION")
             )
             if not op_location:
-                body = resp.text or ""
-                snippet = body[:300]
+                body = (resp.text or "").strip()
+                snippet = body[:500]
                 raise RuntimeError(
                     f"Azure OCR missing Operation-Location (status={resp.status_code} body={snippet})"
                 )

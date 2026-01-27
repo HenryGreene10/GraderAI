@@ -22,6 +22,11 @@ from reportlab.lib.utils import ImageReader
 
 logger = logging.getLogger(__name__)
 
+MIN_DIM_PX = 50
+MAX_DIM_PX = 5000
+PDF_DPI = 300
+MAX_PDF_IN = 17.0
+
 
 @dataclass
 class ScanResult:
@@ -130,17 +135,93 @@ def _image_to_png_bytes(image: Image.Image) -> bytes:
 
 def _image_to_pdf_bytes(image: Image.Image) -> bytes:
     width, height = image.size
+    width_in = width / PDF_DPI
+    height_in = height / PDF_DPI
+    max_in = max(width_in, height_in)
+    if max_in > MAX_PDF_IN:
+        scale = MAX_PDF_IN / max_in
+        new_w = max(1, int(round(width * scale)))
+        new_h = max(1, int(round(height * scale)))
+        image = image.resize((new_w, new_h), Image.LANCZOS)
+        width, height = image.size
+        width_in = width / PDF_DPI
+        height_in = height / PDF_DPI
+    width_pt = width_in * 72.0
+    height_pt = height_in * 72.0
     buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=(width, height))
-    c.drawImage(ImageReader(image), 0, 0, width=width, height=height)
+    c = canvas.Canvas(buf, pagesize=(width_pt, height_pt))
+    c.drawImage(ImageReader(image), 0, 0, width=width_pt, height=height_pt)
     c.showPage()
     c.save()
     return buf.getvalue()
 
 
+def _resize_dims(width: int, height: int) -> Tuple[int, int, float]:
+    if width <= 0 or height <= 0:
+        return width, height, 1.0
+    max_dim = max(width, height)
+    scale_down = min(1.0, MAX_DIM_PX / float(max_dim))
+    width = max(1, int(round(width * scale_down)))
+    height = max(1, int(round(height * scale_down)))
+    min_dim = min(width, height)
+    scale_up = 1.0
+    if min_dim < MIN_DIM_PX:
+        scale_up = MIN_DIM_PX / float(min_dim)
+        if max(width, height) * scale_up <= MAX_DIM_PX:
+            width = max(1, int(round(width * scale_up)))
+            height = max(1, int(round(height * scale_up)))
+            return width, height, scale_down * scale_up
+        return width, height, scale_down
+    return width, height, scale_down
+
+
+def _pad_pil(image: Image.Image) -> Image.Image:
+    width, height = image.size
+    if min(width, height) >= MIN_DIM_PX:
+        return image
+    new_w = max(width, MIN_DIM_PX)
+    new_h = max(height, MIN_DIM_PX)
+    canvas = Image.new("RGB", (new_w, new_h), color=(255, 255, 255))
+    offset = ((new_w - width) // 2, (new_h - height) // 2)
+    canvas.paste(image, offset)
+    return canvas
+
+
+def _pad_cv(image: "np.ndarray") -> "np.ndarray":
+    height, width = image.shape[:2]
+    if min(width, height) >= MIN_DIM_PX:
+        return image
+    new_w = max(width, MIN_DIM_PX)
+    new_h = max(height, MIN_DIM_PX)
+    canvas = 255 * np.ones((new_h, new_w, 3), dtype=image.dtype)
+    x = (new_w - width) // 2
+    y = (new_h - height) // 2
+    canvas[y : y + height, x : x + width] = image
+    return canvas
+
+
+def _clamp_pil(image: Image.Image) -> Image.Image:
+    width, height = image.size
+    new_w, new_h, scale = _resize_dims(width, height)
+    if (new_w, new_h) != (width, height):
+        resample = Image.LANCZOS if scale < 1.0 else Image.BICUBIC
+        image = image.resize((new_w, new_h), resample)
+    return _pad_pil(image)
+
+
+def _clamp_cv(image: "np.ndarray") -> "np.ndarray":
+    height, width = image.shape[:2]
+    new_w, new_h, scale = _resize_dims(width, height)
+    if (new_w, new_h) != (width, height):
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        image = cv2.resize(image, (new_w, new_h), interpolation=interp)
+    return _pad_cv(image)
+
+
 def normalize_image_bytes(image_bytes: bytes) -> ScanResult:
     img = Image.open(BytesIO(image_bytes))
     img = ImageOps.exif_transpose(img).convert("RGB")
+    img = _clamp_pil(img)
 
     if not _HAS_CV2:
         err = f"opencv_missing: {_CV2_ERR}"
@@ -148,6 +229,7 @@ def normalize_image_bytes(image_bytes: bytes) -> ScanResult:
         png_bytes = _image_to_png_bytes(img)
         pdf_bytes = _image_to_pdf_bytes(img)
         width, height = img.size
+        logger.info("Normalized image size (fallback): %sx%s px", width, height)
         return ScanResult(
             normalized_png=png_bytes,
             normalized_pdf=pdf_bytes,
@@ -167,10 +249,12 @@ def normalize_image_bytes(image_bytes: bytes) -> ScanResult:
         warped = _four_point_warp(cv_img, contour)
         warped = _deskew(warped)
         warped = _normalize_contrast(warped)
+        warped = _clamp_cv(warped)
         normalized = Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
         png_bytes = _image_to_png_bytes(normalized)
         pdf_bytes = _image_to_pdf_bytes(normalized)
         width, height = normalized.size
+        logger.info("Normalized image size: %sx%s px", width, height)
         return ScanResult(
             normalized_png=png_bytes,
             normalized_pdf=pdf_bytes,
@@ -182,9 +266,11 @@ def normalize_image_bytes(image_bytes: bytes) -> ScanResult:
     except Exception as exc:
         err = str(exc)
         logger.warning("Scan normalization failed; falling back to EXIF-only: %s", err)
+        img = _clamp_pil(img)
         png_bytes = _image_to_png_bytes(img)
         pdf_bytes = _image_to_pdf_bytes(img)
         width, height = img.size
+        logger.info("Normalized image size (fallback): %sx%s px", width, height)
         return ScanResult(
             normalized_png=png_bytes,
             normalized_pdf=pdf_bytes,

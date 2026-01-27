@@ -1,4 +1,7 @@
 import datetime as dt
+import logging
+import os
+from io import BytesIO
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -25,6 +28,9 @@ from ..services.ocr import normalize_ocr_result
 from ..services.report import flatten_to_pdf
 from ..services.scan_pipeline import prepare_ocr_image
 from ..services.storage import download_submission_bytes, upload_bytes, upload_json
+from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["grade"])
 
@@ -35,6 +41,14 @@ class StartGradeBody(BaseModel):
 
 def _utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _log_ocr_image_size(tag: str, image_bytes: bytes) -> None:
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            logger.info("%s OCR input size: %sx%s px", tag, img.width, img.height)
+    except Exception:
+        return
 
 
 def _needs_review(result: GradeResult, ocr_confidence: Optional[float], text: str) -> bool:
@@ -75,7 +89,32 @@ async def _ensure_ocr(row: dict) -> dict:
         scan_error = str(exc)
         ocr_bytes = blob
 
-    raw = await ocr_service.extract_text(image_bytes=ocr_bytes)
+    provider = os.getenv("OCR_PROVIDER", "").strip().lower()
+    if provider == "azure":
+        if scan_artifacts:
+            ocr_bytes = scan_artifacts.normalized_image_bytes
+        else:
+            normalized_path = row.get("normalized_image_path")
+            if normalized_path:
+                try:
+                    ocr_bytes = download_submission_bytes(normalized_path)
+                except Exception:
+                    ocr_bytes = blob
+
+    _log_ocr_image_size("_ensure_ocr", ocr_bytes)
+    try:
+        raw = await ocr_service.extract_text(image_bytes=ocr_bytes)
+    except Exception as exc:
+        update_upload(
+            row["id"],
+            {
+                "ocr_status": "error",
+                "status": "error",
+                "ocr_error": str(exc),
+                "updated_at": _utc_iso(),
+            },
+        )
+        raise HTTPException(status_code=500, detail=f"OCR failed: {exc}")
     norm = normalize_ocr_result(raw)
     text = (norm.get("text") or "").strip()
     if not text:
@@ -118,7 +157,7 @@ async def start_grade(
         caller_id,
         columns=(
             "id,owner_id,storage_path,ocr_text,extracted_text,ocr_boxes,"
-            "ocr_confidence,mime_type,needs_review"
+            "ocr_confidence,mime_type,needs_review,normalized_image_path"
         ),
     )
 
