@@ -8,6 +8,7 @@ from ..auth import get_current_user_id
 from ..services import ocr
 from ..services.db import get_upload, update_upload
 from ..services.ocr import normalize_ocr_result
+from ..services.scan_pipeline import prepare_ocr_image
 from ..services.storage import download_submission_bytes
 
 router = APIRouter(prefix="/api/ocr", tags=["ocr"])
@@ -27,7 +28,11 @@ def _utc_iso() -> str:
 
 
 async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
-    row = get_upload(upload_id, user_id, columns="id,owner_id,storage_path")
+    row = get_upload(
+        upload_id,
+        user_id,
+        columns="id,owner_id,storage_path,mime_type,needs_review",
+    )
     storage_path = row.get("storage_path")
     if not storage_path:
         raise HTTPException(status_code=400, detail="Missing storage_path")
@@ -44,12 +49,30 @@ async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
 
     try:
         blob = download_submission_bytes(storage_path)
-        raw = await ocr.extract_text(image_bytes=blob)
+        scan_artifacts = None
+        scan_error = None
+        ocr_bytes = blob
+        try:
+            ocr_bytes, scan_artifacts = prepare_ocr_image(
+                blob,
+                row.get("mime_type"),
+                row.get("owner_id") or user_id or "unknown",
+                row["id"],
+            )
+        except Exception as exc:
+            scan_artifacts = None
+            scan_error = str(exc)
+            logger.warning("Scan normalization failed for %s: %s", row["id"], exc)
+            ocr_bytes = blob
+
+        raw = await ocr.extract_text(image_bytes=ocr_bytes)
         norm = normalize_ocr_result(raw)
         text = (norm.get("text") or "").strip()
         if not text:
             raise HTTPException(status_code=422, detail="OCR returned empty text")
 
+        scan_failed = bool(scan_artifacts and not scan_artifacts.scan_ok) or bool(scan_error)
+        needs_review = bool(row.get("needs_review")) or scan_failed
         payload = {
             "ocr_status": OCR_DONE,
             "status": "ocr_done",
@@ -60,6 +83,26 @@ async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
             "ocr_error": None,
             "updated_at": _utc_iso(),
         }
+        if scan_artifacts:
+            payload.update(
+                {
+                    "normalized_image_path": scan_artifacts.normalized_image_path,
+                    "normalized_pdf_path": scan_artifacts.normalized_pdf_path,
+                    "normalized_width_px": scan_artifacts.width_px,
+                    "normalized_height_px": scan_artifacts.height_px,
+                    "scan_status": "normalized" if scan_artifacts.scan_ok else "fallback",
+                    "scan_error": scan_artifacts.error,
+                    "needs_review": needs_review,
+                }
+            )
+        elif scan_error:
+            payload.update(
+                {
+                    "scan_status": "fallback",
+                    "scan_error": scan_error,
+                    "needs_review": needs_review,
+                }
+            )
         update_upload(row["id"], payload)
         try:
             from .uploads import run_grade_pipeline

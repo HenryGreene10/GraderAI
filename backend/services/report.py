@@ -15,6 +15,8 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 from ..models.schemas import Overlay, OverlayMark, GradeResult
+from .coords import px_to_pdf, rect_px_to_pdf
+from .marking import DebugLayout
 
 
 def build_overlay_basic(result: GradeResult) -> Overlay:
@@ -25,8 +27,6 @@ def build_overlay_basic(result: GradeResult) -> Overlay:
         marks.append(OverlayMark(tool="bubble", coords=[40.0, y], text=f"{item.score:.0f}/{item.max_score:.0f}"))
         marks.append(OverlayMark(tool="note", coords=[90.0, y], text=f"Q{item.question_id}: {label} {item.rationale}"))
         y -= 28.0
-    if result.needs_review:
-        marks.append(OverlayMark(tool="highlight", coords=[36.0, 40.0, 540.0, 20.0], text="Needs review"))
     return Overlay(page=1, marks=marks)
 
 
@@ -100,7 +100,14 @@ def _draw_marks(c: canvas.Canvas, overlay: Overlay) -> None:
             c.drawString(x, y, mark.text or "")
         elif mark.tool == "bubble":
             c.setFont("Helvetica-Bold", 12)
-            c.drawString(x, y, mark.text or "")
+            if len(mark.coords) >= 4:
+                _, _, w, h = mark.coords[:4]
+                c.setFillColorRGB(1, 1, 1)
+                c.rect(x, y, w, h, stroke=1, fill=1)
+                c.setFillColorRGB(0, 0, 0)
+                c.drawString(x + 6, y + max(6, (h - 12) / 2), mark.text or "")
+            else:
+                c.drawString(x, y, mark.text or "")
         elif mark.tool == "highlight" and len(mark.coords) >= 4:
             _, _, w, h = mark.coords[:4]
             c.setFillColorRGB(1, 1, 0)
@@ -146,3 +153,54 @@ def render_marked_pdf(
     _draw_marks(c, overlay)
     c.save()
     return buf.getvalue()
+
+
+def render_debug_layout_pdf(
+    original_bytes: bytes,
+    mime_type: str | None,
+    ocr_boxes: object,
+    debug_layout: DebugLayout,
+    normalized_size: Tuple[float, float],
+) -> bytes:
+    if PdfReader is None or PdfWriter is None:
+        raise RuntimeError("pypdf is required for debug overlays")
+
+    reader = PdfReader(BytesIO(original_bytes))
+    writer = PdfWriter()
+    page = reader.pages[0]
+    page_width = float(page.mediabox.width)
+    page_height = float(page.mediabox.height)
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_width, page_height))
+
+    norm_w, norm_h = normalized_size
+    if norm_w <= 0 or norm_h <= 0:
+        # Best-effort infer from OCR boxes if present
+        analyze = (ocr_boxes or {}).get("analyzeResult", {}) if isinstance(ocr_boxes, dict) else {}
+        read_results = analyze.get("readResults") or []
+        if read_results:
+            norm_w = float(read_results[0].get("width") or 0.0)
+            norm_h = float(read_results[0].get("height") or 0.0)
+    if norm_w <= 0 or norm_h <= 0:
+        norm_w, norm_h = page_width, page_height
+
+    c.setStrokeColorRGB(0.1, 0.4, 0.8)
+    for rect in debug_layout.boxes_px:
+        x, y, w, h = rect_px_to_pdf(rect, (norm_w, norm_h), (page_width, page_height))
+        c.rect(x, y, w, h, stroke=1, fill=0)
+
+    c.setFillColorRGB(0.9, 0.1, 0.1)
+    c.setFont("Helvetica", 8)
+    for anchor in debug_layout.anchors:
+        ax, ay = px_to_pdf(anchor.anchor_px[0], anchor.anchor_px[1], (norm_w, norm_h), (page_width, page_height))
+        c.circle(ax, ay, 3, stroke=0, fill=1)
+        c.drawString(ax + 4, ay + 2, f"Q{anchor.question_id} ({anchor.source})")
+
+    c.save()
+    overlay_reader = PdfReader(BytesIO(buf.getvalue()))
+    page.merge_page(overlay_reader.pages[0])
+    writer.add_page(page)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()

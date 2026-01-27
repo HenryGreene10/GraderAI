@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS uploads (
   ocr_confidence numeric,
   ocr_error text,
   extracted_text text,
+  normalized_image_path text,
+  normalized_pdf_path text,
+  normalized_width_px integer,
+  normalized_height_px integer,
+  scan_status text,
+  scan_error text,
   grade_json jsonb,
   overlay_json jsonb,
   overlay_path text,
@@ -60,6 +66,12 @@ ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS ocr_boxes jsonb;
 ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS ocr_confidence numeric;
 ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS ocr_error text;
 ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS extracted_text text;
+ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS normalized_image_path text;
+ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS normalized_pdf_path text;
+ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS normalized_width_px integer;
+ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS normalized_height_px integer;
+ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS scan_status text;
+ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS scan_error text;
 ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS grade_json jsonb;
 ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS overlay_json jsonb;
 ALTER TABLE IF EXISTS uploads ADD COLUMN IF NOT EXISTS overlay_path text;

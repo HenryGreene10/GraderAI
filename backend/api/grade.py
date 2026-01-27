@@ -23,6 +23,7 @@ from ..services.grader import (
 )
 from ..services.ocr import normalize_ocr_result
 from ..services.report import flatten_to_pdf
+from ..services.scan_pipeline import prepare_ocr_image
 from ..services.storage import download_submission_bytes, upload_bytes, upload_json
 
 router = APIRouter(tags=["grade"])
@@ -60,12 +61,28 @@ async def _ensure_ocr(row: dict) -> dict:
         raise HTTPException(status_code=400, detail="Missing storage_path")
 
     blob = download_submission_bytes(storage_path)
-    raw = await ocr_service.extract_text(image_bytes=blob)
+    scan_artifacts = None
+    scan_error = None
+    ocr_bytes = blob
+    try:
+        ocr_bytes, scan_artifacts = prepare_ocr_image(
+            blob,
+            row.get("mime_type"),
+            row.get("owner_id") or "unknown",
+            row["id"],
+        )
+    except Exception as exc:
+        scan_error = str(exc)
+        ocr_bytes = blob
+
+    raw = await ocr_service.extract_text(image_bytes=ocr_bytes)
     norm = normalize_ocr_result(raw)
     text = (norm.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=422, detail="OCR returned empty text")
 
+    scan_failed = bool(scan_artifacts and not scan_artifacts.scan_ok) or bool(scan_error)
+    needs_review = bool(row.get("needs_review")) or scan_failed
     update_upload(
         row["id"],
         {
@@ -76,6 +93,13 @@ async def _ensure_ocr(row: dict) -> dict:
             "ocr_boxes": norm.get("boxes"),
             "ocr_confidence": norm.get("confidence"),
             "ocr_error": None,
+            "normalized_image_path": scan_artifacts.normalized_image_path if scan_artifacts else None,
+            "normalized_pdf_path": scan_artifacts.normalized_pdf_path if scan_artifacts else None,
+            "normalized_width_px": scan_artifacts.width_px if scan_artifacts else None,
+            "normalized_height_px": scan_artifacts.height_px if scan_artifacts else None,
+            "scan_status": "normalized" if (scan_artifacts and scan_artifacts.scan_ok) else ("fallback" if scan_failed else None),
+            "scan_error": (scan_artifacts.error if scan_artifacts else scan_error),
+            "needs_review": needs_review,
             "updated_at": _utc_iso(),
         },
     )
@@ -92,7 +116,10 @@ async def start_grade(
     row = get_upload(
         body.upload_id,
         caller_id,
-        columns="id,owner_id,storage_path,ocr_text,extracted_text,ocr_boxes,ocr_confidence",
+        columns=(
+            "id,owner_id,storage_path,ocr_text,extracted_text,ocr_boxes,"
+            "ocr_confidence,mime_type,needs_review"
+        ),
     )
 
     ocr_result = await _ensure_ocr(row)
@@ -129,7 +156,7 @@ async def start_grade(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"PDF upload failed: {exc}")
 
-    needs_review = _needs_review(result, ocr_result.get("confidence"), text)
+    needs_review = _needs_review(result, ocr_result.get("confidence"), text) or bool(row.get("needs_review"))
 
     update_upload(
         row["id"],

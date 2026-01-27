@@ -45,6 +45,7 @@ class GradeResult(BaseModel):
     rubric_version: str
     prompt_version: str
     needs_review: bool = False
+    unplaced_items: List[str] = Field(default_factory=list)
 
 
 class OverlayMark(BaseModel):
@@ -56,4 +57,3 @@ class OverlayMark(BaseModel):
 class Overlay(BaseModel):
     page: int = 1
     marks: List[OverlayMark] = Field(default_factory=list)
-
