@@ -1,4 +1,6 @@
 from typing import Any, Optional
+import logging
+import re
 
 from fastapi import HTTPException
 try:  # pragma: no cover - optional import for supabase error handling
@@ -8,6 +10,22 @@ except Exception:  # pragma: no cover - fallback if dependency changes
 
 from ..config import REQUIRE_OWNER
 from .supabase_client import get_supabase
+
+logger = logging.getLogger(__name__)
+
+
+def _missing_column(err: dict) -> Optional[str]:
+    details = str(err.get("details") or err.get("message") or "")
+    match = re.search(r"Could not find the '([^']+)' column", details)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _strip_column(columns: str, missing: str) -> str:
+    parts = [c.strip() for c in (columns or "").split(",") if c.strip()]
+    filtered = [c for c in parts if c != missing]
+    return ",".join(filtered)
 
 
 def require_supabase():
@@ -25,14 +43,25 @@ def owner_matches(row: dict, caller_id: Optional[str]) -> bool:
 
 def get_assignment(assignment_id: str, caller_id: Optional[str], columns: str = "*") -> dict:
     sb = require_supabase()
-    try:
-        resp = sb.table("assignments").select(columns).eq("id", assignment_id).maybe_single().execute()
-        row = resp.data
-    except APIError as exc:
-        err = getattr(exc, "message", None) or getattr(exc, "args", [""])[0]
-        if isinstance(err, dict) and str(err.get("code")) == "204":
-            row = None
-        else:
+    row = None
+    cols = columns
+    for _ in range(3):
+        try:
+            resp = sb.table("assignments").select(cols).eq("id", assignment_id).maybe_single().execute()
+            row = resp.data
+            break
+        except APIError as exc:
+            err = getattr(exc, "message", None) or getattr(exc, "args", [""])[0]
+            if isinstance(err, dict):
+                code = str(err.get("code") or "")
+                if code == "204":
+                    row = None
+                    break
+                if code == "PGRST204":
+                    missing = _missing_column(err)
+                    if missing:
+                        cols = _strip_column(cols, missing)
+                        continue
             raise
     if not row:
         raise HTTPException(status_code=404, detail="Assignment not found")
@@ -43,14 +72,25 @@ def get_assignment(assignment_id: str, caller_id: Optional[str], columns: str = 
 
 def get_upload(upload_id: str, caller_id: Optional[str], columns: str = "*") -> dict:
     sb = require_supabase()
-    try:
-        resp = sb.table("uploads").select(columns).eq("id", upload_id).maybe_single().execute()
-        row = resp.data
-    except APIError as exc:
-        err = getattr(exc, "message", None) or getattr(exc, "args", [""])[0]
-        if isinstance(err, dict) and str(err.get("code")) == "204":
-            row = None
-        else:
+    row = None
+    cols = columns
+    for _ in range(3):
+        try:
+            resp = sb.table("uploads").select(cols).eq("id", upload_id).maybe_single().execute()
+            row = resp.data
+            break
+        except APIError as exc:
+            err = getattr(exc, "message", None) or getattr(exc, "args", [""])[0]
+            if isinstance(err, dict):
+                code = str(err.get("code") or "")
+                if code == "204":
+                    row = None
+                    break
+                if code == "PGRST204":
+                    missing = _missing_column(err)
+                    if missing:
+                        cols = _strip_column(cols, missing)
+                        continue
             raise
     if not row:
         raise HTTPException(status_code=404, detail="Upload not found")
@@ -61,4 +101,19 @@ def get_upload(upload_id: str, caller_id: Optional[str], columns: str = "*") -> 
 
 def update_upload(upload_id: str, payload: dict[str, Any]) -> None:
     sb = require_supabase()
-    sb.table("uploads").update(payload).eq("id", upload_id).execute()
+    data = dict(payload)
+    for _ in range(3):
+        if not data:
+            return
+        try:
+            sb.table("uploads").update(data).eq("id", upload_id).execute()
+            return
+        except APIError as exc:
+            err = getattr(exc, "message", None) or getattr(exc, "args", [""])[0]
+            if isinstance(err, dict) and str(err.get("code")) == "PGRST204":
+                missing = _missing_column(err)
+                if missing and missing in data:
+                    logger.warning("Dropping missing uploads column '%s' from update", missing)
+                    data.pop(missing, None)
+                    continue
+            raise
