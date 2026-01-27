@@ -36,6 +36,7 @@ def test_upload_grade_sets_pdf(fake_supabase, monkeypatch):
         },
         "mime_type": "application/pdf",
     }
+    fake_supabase.storage.objects[("submissions", "owner-1/file.pdf")] = b"%PDF-1.4 mock"
 
     async def fake_grade_with_llm(_text):
         item = QuestionGrade(
