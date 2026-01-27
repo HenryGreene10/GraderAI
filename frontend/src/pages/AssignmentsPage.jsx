@@ -29,6 +29,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useToast } from "@/hooks/use-toast";
 import { apiFetch } from "../lib/apiBase";
 import supa from "../lib/supa";
@@ -47,10 +54,42 @@ function statusLabel(status) {
   const normalized = String(status || "uploaded").toLowerCase();
   if (normalized === "overridden") return "Overridden";
   if (normalized === "reviewed") return "Reviewed";
+  if (normalized === "uploading") return "Uploading";
+  if (normalized === "ocr_running") return "OCR...";
+  if (normalized === "ocr_done") return "OCR done";
+  if (normalized === "grading") return "Grading...";
+  if (normalized === "pdf_ready") return "PDF ready";
   if (normalized === "pending" || normalized === "uploaded") return "Uploaded";
   if (normalized === "processing" || normalized === "running") return "Processing";
-  if (normalized === "failed" || normalized === "error") return "Needs review";
+  if (normalized === "failed" || normalized === "error") return "Error";
   return normalized.replace(/_/g, " ");
+}
+
+function baseStatus(upload) {
+  const status = String(upload?.status || "").toLowerCase();
+  const ocrStatus = String(upload?.ocr_status || "").toLowerCase();
+  const hasPdf = Boolean(upload?.graded_pdf_path);
+
+  if (status === "error" || ocrStatus === "error") return "error";
+  if (status === "grading") return "grading";
+  if (status === "ocr_running") return "ocr_running";
+  if (status === "ocr_done") return "grading";
+  if (status === "uploading" || status === "pending" || status === "uploaded") return "uploading";
+  if (status === "graded" || status === "pdf_ready" || hasPdf) return "pdf_ready";
+  if (ocrStatus === "pending") return "ocr_running";
+  return status || "uploaded";
+}
+
+function reviewState(upload) {
+  const status = String(upload?.status || "").toLowerCase();
+  if ((status === "reviewed" || status === "overridden") && upload?.graded_pdf_path) {
+    return status;
+  }
+  return null;
+}
+
+function isProcessing(status) {
+  return status === "uploading" || status === "ocr_running" || status === "grading";
 }
 
 function isPdf(upload) {
@@ -58,12 +97,6 @@ function isPdf(upload) {
     String(upload?.mime_type || "").includes("pdf") ||
     String(upload?.original_name || "").toLowerCase().endsWith(".pdf")
   );
-}
-
-function isImage(upload) {
-  const name = String(upload?.original_name || "").toLowerCase();
-  if (name.endsWith(".png") || name.endsWith(".jpg") || name.endsWith(".jpeg")) return true;
-  return String(upload?.mime_type || "").startsWith("image/");
 }
 
 export default function AssignmentsPage() {
@@ -84,16 +117,18 @@ export default function AssignmentsPage() {
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef(null);
 
-  const [previewOpen, setPreviewOpen] = useState(false);
-  const [previewUrl, setPreviewUrl] = useState("");
-  const [previewFile, setPreviewFile] = useState(null);
-  const [previewLoading, setPreviewLoading] = useState(false);
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const [viewerTab, setViewerTab] = useState("original");
+  const [viewerTarget, setViewerTarget] = useState(null);
+  const [viewerUrls, setViewerUrls] = useState({ original: "", marked: "" });
+  const [viewerLoading, setViewerLoading] = useState(false);
+  const [viewerError, setViewerError] = useState("");
 
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteAssignmentOpen, setDeleteAssignmentOpen] = useState(false);
   const [deletingAssignment, setDeletingAssignment] = useState(false);
-  const [grading, setGrading] = useState({});
+  const [retrying, setRetrying] = useState({});
   const [overrideOpen, setOverrideOpen] = useState(false);
   const [overrideTarget, setOverrideTarget] = useState(null);
   const [overrideStatus, setOverrideStatus] = useState("correct");
@@ -112,6 +147,16 @@ export default function AssignmentsPage() {
     loadAssignment();
     loadUploads();
   }, [assignmentId]);
+
+  useEffect(() => {
+    if (!assignmentId) return;
+    const hasProcessing = uploads.some((u) => isProcessing(baseStatus(u)));
+    if (!hasProcessing) return;
+    const timer = setInterval(() => {
+      loadUploads({ silent: true });
+    }, 4000);
+    return () => clearInterval(timer);
+  }, [uploads, assignmentId]);
 
   async function loadAssignment() {
     try {
@@ -132,9 +177,9 @@ export default function AssignmentsPage() {
     }
   }
 
-  async function loadUploads() {
+  async function loadUploads({ silent = false } = {}) {
     if (!assignmentId) return;
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
       const resp = await apiFetch(`/api/assignments/${assignmentId}/uploads`);
       if (!resp.ok) {
@@ -144,14 +189,16 @@ export default function AssignmentsPage() {
       const data = await resp.json();
       setUploads(data.uploads || []);
     } catch (err) {
-      toast({
-        variant: "destructive",
-        title: "Failed to load uploads",
-        description: err?.message || "Try again.",
-      });
-      setUploads([]);
+      if (!silent) {
+        toast({
+          variant: "destructive",
+          title: "Failed to load uploads",
+          description: err?.message || "Try again.",
+        });
+      }
+      if (!silent) setUploads([]);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }
 
@@ -224,28 +271,47 @@ export default function AssignmentsPage() {
     }
   }
 
-  async function handlePreview(upload) {
-    setPreviewFile(upload);
-    setPreviewUrl("");
-    setPreviewLoading(true);
-    setPreviewOpen(true);
+  async function fetchOriginalUrl(upload) {
+    const resp = await apiFetch(`/api/uploads/${upload.id}/preview`);
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(text || `Preview failed: ${resp.status}`);
+    }
+    const data = await resp.json();
+    if (!data?.url) throw new Error("Missing preview URL");
+    return data.url;
+  }
+
+  async function fetchMarkedUrl(upload) {
+    const key = upload?.graded_pdf_path;
+    if (!key) return "";
+    const normalized = String(key).replace(/^\/+/, "");
+    const path = normalized.startsWith("graded-pdfs/")
+      ? normalized.slice("graded-pdfs/".length)
+      : normalized;
+    const { data, error } = await supa.storage.from("graded-pdfs").createSignedUrl(path, 3600);
+    if (error) throw new Error(error.message || "Signed URL failed");
+    if (!data?.signedUrl) throw new Error("Missing signed URL");
+    return data.signedUrl;
+  }
+
+  async function openViewer(upload) {
+    if (!upload?.id) return;
+    setViewerTarget(upload);
+    setViewerTab("original");
+    setViewerOpen(true);
+    setViewerLoading(true);
+    setViewerError("");
+    setViewerUrls({ original: "", marked: "" });
     try {
-      const resp = await apiFetch(`/api/uploads/${upload.id}/preview`);
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        throw new Error(text || `Preview failed: ${resp.status}`);
-      }
-      const data = await resp.json();
-      setPreviewUrl(data.url || "");
+      const originalPromise = fetchOriginalUrl(upload);
+      const markedPromise = upload.graded_pdf_path ? fetchMarkedUrl(upload) : Promise.resolve("");
+      const [originalUrl, markedUrl] = await Promise.all([originalPromise, markedPromise]);
+      setViewerUrls({ original: originalUrl, marked: markedUrl });
     } catch (err) {
-      toast({
-        variant: "destructive",
-        title: "Preview failed",
-        description: err?.message || "Try again.",
-      });
-      setPreviewOpen(false);
+      setViewerError(err?.message || "Failed to load viewer");
     } finally {
-      setPreviewLoading(false);
+      setViewerLoading(false);
     }
   }
 
@@ -270,51 +336,58 @@ export default function AssignmentsPage() {
     }
   }
 
-  async function handleGenerateMarked(upload) {
-    const key = upload?.id;
-    if (!key) return;
-    setGrading((prev) => ({ ...prev, [key]: true }));
+  async function handleDownloadOriginal(upload) {
+    if (!upload?.id) return;
     try {
-      const resp = await apiFetch(`/api/uploads/${upload.id}/grade`, { method: "POST" });
+      const url = await fetchOriginalUrl(upload);
+      window.open(url, "_blank");
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Download failed",
+        description: err?.message || "Try again.",
+      });
+    }
+  }
+
+  async function handleDownloadMarked(upload) {
+    if (!upload?.id) return;
+    try {
+      const url = await fetchMarkedUrl(upload);
+      if (!url) throw new Error("Marked PDF not ready");
+      window.open(url, "_blank");
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Download failed",
+        description: err?.message || "Try again.",
+      });
+    }
+  }
+
+  async function handleRetry(upload) {
+    if (!upload?.id || retrying[upload.id]) return;
+    setRetrying((prev) => ({ ...prev, [upload.id]: true }));
+    try {
+      const resp = await apiFetch(`/api/uploads/${upload.id}/retry`, { method: "POST" });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         const detail = data?.detail || `Failed: ${resp.status}`;
         throw new Error(detail);
       }
-      toast({ title: "Marked PDF generated" });
+      toast({ title: "Retry started" });
       await loadUploads();
     } catch (err) {
       toast({
         variant: "destructive",
-        title: "Generate failed",
+        title: "Retry failed",
         description: err?.message || "Try again.",
       });
     } finally {
-      setGrading((prev) => {
+      setRetrying((prev) => {
         const next = { ...prev };
-        delete next[key];
+        delete next[upload.id];
         return next;
-      });
-    }
-  }
-
-  async function handleOpenMarked(upload) {
-    const key = upload?.graded_pdf_path;
-    if (!key) return;
-    try {
-      const normalized = String(key).replace(/^\/+/, "");
-      const path = normalized.startsWith("graded-pdfs/")
-        ? normalized.slice("graded-pdfs/".length)
-        : normalized;
-      const { data, error } = await supa.storage.from("graded-pdfs").createSignedUrl(path, 3600);
-      if (error) throw new Error(error.message || "Signed URL failed");
-      if (!data?.signedUrl) throw new Error("Missing signed URL");
-      window.open(data.signedUrl, "_blank");
-    } catch (err) {
-      toast({
-        variant: "destructive",
-        title: "Open marked PDF failed",
-        description: err?.message || "Try again.",
       });
     }
   }
@@ -492,7 +565,7 @@ export default function AssignmentsPage() {
             {!loading && uploads.length === 0 && (
               <TableRow>
                 <TableCell colSpan={3} className="text-center text-muted-foreground">
-                  No uploads yet.
+                  No uploads yet. Add files to start OCR and grading.
                 </TableCell>
               </TableRow>
             )}
@@ -500,46 +573,73 @@ export default function AssignmentsPage() {
               <TableRow key={upload.id}>
                 <TableCell className="font-medium">{upload.original_name || "Untitled"}</TableCell>
                 <TableCell>
-                  <Badge variant="secondary">{statusLabel(upload.status)}</Badge>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge
+                      variant={baseStatus(upload) === "error" ? "destructive" : "secondary"}
+                    >
+                      {statusLabel(baseStatus(upload))}
+                    </Badge>
+                    {reviewState(upload) && (
+                      <Badge variant="outline">
+                        {statusLabel(reviewState(upload))}
+                      </Badge>
+                    )}
+                  </div>
                 </TableCell>
                 <TableCell className="text-right">
                   <div className="flex justify-end gap-2">
-                    <Button size="sm" variant="outline" onClick={() => handlePreview(upload)}>
-                      Preview
-                    </Button>
-                    {upload.graded_pdf_path && (
-                      <Button size="sm" variant="outline" onClick={() => handleOpenMarked(upload)}>
-                        Open marked PDF
-                      </Button>
-                    )}
-                    {upload.graded_pdf_path && (
-                      <Button size="sm" variant="outline" onClick={() => openOverride(upload)}>
-                        Override
-                      </Button>
-                    )}
                     <Button
                       size="sm"
-                      variant="outline"
-                      disabled={grading[upload.id] || String(upload.ocr_status || "").toLowerCase() !== "done"}
-                      onClick={() => handleGenerateMarked(upload)}
-                      title={
-                        String(upload.ocr_status || "").toLowerCase() !== "done"
-                          ? "OCR not complete"
-                          : undefined
-                      }
+                      onClick={() => openViewer(upload)}
+                      disabled={isProcessing(baseStatus(upload))}
                     >
-                      {grading[upload.id] ? "Generating..." : "Generate marked PDF"}
+                      View
                     </Button>
-                    <Button
-                      size="sm"
-                      variant="destructive"
-                      onClick={() => {
-                        setDeleteTarget(upload);
-                        setDeleteOpen(true);
-                      }}
-                    >
-                      Delete
-                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={isProcessing(baseStatus(upload))}
+                        >
+                          ...
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {baseStatus(upload) === "error" && (
+                          <>
+                            <DropdownMenuItem onClick={() => handleRetry(upload)}>
+                              {retrying[upload.id] ? "Retrying..." : "Retry"}
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                          </>
+                        )}
+                        {upload.graded_pdf_path && (
+                          <DropdownMenuItem onClick={() => openOverride(upload)}>
+                            Review/Override
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuItem onClick={() => handleDownloadOriginal(upload)}>
+                          Download original
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          disabled={!upload.graded_pdf_path}
+                          onClick={() => handleDownloadMarked(upload)}
+                        >
+                          Download marked PDF
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          className="text-destructive focus:text-destructive"
+                          onClick={() => {
+                            setDeleteTarget(upload);
+                            setDeleteOpen(true);
+                          }}
+                        >
+                          Delete
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </div>
                 </TableCell>
               </TableRow>
@@ -548,46 +648,102 @@ export default function AssignmentsPage() {
         </Table>
       </div>
 
-      <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
-        <DialogContent className="sm:max-w-[520px]">
+      <Dialog open={viewerOpen} onOpenChange={setViewerOpen}>
+        <DialogContent className="sm:max-w-[900px]">
           <DialogHeader>
-            <DialogTitle>Preview</DialogTitle>
-            <DialogDescription>{previewFile?.original_name}</DialogDescription>
+            <DialogTitle>Submission viewer</DialogTitle>
+            <DialogDescription>{viewerTarget?.original_name}</DialogDescription>
           </DialogHeader>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant={viewerTab === "original" ? "default" : "outline"}
+              onClick={() => setViewerTab("original")}
+            >
+              Original
+            </Button>
+            <Button
+              size="sm"
+              variant={viewerTab === "marked" ? "default" : "outline"}
+              onClick={() => setViewerTab("marked")}
+              disabled={!viewerUrls.marked}
+            >
+              Marked PDF
+            </Button>
+          </div>
           <div className="space-y-3">
-            {previewLoading && (
-              <div className="text-sm text-muted-foreground">Loading preview...</div>
+            {viewerLoading && (
+              <div className="text-sm text-muted-foreground">Loading document...</div>
             )}
-            {!previewLoading && previewUrl && isImage(previewFile) && (
-              <img
-                src={previewUrl}
-                alt={previewFile?.original_name || "Preview"}
-                className="max-h-60 w-full rounded-md object-contain"
+            {!viewerLoading && viewerError && (
+              <div className="text-sm text-destructive">{viewerError}</div>
+            )}
+            {!viewerLoading && !viewerError && viewerTab === "original" && viewerUrls.original && (
+              isPdf(viewerTarget) ? (
+                <iframe
+                  title="Original PDF"
+                  className="h-[70vh] w-full rounded-md border"
+                  src={viewerUrls.original}
+                />
+              ) : (
+                <img
+                  src={viewerUrls.original}
+                  alt={viewerTarget?.original_name || "Original"}
+                  className="max-h-[70vh] w-full rounded-md object-contain"
+                />
+              )
+            )}
+            {!viewerLoading && !viewerError && viewerTab === "marked" && viewerUrls.marked && (
+              <iframe
+                title="Marked PDF"
+                className="h-[70vh] w-full rounded-md border"
+                src={viewerUrls.marked}
               />
             )}
-            {!previewLoading && previewUrl && isPdf(previewFile) && (
+            {!viewerLoading && !viewerError && viewerTab === "marked" && !viewerUrls.marked && (
+              <div className="text-sm text-muted-foreground">Marked PDF not ready yet.</div>
+            )}
+            {!viewerLoading && !viewerError && viewerTab === "original" && viewerUrls.original && (
               <a
-                className="text-sm text-primary underline"
-                href={previewUrl}
+                className="text-xs text-muted-foreground underline"
+                href={viewerUrls.original}
                 target="_blank"
                 rel="noreferrer"
               >
-                Open PDF in new tab
+                Open original in new tab
               </a>
             )}
-            {!previewLoading && previewUrl && !isImage(previewFile) && !isPdf(previewFile) && (
+            {!viewerLoading && !viewerError && viewerTab === "marked" && viewerUrls.marked && (
               <a
-                className="text-sm text-primary underline"
-                href={previewUrl}
+                className="text-xs text-muted-foreground underline"
+                href={viewerUrls.marked}
                 target="_blank"
                 rel="noreferrer"
               >
-                Open file
+                Open marked PDF in new tab
               </a>
             )}
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setPreviewOpen(false)}>Close</Button>
+          <DialogFooter className="flex flex-col gap-2 sm:flex-row sm:justify-between">
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                onClick={() => handleDownloadOriginal(viewerTarget)}
+                disabled={!viewerUrls.original}
+              >
+                Download original
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => handleDownloadMarked(viewerTarget)}
+                disabled={!viewerUrls.marked}
+              >
+                Download marked PDF
+              </Button>
+            </div>
+            <Button variant="outline" onClick={() => setViewerOpen(false)}>
+              Close
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
