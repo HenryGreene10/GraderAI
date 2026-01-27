@@ -269,7 +269,7 @@ async def upload_assignment_files(
                 "original_name": file.filename,
                 "mime_type": file.content_type,
                 "size_bytes": size_bytes,
-                "status": "pending",
+                "status": "uploading",
                 "ocr_status": "pending",
             }
         )

@@ -99,16 +99,18 @@ class OverridePayload(BaseModel):
     note: Optional[str] = None
 
 
-@router.post("/{upload_id}/grade")
-async def grade_upload(
-    upload_id: str,
-    user_id: str = Depends(get_current_user_id),
-):
+async def run_grade_pipeline(upload_id: str, user_id: str, *, force: bool = False) -> dict:
     row = get_upload(
         upload_id,
         user_id,
-        columns="id,owner_id,storage_path,ocr_status,ocr_text,ocr_boxes,mime_type",
+        columns="id,owner_id,storage_path,ocr_status,ocr_text,ocr_boxes,mime_type,graded_pdf_path,status",
     )
+    status = (row.get("status") or "").strip().lower()
+    if row.get("graded_pdf_path") and not force:
+        return {"ok": True, "upload_id": row["id"], "graded_pdf_path": row.get("graded_pdf_path"), "already": True}
+    if status in {"grading", "pdf_ready"} and not force:
+        return {"ok": True, "upload_id": row["id"], "graded_pdf_path": row.get("graded_pdf_path"), "already": True}
+
     if (row.get("ocr_status") or "").strip().lower() != "done":
         raise HTTPException(status_code=409, detail="OCR not complete")
 
@@ -119,63 +121,103 @@ async def grade_upload(
     if not ocr_boxes:
         raise HTTPException(status_code=400, detail="Missing ocr_boxes")
 
-    grade_result, answers = await grade_with_llm(ocr_text)
-    grade_result.submission_id = row["id"]
-
-    storage_path = row.get("storage_path")
-    if not storage_path:
-        raise HTTPException(status_code=400, detail="Missing storage_path")
-    original_bytes = download_submission_bytes(storage_path)
-    page_sizes = get_page_sizes(original_bytes, row.get("mime_type"))
-
-    overlay, needs_review_from_overlay = build_overlay_from_answers(
-        answers,
-        ocr_boxes,
-        page_sizes,
-    )
-
-    pdf_bytes = render_marked_pdf(original_bytes, row.get("mime_type"), overlay)
-
-    owner_id = row.get("owner_id") or user_id or "unknown"
-    pdf_key = f"{owner_id}/{row['id']}.pdf"
-    overlay_key = f"{owner_id}/{row['id']}.json"
-
-    try:
-        upload_bytes(GRADED_BUCKET, pdf_key, pdf_bytes, "application/pdf")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"PDF upload failed: {exc}")
-
-    try:
-        upload_json(OVERLAYS_BUCKET, overlay_key, overlay.model_dump())
-    except Exception:
-        pass
-
-    needs_review = grade_result.needs_review or needs_review_from_overlay
-
     update_upload(
         row["id"],
-        {
-            "status": "graded",
-            "needs_review": needs_review,
-            "graded_pdf_path": pdf_key,
-            "overlay_path": overlay_key,
-            "overlay_json": overlay.model_dump(),
-            "grade_json": {
-                **grade_result.model_dump(),
-                "answers": [a.to_dict() for a in answers],
-            },
-            "rubric_version": grade_result.rubric_version,
-            "prompt_version": grade_result.prompt_version,
-            "updated_at": _utc_iso(),
-        },
+        {"status": "grading", "ocr_error": None, "updated_at": _utc_iso()},
     )
 
-    return {
-        "ok": True,
-        "upload_id": row["id"],
-        "needs_review": needs_review,
-        "graded_pdf_path": pdf_key,
-    }
+    try:
+        grade_result, answers = await grade_with_llm(ocr_text)
+        grade_result.submission_id = row["id"]
+
+        storage_path = row.get("storage_path")
+        if not storage_path:
+            raise HTTPException(status_code=400, detail="Missing storage_path")
+        original_bytes = download_submission_bytes(storage_path)
+        page_sizes = get_page_sizes(original_bytes, row.get("mime_type"))
+
+        overlay, needs_review_from_overlay = build_overlay_from_answers(
+            answers,
+            ocr_boxes,
+            page_sizes,
+        )
+
+        pdf_bytes = render_marked_pdf(original_bytes, row.get("mime_type"), overlay)
+
+        owner_id = row.get("owner_id") or user_id or "unknown"
+        pdf_key = f"{owner_id}/{row['id']}.pdf"
+        overlay_key = f"{owner_id}/{row['id']}.json"
+
+        upload_bytes(GRADED_BUCKET, pdf_key, pdf_bytes, "application/pdf")
+        try:
+            upload_json(OVERLAYS_BUCKET, overlay_key, overlay.model_dump())
+        except Exception:
+            pass
+
+        needs_review = grade_result.needs_review or needs_review_from_overlay
+
+        update_upload(
+            row["id"],
+            {
+                "status": "pdf_ready",
+                "needs_review": needs_review,
+                "graded_pdf_path": pdf_key,
+                "overlay_path": overlay_key,
+                "overlay_json": overlay.model_dump(),
+                "grade_json": {
+                    **grade_result.model_dump(),
+                    "answers": [a.to_dict() for a in answers],
+                },
+                "rubric_version": grade_result.rubric_version,
+                "prompt_version": grade_result.prompt_version,
+                "updated_at": _utc_iso(),
+            },
+        )
+        return {
+            "ok": True,
+            "upload_id": row["id"],
+            "needs_review": needs_review,
+            "graded_pdf_path": pdf_key,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        update_upload(
+            row["id"],
+            {
+                "status": "error",
+                "ocr_error": f"grade_failed: {exc}",
+                "updated_at": _utc_iso(),
+            },
+        )
+        raise HTTPException(status_code=500, detail=f"grade_failed: {exc}")
+
+
+@router.post("/{upload_id}/grade")
+async def grade_upload(
+    upload_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    return await run_grade_pipeline(upload_id, user_id)
+
+
+@router.post("/{upload_id}/retry")
+async def retry_upload(
+    upload_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    row = get_upload(
+        upload_id,
+        user_id,
+        columns="id,owner_id,ocr_status,graded_pdf_path",
+    )
+    if row.get("graded_pdf_path"):
+        return {"ok": True, "upload_id": row["id"], "graded_pdf_path": row.get("graded_pdf_path"), "already": True}
+    if (row.get("ocr_status") or "").strip().lower() != "done":
+        from .ocr import run_ocr_for_upload
+
+        return await run_ocr_for_upload(row["id"], user_id)
+    return await run_grade_pipeline(row["id"], user_id, force=True)
 
 
 @router.post("/{upload_id}/override")

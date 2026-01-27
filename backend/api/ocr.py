@@ -1,4 +1,5 @@
 import datetime as dt
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -10,6 +11,7 @@ from ..services.ocr import normalize_ocr_result
 from ..services.storage import download_submission_bytes
 
 router = APIRouter(prefix="/api/ocr", tags=["ocr"])
+logger = logging.getLogger(__name__)
 
 OCR_PENDING = "pending"
 OCR_DONE = "done"
@@ -34,7 +36,7 @@ async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
         row["id"],
         {
             "ocr_status": OCR_PENDING,
-            "status": OCR_PENDING,
+            "status": "ocr_running",
             "ocr_error": None,
             "updated_at": _utc_iso(),
         },
@@ -50,7 +52,7 @@ async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
 
         payload = {
             "ocr_status": OCR_DONE,
-            "status": OCR_DONE,
+            "status": "ocr_done",
             "ocr_text": text,
             "extracted_text": text,
             "ocr_boxes": norm.get("boxes"),
@@ -59,6 +61,14 @@ async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
             "updated_at": _utc_iso(),
         }
         update_upload(row["id"], payload)
+        try:
+            from .uploads import run_grade_pipeline
+
+            await run_grade_pipeline(row["id"], user_id)
+        except HTTPException as exc:
+            logger.warning("Auto-grade failed for %s: %s", row["id"], exc.detail)
+        except Exception:
+            logger.exception("Auto-grade failed for %s", row["id"])
         return {
             "ok": True,
             "status": OCR_DONE,
@@ -73,7 +83,7 @@ async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
             row["id"],
             {
                 "ocr_status": OCR_ERROR,
-                "status": OCR_ERROR,
+                "status": "error",
                 "ocr_error": str(exc),
                 "updated_at": _utc_iso(),
             },
