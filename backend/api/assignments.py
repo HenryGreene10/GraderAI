@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
@@ -67,6 +67,9 @@ def _assignment_detail_payload(row: dict) -> dict:
             "template_width_px": row.get("template_width_px"),
             "template_height_px": row.get("template_height_px"),
             "template_version": row.get("template_version"),
+            "template_upload_id": row.get("template_upload_id"),
+            "template_original_name": row.get("template_original_name"),
+            "template_uploaded_at": row.get("template_uploaded_at"),
         }
     )
     return base
@@ -79,6 +82,10 @@ def _file_extension(filename: Optional[str], content_type: Optional[str]) -> str
     if content_type in ALLOWED_MIME:
         return ALLOWED_MIME[content_type]
     return ""
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 @router.get("")
@@ -127,7 +134,8 @@ def get_assignment_detail(
         columns=(
             "id,owner_id,title,due_date,created_at,rubric_json,"
             "template_storage_path,template_regions_json,template_width_px,"
-            "template_height_px,template_version"
+            "template_height_px,template_version,template_upload_id,"
+            "template_original_name,template_uploaded_at"
         ),
     )
     return {"assignment": _assignment_detail_payload(row)}
@@ -268,7 +276,7 @@ async def upload_template(
     assignment = get_assignment(
         assignment_id,
         user_id,
-        columns="id,owner_id,template_version",
+        columns="id,owner_id,template_version,template_storage_path,template_regions_json",
     )
     ext = _file_extension(file.filename, file.content_type)
     if ext not in {".png", ".jpg", ".jpeg"}:
@@ -320,6 +328,9 @@ async def upload_template(
     ]
 
     template_version = int(assignment.get("template_version") or 0) + 1
+    template_upload_id = str(uuid4())
+    template_uploaded_at = _utc_iso()
+    template_original_name = file.filename
     sb = require_supabase()
     sb.table("assignments").update(
         {
@@ -328,14 +339,26 @@ async def upload_template(
             "template_height_px": template_h,
             "template_regions_json": template_regions,
             "template_version": template_version,
+            "template_upload_id": template_upload_id,
+            "template_original_name": template_original_name,
+            "template_uploaded_at": template_uploaded_at,
         }
     ).eq("id", assignment_id).execute()
+
+    had_template = bool(assignment.get("template_storage_path") and assignment.get("template_regions_json"))
+    if had_template:
+        sb.table("uploads").update({"needs_review": True}).eq("assignment_id", assignment_id).eq(
+            "owner_id", user_id
+        ).execute()
 
     return {
         "ok": True,
         "assignment_id": assignment_id,
         "template_storage_path": f"{SUBMISSIONS_BUCKET}/{template_key}",
         "template_version": template_version,
+        "template_upload_id": template_upload_id,
+        "template_original_name": template_original_name,
+        "template_uploaded_at": template_uploaded_at,
         "boxes_detected": len(template_regions),
         "qids": [r["qid"] for r in template_regions],
     }
@@ -348,7 +371,16 @@ async def upload_assignment_files(
     files: list[UploadFile] = File(...),
     user_id: str = Depends(get_current_user_id),
 ):
-    get_assignment(assignment_id, user_id, columns="id,owner_id")
+    assignment = get_assignment(
+        assignment_id,
+        user_id,
+        columns="id,owner_id,template_storage_path,template_regions_json,template_upload_id",
+    )
+
+    template_regions = assignment.get("template_regions_json") or []
+    template_storage_path = assignment.get("template_storage_path")
+    if not template_storage_path or not template_regions:
+        raise HTTPException(status_code=409, detail="Upload master key first.")
 
     if not files:
         raise HTTPException(status_code=400, detail="files_required")

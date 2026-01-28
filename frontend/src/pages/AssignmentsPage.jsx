@@ -108,6 +108,26 @@ function isPdf(upload) {
   );
 }
 
+function formatTimestamp(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toLocaleString();
+}
+
+async function readErrorMessage(resp) {
+  const text = await resp.text().catch(() => "");
+  if (!text) return "";
+  try {
+    const data = JSON.parse(text);
+    if (data?.detail) return String(data.detail);
+    if (data?.message) return String(data.message);
+  } catch {
+    // ignore JSON parse errors
+  }
+  return text;
+}
+
 export default function AssignmentsPage() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -146,12 +166,27 @@ export default function AssignmentsPage() {
   const [overrideNote, setOverrideNote] = useState("");
   const [overrideSaving, setOverrideSaving] = useState(false);
 
+  const masterKeyReady = Boolean(
+    assignment?.template_storage_path && assignment?.template_regions_count
+  );
+  const masterKeyFilename = assignment?.template_original_name
+    || (assignment?.template_storage_path || "").split("/").pop()
+    || "";
+  const masterKeyUploadedAt = assignment?.template_uploaded_at;
+  const latestUpload = uploads[0];
+
   useEffect(() => {
     if (!uploadOpen) {
       setFiles([]);
       setUploading(false);
     }
   }, [uploadOpen]);
+
+  useEffect(() => {
+    if (!masterKeyReady && uploadOpen) {
+      setUploadOpen(false);
+    }
+  }, [masterKeyReady, uploadOpen]);
 
   useEffect(() => {
     if (!assignmentId) return;
@@ -173,7 +208,7 @@ export default function AssignmentsPage() {
     try {
       const resp = await apiFetch(`/api/assignments/${assignmentId}`);
       if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
+        const text = await readErrorMessage(resp);
         throw new Error(text || `Failed: ${resp.status}`);
       }
       const data = await resp.json();
@@ -193,7 +228,7 @@ export default function AssignmentsPage() {
     try {
       const resp = await apiFetch(`/api/assignments/${assignmentId}/uploads`);
       if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
+        const text = await readErrorMessage(resp);
         throw new Error(text || `Failed: ${resp.status}`);
       }
       const data = await resp.json();
@@ -259,7 +294,7 @@ export default function AssignmentsPage() {
         body: formData,
       });
       if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
+        const text = await readErrorMessage(resp);
         throw new Error(text || `Upload failed: ${resp.status}`);
       }
       toast({ title: "Master Key uploaded" });
@@ -305,7 +340,7 @@ export default function AssignmentsPage() {
         body: formData,
       });
       if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
+        const text = await readErrorMessage(resp);
         throw new Error(text || `Upload failed: ${resp.status}`);
       }
       toast({
@@ -374,7 +409,7 @@ export default function AssignmentsPage() {
     try {
       const resp = await apiFetch(`/api/uploads/${deleteTarget.id}`, { method: "DELETE" });
       if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
+        const text = await readErrorMessage(resp);
         throw new Error(text || `Delete failed: ${resp.status}`);
       }
       toast({ title: "Upload deleted" });
@@ -452,7 +487,7 @@ export default function AssignmentsPage() {
     try {
       const resp = await apiFetch(`/api/assignments/${assignmentId}`, { method: "DELETE" });
       if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
+        const text = await readErrorMessage(resp);
         throw new Error(text || `Delete failed: ${resp.status}`);
       }
       toast({ title: "Assignment deleted" });
@@ -515,6 +550,18 @@ export default function AssignmentsPage() {
     }
   }
 
+  const handleUploadDialogOpen = (nextOpen) => {
+    if (nextOpen && !masterKeyReady) {
+      toast({
+        variant: "destructive",
+        title: "Upload master key first",
+        description: "Step 1 must be completed before student uploads are enabled.",
+      });
+      return;
+    }
+    setUploadOpen(nextOpen);
+  };
+
   if (!assignmentId) {
     return (
       <div className="p-6 space-y-4">
@@ -538,9 +585,11 @@ export default function AssignmentsPage() {
           )}
         </div>
         <div className="flex items-center gap-2">
-          <Dialog open={uploadOpen} onOpenChange={setUploadOpen}>
+          <Dialog open={uploadOpen} onOpenChange={handleUploadDialogOpen}>
             <DialogTrigger asChild>
-              <Button>Upload student worksheets</Button>
+              <Button disabled={!masterKeyReady} title={!masterKeyReady ? "Upload master key first" : undefined}>
+                Upload student worksheets
+              </Button>
             </DialogTrigger>
             <DialogContent className="sm:max-w-[520px]">
               <DialogHeader>
@@ -559,7 +608,7 @@ export default function AssignmentsPage() {
                   className="hidden"
                   onChange={(e) => addFiles(e.target.files)}
                 />
-                <Button variant="secondary" type="button" onClick={openPicker}>
+                <Button variant="secondary" type="button" onClick={openPicker} disabled={!masterKeyReady}>
                   Add files
                 </Button>
 
@@ -587,7 +636,7 @@ export default function AssignmentsPage() {
                 <Button variant="outline" onClick={() => setUploadOpen(false)} disabled={uploading}>
                   Cancel
                 </Button>
-                <Button onClick={handleUpload} disabled={files.length === 0 || uploading}>
+                <Button onClick={handleUpload} disabled={files.length === 0 || uploading || !masterKeyReady}>
                   {uploading ? "Uploading..." : "Upload"}
                 </Button>
               </DialogFooter>
@@ -624,9 +673,19 @@ export default function AssignmentsPage() {
           </div>
         </div>
         {assignment?.template_storage_path ? (
-          <div className="text-sm text-muted-foreground">
-            Template detected ✅{" "}
-            {assignment?.template_regions_count ? `(${assignment.template_regions_count} questions)` : ""}
+          <div className="space-y-1 text-sm text-muted-foreground">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="secondary">Master Key ready</Badge>
+              {assignment?.template_regions_count ? (
+                <span>{assignment.template_regions_count} questions detected</span>
+              ) : null}
+            </div>
+            {(masterKeyFilename || masterKeyUploadedAt) && (
+              <div>
+                Last uploaded:{" "}
+                {[masterKeyFilename, formatTimestamp(masterKeyUploadedAt)].filter(Boolean).join(" • ")}
+              </div>
+            )}
           </div>
         ) : (
           <div className="text-sm text-muted-foreground">
@@ -638,13 +697,30 @@ export default function AssignmentsPage() {
       <section className="space-y-3">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">Step 2: Upload Student Worksheets</h2>
+          {!masterKeyReady && (
+            <Badge variant="outline">Upload master key first</Badge>
+          )}
         </div>
+        {latestUpload && (
+          <div className="text-sm text-muted-foreground">
+            Last student upload:{" "}
+            {[latestUpload.original_name, formatTimestamp(latestUpload.created_at)]
+              .filter(Boolean)
+              .join(" • ")}
+          </div>
+        )}
+        {!masterKeyReady && (
+          <div className="text-sm text-muted-foreground">
+            Student uploads unlock after the master key has been validated.
+          </div>
+        )}
 
         <div className="rounded-lg border border-border">
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>Filename</TableHead>
+              <TableHead>Uploaded</TableHead>
               <TableHead>Status</TableHead>
               <TableHead className="text-right">Actions</TableHead>
             </TableRow>
@@ -652,14 +728,14 @@ export default function AssignmentsPage() {
           <TableBody>
             {loading && (
               <TableRow>
-                <TableCell colSpan={3} className="text-center text-muted-foreground">
+                <TableCell colSpan={4} className="text-center text-muted-foreground">
                   Loading uploads...
                 </TableCell>
               </TableRow>
             )}
             {!loading && uploads.length === 0 && (
               <TableRow>
-                <TableCell colSpan={3} className="text-center text-muted-foreground">
+                <TableCell colSpan={4} className="text-center text-muted-foreground">
                   No uploads yet. Add files to start OCR and grading.
                 </TableCell>
               </TableRow>
@@ -667,6 +743,9 @@ export default function AssignmentsPage() {
             {uploads.map((upload) => (
               <TableRow key={upload.id}>
                 <TableCell className="font-medium">{upload.original_name || "Untitled"}</TableCell>
+                <TableCell className="text-sm text-muted-foreground">
+                  {formatTimestamp(upload.created_at)}
+                </TableCell>
                 <TableCell>
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge
@@ -674,6 +753,9 @@ export default function AssignmentsPage() {
                     >
                       {statusLabel(baseStatus(upload))}
                     </Badge>
+                    {upload.needs_review && (
+                      <Badge variant="outline">Needs review</Badge>
+                    )}
                     {reviewState(upload) && (
                       <Badge variant="outline">
                         {statusLabel(reviewState(upload))}
