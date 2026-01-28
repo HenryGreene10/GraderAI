@@ -239,6 +239,12 @@ def normalize_image_bytes(image_bytes: bytes) -> ScanResult:
             error=err,
         )
 
+
+def image_bytes_to_pdf(image_bytes: bytes) -> bytes:
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    img = _clamp_pil(img)
+    return _image_to_pdf_bytes(img)
+
     try:
         cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
         img_h, img_w = cv_img.shape[:2]
