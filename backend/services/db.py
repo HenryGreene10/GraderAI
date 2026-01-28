@@ -29,8 +29,10 @@ def _missing_column(err: dict) -> Optional[str]:
     details = str(err.get("details") or err.get("message") or "")
     match = re.search(r"Could not find the '([^']+)' column", details)
     if not match:
-        return None
-    return match.group(1)
+        match = re.search(r"column\\s+[^\\.]+\\.([a-zA-Z0-9_]+)\\s+does not exist", details)
+    if match:
+        return match.group(1)
+    return None
 
 
 def _strip_column(columns: str, missing: str) -> str:
@@ -68,11 +70,23 @@ def get_assignment(assignment_id: str, caller_id: Optional[str], columns: str = 
                 if code == "204":
                     row = None
                     break
-                if code == "PGRST204":
+                if code in {"PGRST204", "42703"}:
                     missing = _missing_column(err)
                     if missing:
+                        logger.warning(
+                            "get_assignment missing column '%s' for assignment %s; cols=%s",
+                            missing,
+                            assignment_id,
+                            cols,
+                        )
                         cols = _strip_column(cols, missing)
                         continue
+                logger.warning(
+                    "get_assignment APIError for assignment %s; cols=%s; error=%s",
+                    assignment_id,
+                    cols,
+                    err,
+                )
             raise
     if not row:
         raise HTTPException(status_code=404, detail="Assignment not found")
