@@ -22,6 +22,8 @@ from ..services.supabase_client import get_supabase
 from ..services.debug_artifacts import (
     debug_enabled,
     draw_marks_overlay,
+    draw_rects_overlay,
+    draw_template_overlay,
     log_debug,
     upload_debug_artifact,
 )
@@ -158,6 +160,7 @@ async def run_grade_pipeline(
         template_regions = None
         template_storage_path = None
         template_version = None
+        template_png = None
         if row.get("assignment_id"):
             try:
                 assignment = get_assignment(
@@ -176,6 +179,7 @@ async def run_grade_pipeline(
         template_used = False
         template_alignment = None
         debug_image_bytes = None
+        template_ocr_rects = []
         debug_layout = None
         needs_review_from_overlay = False
         unplaced_items = []
@@ -214,6 +218,7 @@ async def run_grade_pipeline(
             answers = template_output.student_answers
             template_alignment = template_output.alignment
             debug_image_bytes = template_output.alignment.aligned_png
+            template_ocr_rects = template_output.ocr_rects
 
             pdf_source_bytes = image_bytes_to_pdf(template_output.alignment.aligned_png)
             pdf_mime = "application/pdf"
@@ -336,6 +341,24 @@ async def run_grade_pipeline(
                         "image/png",
                     )
                     log_debug("marks", {"count": mark_info.get("marks"), "bboxes": mark_info.get("mark_bboxes")})
+                if template_used and template_png:
+                    template_overlay, _ = draw_template_overlay(template_png, template_regions or [])
+                    upload_debug_artifact(
+                        owner_id,
+                        row["id"],
+                        "template_overlay.png",
+                        template_overlay,
+                        "image/png",
+                    )
+                if template_used and normalized_bytes and template_ocr_rects:
+                    ocr_overlay = draw_rects_overlay(normalized_bytes, template_ocr_rects)
+                    upload_debug_artifact(
+                        owner_id,
+                        row["id"],
+                        "ocr_overlay.png",
+                        ocr_overlay,
+                        "image/png",
+                    )
                 upload_debug_artifact(
                     owner_id,
                     row["id"],

@@ -127,5 +127,44 @@ def draw_marks_overlay(
     return buf.getvalue(), {"marks": len(overlay.marks), "mark_bboxes": mark_bboxes}
 
 
+def draw_template_overlay(
+    image_bytes: bytes,
+    regions: List[Dict[str, Any]],
+) -> Tuple[bytes, Dict[str, int]]:
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    for region in regions:
+        rect = region.get("region") or {}
+        box = region.get("answer_box") or {}
+        if rect:
+            x = float(rect.get("x") or 0.0)
+            y = float(rect.get("y") or 0.0)
+            w = float(rect.get("w") or 0.0)
+            h = float(rect.get("h") or 0.0)
+            draw.rectangle([x, y, x + w, y + h], outline=(0, 120, 255), width=3)
+            qid = str(region.get("qid") or "")
+            if qid:
+                draw.text((x + 6, y + 6), qid, fill=(0, 120, 255))
+        if box:
+            bx = float(box.get("x") or 0.0)
+            by = float(box.get("y") or 0.0)
+            bw = float(box.get("w") or 0.0)
+            bh = float(box.get("h") or 0.0)
+            draw.rectangle([bx, by, bx + bw, by + bh], outline=(220, 0, 0), width=3)
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue(), {"regions": len(regions)}
+
+
+def draw_rects_overlay(image_bytes: bytes, rects: List[Tuple[float, float, float, float]]) -> bytes:
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    for x0, y0, x1, y1 in rects:
+        draw.rectangle([x0, y0, x1, y1], outline=(0, 200, 0), width=2)
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def serialize_json(data: Any) -> bytes:
     return json.dumps(data, ensure_ascii=True).encode("utf-8")

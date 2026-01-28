@@ -26,6 +26,7 @@ class TemplateGradeOutput:
     needs_review: bool
     alignment: AlignmentResult
     student_answers: List[Dict[str, Any]]
+    ocr_rects: List[Tuple[float, float, float, float]]
 
 
 class TemplateAlignmentError(Exception):
@@ -114,6 +115,7 @@ async def grade_with_template(
     items: List[QuestionGrade] = []
     answers: List[Dict[str, Any]] = []
     needs_review = False
+    ocr_rects: List[Tuple[float, float, float, float]] = []
 
     for region in template_regions:
         qid = str(region.get("qid") or "")
@@ -131,6 +133,7 @@ async def grade_with_template(
         crop_png = _crop_to_png(aligned_img, (x0, y0, x1, y1))
         raw = await ocr_func(image_bytes=crop_png)
         student_text = str((raw or {}).get("text") or "").strip()
+        ocr_rects.extend(_offset_rects(_extract_rects(raw), x0, y0))
         score, rationale, low_conf = _score_answer(expected, student_text)
         if low_conf or not student_text:
             needs_review = True
@@ -179,6 +182,7 @@ async def grade_with_template(
         needs_review=needs_review,
         alignment=alignment,
         student_answers=answers,
+        ocr_rects=ocr_rects,
     )
 
 
@@ -224,3 +228,23 @@ def _build_template_overlay(
 
     return Overlay(page=1, marks=marks)
 
+
+def _extract_rects(raw: Any) -> List[Tuple[float, float, float, float]]:
+    if not isinstance(raw, dict):
+        return []
+    analyze = (raw or {}).get("analyzeResult", {})
+    read_results = analyze.get("readResults") or []
+    rects: List[Tuple[float, float, float, float]] = []
+    for page in read_results:
+        for line in page.get("lines") or []:
+            bbox = line.get("boundingBox") or []
+            if len(bbox) < 8:
+                continue
+            xs = bbox[0::2]
+            ys = bbox[1::2]
+            rects.append((min(xs), min(ys), max(xs), max(ys)))
+    return rects
+
+
+def _offset_rects(rects: List[Tuple[float, float, float, float]], dx: float, dy: float) -> List[Tuple[float, float, float, float]]:
+    return [(x0 + dx, y0 + dy, x1 + dx, y1 + dy) for x0, y0, x1, y1 in rects]
