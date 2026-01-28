@@ -602,11 +602,13 @@ export default function AssignmentsPage() {
       <section className="rounded-lg border border-border p-4 space-y-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h2 className="text-lg font-semibold">Step 1: Upload Master Key</h2>
-            <p className="text-sm text-muted-foreground">
-              Draw thick black boxes around each answer, label Q1/Q2…, and write the correct answer inside each box.
-              Use a straight-on photo.
-            </p>
+            <h2 className="text-lg font-semibold">Step 1: Upload Master Key (Required)</h2>
+            <ul className="mt-2 space-y-1 text-sm text-muted-foreground">
+              <li>1) Dashed/thin outline around EACH question region (includes Q label + answer box)</li>
+              <li>2) Circled Q1/Q2… label inside the region</li>
+              <li>3) Small solid/thick answer box inside the region</li>
+              <li>4) Write the correct answer inside the answer box</li>
+            </ul>
           </div>
           <div className="flex items-center gap-2">
             <input
@@ -623,8 +625,8 @@ export default function AssignmentsPage() {
         </div>
         {assignment?.template_storage_path ? (
           <div className="text-sm text-muted-foreground">
-            Master Key uploaded ✅{" "}
-            {assignment?.template_regions_count ? `(${assignment.template_regions_count} boxes)` : ""}
+            Template detected ✅{" "}
+            {assignment?.template_regions_count ? `(${assignment.template_regions_count} questions)` : ""}
           </div>
         ) : (
           <div className="text-sm text-muted-foreground">

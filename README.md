@@ -3,11 +3,12 @@
 GraderAI is a web app that auto-grades handwritten worksheets and produces a printable, marked PDF.
 
 ## What teachers do (2 minutes)
-Create one **Master Key Sheet** per assignment:
-1) Print a blank copy of the worksheet.
-2) Draw **thick black boxes** around each answer area.
-3) Write `Q1`, `Q2`, ... in the top-left corner of each box.
-4) Write the **correct answer inside each box** (MVP).
+Create one **Master Key Sheet** per assignment (required rules):
+1) Draw a **dashed (or thin) outline** around EACH question region.
+   - The region must contain the circled Q label and the answer box.
+2) Write a **circled Q1/Q2…** label inside each region.
+3) Draw a **small solid/thick answer box** inside the region.
+4) Write the **correct final answer** inside the answer box.
 5) Take a straight-on photo (or scan) and upload as the Master Key.
 
 Then upload student photos. GraderAI aligns each student scan to the Master Key and marks deterministically.
@@ -67,13 +68,15 @@ Includes:
 - `normalized.png`
 - `ocr_raw.json`
 - `ocr_overlay.png`
+- `template_overlay.png`
 - `marks_overlay.png`
 - `marked.pdf`
 
 ## Notes & limitations
 - Single-page worksheets only (MVP).
 - Best results with high-res, well-lit, straight-on photos.
-- If template alignment fails, GraderAI falls back and marks `needs_review=true`.
+- Regions remove ambiguity: each answer box is tied to its region and Q label.
+- If template alignment fails, GraderAI returns an error and requests a review.
 
 ## Privacy & security
 - Never share service keys.
