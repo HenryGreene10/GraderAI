@@ -172,7 +172,8 @@ async def run_grade_pipeline(
             template_storage_path = assignment.get("template_storage_path")
             template_version = assignment.get("template_version")
 
-        template_used = bool(template_regions and template_storage_path)
+        template_available = bool(template_regions and template_storage_path)
+        template_used = False
         template_alignment = None
         debug_image_bytes = None
         debug_layout = None
@@ -180,7 +181,7 @@ async def run_grade_pipeline(
         unplaced_items = []
         answers = []
 
-        if template_used and row.get("normalized_image_path"):
+        if template_available and row.get("normalized_image_path"):
             template_png = download_submission_bytes(template_storage_path)
             student_png = download_submission_bytes(row.get("normalized_image_path"))
             template_output = await grade_with_template(
@@ -189,6 +190,7 @@ async def run_grade_pipeline(
                 template_regions,
                 ocr_service.extract_text,
             )
+            template_used = True
             grade_result = template_output.grade_result
             grade_result.submission_id = row["id"]
             overlay = template_output.overlay
@@ -201,7 +203,7 @@ async def run_grade_pipeline(
             pdf_mime = "application/pdf"
             page_sizes = get_page_sizes(pdf_source_bytes, pdf_mime)
         else:
-            if template_used:
+            if template_available:
                 logger.warning("Template exists but normalized image missing for %s; falling back", row["id"])
             grade_result, answers = await grade_with_llm(ocr_text)
             grade_result.submission_id = row["id"]
