@@ -13,12 +13,18 @@ from ..auth import get_current_user_id
 from ..config import GRADED_BUCKET, OVERLAYS_BUCKET, SUBMISSIONS_BUCKET
 from ..services.db import get_assignment, require_supabase
 from ..services.storage import strip_bucket_prefix, upload_bytes
-from ..services.scanner import normalize_image_bytes
+from io import BytesIO
+
+from PIL import Image
+
+from ..services.scanner import MAX_DIM_PX, normalize_image_bytes
 from ..services import ocr as ocr_service
 from ..services.template import extract_template_regions
 from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
+
+TEMPLATE_MIN_LONG_EDGE = 1200
 logger = logging.getLogger(__name__)
 
 ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".pdf"}
@@ -273,12 +279,26 @@ async def upload_template(
         raise HTTPException(status_code=400, detail="template_empty")
 
     scan = normalize_image_bytes(payload)
+    template_png = scan.normalized_png
+    template_w = scan.width_px
+    template_h = scan.height_px
+    max_dim = max(template_w, template_h)
+    if max_dim and max_dim < TEMPLATE_MIN_LONG_EDGE:
+        scale = min(float(TEMPLATE_MIN_LONG_EDGE) / float(max_dim), MAX_DIM_PX / float(max_dim))
+        new_w = max(1, int(round(template_w * scale)))
+        new_h = max(1, int(round(template_h * scale)))
+        image = Image.open(BytesIO(template_png)).convert("RGB")
+        image = image.resize((new_w, new_h), Image.BICUBIC)
+        buf = BytesIO()
+        image.save(buf, format="PNG")
+        template_png = buf.getvalue()
+        template_w, template_h = new_w, new_h
     owner_id = assignment.get("owner_id") or user_id or "unknown"
     template_key = f"{owner_id}/templates/{assignment_id}.png"
-    upload_bytes(SUBMISSIONS_BUCKET, template_key, scan.normalized_png, "image/png")
+    upload_bytes(SUBMISSIONS_BUCKET, template_key, template_png, "image/png")
 
     try:
-        regions = await extract_template_regions(scan.normalized_png, ocr_service.extract_text)
+        regions = await extract_template_regions(template_png, ocr_service.extract_text)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -304,8 +324,8 @@ async def upload_template(
     sb.table("assignments").update(
         {
             "template_storage_path": f"{SUBMISSIONS_BUCKET}/{template_key}",
-            "template_width_px": scan.width_px,
-            "template_height_px": scan.height_px,
+            "template_width_px": template_w,
+            "template_height_px": template_h,
             "template_regions_json": template_regions,
             "template_version": template_version,
         }

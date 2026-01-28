@@ -95,6 +95,18 @@ def _load_cv_image(image_bytes: bytes):
     return image
 
 
+def _odd_kernel(size: int) -> int:
+    if size % 2 == 0:
+        size += 1
+    return max(3, size)
+
+
+def _adaptive_kernel(min_dim: int, ratio: float, min_size: int, max_size: int) -> int:
+    size = int(round(min_dim * ratio))
+    size = max(min_size, min(size, max_size))
+    return _odd_kernel(size)
+
+
 def _find_rects(
     thresh,
     img_area: float,
@@ -130,22 +142,42 @@ def detect_question_regions(image_bytes: bytes) -> List[Tuple[float, float, floa
     image = _load_cv_image(image_bytes)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    block = _adaptive_kernel(min(gray.shape[:2]), 0.06, 21, 51)
     thresh = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 5
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, 5
     )
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    kernel_size = _adaptive_kernel(min(gray.shape[:2]), 0.02, 7, 31)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     img_h, img_w = image.shape[:2]
     img_area = float(img_w * img_h)
-    return _find_rects(
+    min_w = max(60, int(round(img_w * 0.18)))
+    min_h = max(60, int(round(img_h * 0.12)))
+    rects = _find_rects(
         thresh,
         img_area,
-        min_area_ratio=0.06,
-        max_area_ratio=0.95,
-        min_w=120,
-        min_h=120,
+        min_area_ratio=0.03,
+        max_area_ratio=0.98,
+        min_w=min_w,
+        min_h=min_h,
         aspect_range=(0.2, 5.0),
+    )
+    if rects:
+        return rects
+
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.dilate(edges, None, iterations=2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return _find_rects(
+        edges,
+        img_area,
+        min_area_ratio=0.02,
+        max_area_ratio=0.98,
+        min_w=min_w,
+        min_h=min_h,
+        aspect_range=(0.2, 5.5),
     )
 
 
@@ -153,22 +185,39 @@ def detect_answer_boxes(image_bytes: bytes) -> List[Tuple[float, float, float, f
     image = _load_cv_image(image_bytes)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    block = _adaptive_kernel(min(gray.shape[:2]), 0.05, 15, 45)
     thresh = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 3
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, 3
     )
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     img_h, img_w = image.shape[:2]
     img_area = float(img_w * img_h)
-    return _find_rects(
+    min_w = max(24, int(round(img_w * 0.06)))
+    min_h = max(18, int(round(img_h * 0.04)))
+    rects = _find_rects(
         thresh,
         img_area,
-        min_area_ratio=0.002,
-        max_area_ratio=0.08,
-        min_w=40,
-        min_h=28,
+        min_area_ratio=0.001,
+        max_area_ratio=0.12,
+        min_w=min_w,
+        min_h=min_h,
         aspect_range=(0.3, 6.0),
+    )
+    if rects:
+        return rects
+
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.dilate(edges, None, iterations=1)
+    return _find_rects(
+        edges,
+        img_area,
+        min_area_ratio=0.0008,
+        max_area_ratio=0.15,
+        min_w=min_w,
+        min_h=min_h,
+        aspect_range=(0.2, 7.0),
     )
 
 
