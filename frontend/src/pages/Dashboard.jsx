@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import {
   Dialog,
   DialogContent,
@@ -116,19 +117,12 @@ export default function Dashboard() {
       toast({
         variant: "destructive",
         title: "Unsupported file type",
-        description: rejected.map((f) => f.name).join(", "),
+        description: "Answer key must be a PNG, JPG, or PDF.",
       });
     }
     const accepted = list.filter(isAllowedFile);
-    setFiles((prev) => {
-      const existing = new Set(prev.map((f) => `${f.name}-${f.size}`));
-      const merged = [...prev];
-      accepted.forEach((file) => {
-        const key = `${file.name}-${file.size}`;
-        if (!existing.has(key)) merged.push(file);
-      });
-      return merged;
-    });
+    if (!accepted.length) return;
+    setFiles([accepted[0]]);
   };
 
   const removeFileAt = (index) => {
@@ -149,7 +143,7 @@ export default function Dashboard() {
       return;
     }
     if (files.length === 0) {
-      toast({ variant: "destructive", title: "Add at least one file" });
+      toast({ variant: "destructive", title: "Add the answer key file" });
       return;
     }
 
@@ -174,9 +168,9 @@ export default function Dashboard() {
       }
 
       const formData = new FormData();
-      files.forEach((file) => formData.append("files", file));
+      formData.append("file", files[0]);
 
-      const uploadResp = await apiFetch(`/api/assignments/${assignmentId}/uploads`, {
+      const uploadResp = await apiFetch(`/api/assignments/${assignmentId}/template`, {
         method: "POST",
         body: formData,
       });
@@ -187,7 +181,7 @@ export default function Dashboard() {
 
       toast({
         title: "Assignment created",
-        description: `Uploaded ${files.length} file${files.length > 1 ? "s" : ""}.`,
+        description: "Answer key uploaded.",
       });
       setDialogOpen(false);
       await loadAssignments();
@@ -235,7 +229,7 @@ export default function Dashboard() {
             <DialogHeader>
               <DialogTitle>Create assignment</DialogTitle>
               <DialogDescription>
-                Name the assignment, then upload student work in the same step.
+                Name the assignment, then upload the answer key.
               </DialogDescription>
             </DialogHeader>
 
@@ -263,21 +257,23 @@ export default function Dashboard() {
 
               {title.trim() ? (
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">Upload files</label>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <label className="text-sm font-medium">Upload answer key</label>
+                    <Badge variant="outline">Step 1 of 2: Answer Key</Badge>
+                  </div>
                   <div className="flex items-center gap-3">
                     <input
                       ref={fileInputRef}
                       type="file"
-                      multiple
                       accept={ACCEPTED_MIME.join(",")}
                       className="hidden"
                       onChange={(e) => addFiles(e.target.files)}
                     />
                     <Button variant="secondary" type="button" onClick={openPicker}>
-                      Add files
+                      Add file
                     </Button>
                     <span className="text-xs text-muted-foreground">
-                      PNG, JPG, or PDF
+                      Upload the answer key (PNG, JPG, or PDF). Student worksheets are uploaded after creation.
                     </span>
                   </div>
 
@@ -305,7 +301,7 @@ export default function Dashboard() {
                 </div>
               ) : (
                 <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
-                  Enter a name to start selecting files.
+                  Enter a name to select the answer key.
                 </div>
               )}
             </div>
@@ -324,7 +320,7 @@ export default function Dashboard() {
                 onClick={handleCreateAndUpload}
                 disabled={!title.trim() || files.length === 0 || submitting}
               >
-                {submitting ? "Uploading..." : "Create & Upload"}
+                {submitting ? "Uploading..." : "Create & Upload Answer Key"}
               </Button>
             </DialogFooter>
           </DialogContent>
