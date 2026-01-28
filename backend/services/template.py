@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from io import BytesIO
 import logging
 import re
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:  # pragma: no cover - optional dependency check
     import cv2  # type: ignore
@@ -28,6 +28,21 @@ class TemplateRegionV1:
     expected_answer_text: str
     label_method: str
     index: int
+
+
+class TemplateValidationError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        detail: Optional[Dict[str, object]] = None,
+        debug: Optional[Dict[str, object]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.detail = detail or {"code": code}
+        self.debug = debug or {}
 
 
 def _resize_dims(width: int, height: int) -> Tuple[int, int]:
@@ -227,9 +242,15 @@ def _contains(region: Tuple[float, float, float, float], box: Tuple[float, float
     return bx >= rx and by >= ry and (bx + bw) <= (rx + rw) and (by + bh) <= (ry + rh)
 
 
+def _area(box: Tuple[float, float, float, float]) -> float:
+    return float(box[2] * box[3])
+
+
 async def extract_template_regions(
     image_bytes: bytes,
     ocr_func,
+    *,
+    image_size: Optional[Tuple[int, int]] = None,
 ) -> List[TemplateRegionV1]:
     regions = detect_question_regions(image_bytes)
     if not regions:
@@ -244,15 +265,39 @@ async def extract_template_regions(
 
     region_to_answer: List[Tuple[Tuple[float, float, float, float], Tuple[float, float, float, float]]] = []
     used_answers: set[int] = set()
-    for region in regions:
+    for region_index, region in enumerate(regions, start=1):
         inside = [idx for idx, box in enumerate(answer_boxes) if _contains(region, box)]
         if len(inside) == 0:
             raise ValueError(
                 "Answer box not found inside region Q?. Please draw a solid box around the final answer inside each region."
             )
         if len(inside) > 1:
-            raise ValueError(
-                "Multiple answer boxes found inside one region. Use one answer box per question region."
+            region_area = _area(region)
+            filtered = []
+            for idx in inside:
+                ratio = _area(answer_boxes[idx]) / region_area if region_area else 0.0
+                if ratio <= 0.6:
+                    filtered.append(idx)
+            if len(filtered) == 1:
+                inside = filtered
+        if len(inside) > 1:
+            debug = {
+                "image_size": image_size,
+                "regions_count": len(regions),
+                "region_index": region_index,
+                "region": region,
+                "answer_boxes_count": len(inside),
+                "answer_boxes": [answer_boxes[idx] for idx in inside],
+            }
+            raise TemplateValidationError(
+                "Multiple answer boxes found inside one region. Use one answer box per question region.",
+                code="MULTIPLE_ANSWER_BOXES",
+                detail={
+                    "code": "MULTIPLE_ANSWER_BOXES",
+                    "region_index": region_index,
+                    "answer_boxes_count": len(inside),
+                },
+                debug=debug,
             )
         idx = inside[0]
         if idx in used_answers:

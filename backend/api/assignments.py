@@ -19,7 +19,7 @@ from PIL import Image
 
 from ..services.scanner import MAX_DIM_PX, normalize_image_bytes
 from ..services import ocr as ocr_service
-from ..services.template import extract_template_regions
+from ..services.template import TemplateValidationError, extract_template_regions
 from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
@@ -306,7 +306,24 @@ async def upload_template(
     upload_bytes(SUBMISSIONS_BUCKET, template_key, template_png, "image/png")
 
     try:
-        regions = await extract_template_regions(template_png, ocr_service.extract_text)
+        regions = await extract_template_regions(
+            template_png,
+            ocr_service.extract_text,
+            image_size=(template_w, template_h),
+        )
+    except TemplateValidationError as exc:
+        logger.warning(
+            "Template validation failed for assignment %s: size=%sx%s regions=%s region_index=%s region=%s answer_boxes_count=%s answer_boxes=%s",
+            assignment_id,
+            template_w,
+            template_h,
+            exc.debug.get("regions_count"),
+            exc.detail.get("region_index"),
+            exc.debug.get("region"),
+            exc.detail.get("answer_boxes_count"),
+            exc.debug.get("answer_boxes"),
+        )
+        raise HTTPException(status_code=400, detail=exc.detail)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

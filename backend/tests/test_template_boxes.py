@@ -9,6 +9,7 @@ from backend.services.template import (
     detect_answer_boxes,
     detect_question_regions,
     extract_template_regions,
+    TemplateValidationError,
 )
 
 
@@ -36,6 +37,28 @@ def _make_template() -> bytes:
         (560, 140, 720, 200),
         (560, 380, 720, 440),
         (560, 620, 720, 680),
+    ]
+    for box in answer_boxes:
+        cv2.rectangle(img, (box[0], box[1]), (box[2], box[3]), (0, 0, 0), 5)
+    buf = BytesIO()
+    from PIL import Image
+
+    Image.fromarray(img).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _make_template_with_double_answer() -> bytes:
+    img = np.full((1000, 800, 3), 255, dtype=np.uint8)
+    regions = [
+        (60, 80, 740, 260),
+        (60, 320, 740, 500),
+    ]
+    for rect in regions:
+        _draw_dashed_rect(img, rect, thickness=2)
+    answer_boxes = [
+        (560, 140, 720, 200),
+        (420, 150, 520, 210),
+        (560, 380, 720, 440),
     ]
     for box in answer_boxes:
         cv2.rectangle(img, (box[0], box[1]), (box[2], box[3]), (0, 0, 0), 5)
@@ -80,3 +103,17 @@ async def test_extract_template_regions_missing_regions():
 
     with pytest.raises(ValueError):
         await extract_template_regions(buf.getvalue(), fake_ocr)
+
+
+@pytest.mark.asyncio
+async def test_extract_template_regions_multiple_answer_boxes():
+    payload = _make_template_with_double_answer()
+
+    async def fake_ocr(*_args, **_kwargs):
+        return {"text": "Q1"}
+
+    with pytest.raises(TemplateValidationError) as exc:
+        await extract_template_regions(payload, fake_ocr)
+
+    assert exc.value.code == "MULTIPLE_ANSWER_BOXES"
+    assert exc.value.detail["answer_boxes_count"] >= 2
