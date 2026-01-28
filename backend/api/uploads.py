@@ -16,7 +16,7 @@ from ..services.llm_grader import grade_with_llm
 from ..services.marking import build_overlay_from_answers
 from ..services.report import get_page_sizes, render_debug_layout_pdf, render_marked_pdf
 from ..services.scanner import image_bytes_to_pdf
-from ..services.template_grader import grade_with_template
+from ..services.template_grader import TemplateAlignmentError, grade_with_template
 from ..services.storage import download_submission_bytes, strip_bucket_prefix, upload_bytes, upload_json
 from ..services.supabase_client import get_supabase
 from ..services.debug_artifacts import (
@@ -184,12 +184,28 @@ async def run_grade_pipeline(
         if template_available and row.get("normalized_image_path"):
             template_png = download_submission_bytes(template_storage_path)
             student_png = download_submission_bytes(row.get("normalized_image_path"))
-            template_output = await grade_with_template(
-                student_png,
-                template_png,
-                template_regions,
-                ocr_service.extract_text,
-            )
+            try:
+                template_output = await grade_with_template(
+                    student_png,
+                    template_png,
+                    template_regions,
+                    ocr_service.extract_text,
+                )
+            except TemplateAlignmentError as exc:
+                update_upload(
+                    row["id"],
+                    {
+                        "status": "error",
+                        "needs_review": True,
+                        "ocr_error": f"template_alignment_failed: {exc}",
+                        "grade_json": {
+                            "template_used": False,
+                            "template_error": f"Template alignment failed: {exc}",
+                        },
+                        "updated_at": _utc_iso(),
+                    },
+                )
+                raise HTTPException(status_code=422, detail=f"Template alignment failed: {exc}")
             template_used = True
             grade_result = template_output.grade_result
             grade_result.submission_id = row["id"]

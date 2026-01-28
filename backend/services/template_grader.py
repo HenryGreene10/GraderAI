@@ -28,8 +28,17 @@ class TemplateGradeOutput:
     student_answers: List[Dict[str, Any]]
 
 
+class TemplateAlignmentError(Exception):
+    pass
+
+
 def _normalize_text(value: str) -> str:
-    return " ".join((value or "").lower().split())
+    raw = " ".join((value or "").split())
+    if not raw:
+        return ""
+    raw = re.sub(r"(?i)\b(r|rem|remainder)\s*([0-9]+)\b", r"R\2", raw)
+    raw = re.sub(r"(?i)(\d)\s*R\s*([0-9]+)", r"\1 R\2", raw)
+    return raw.lower()
 
 
 def _extract_number(value: str) -> float | None:
@@ -98,20 +107,27 @@ async def grade_with_template(
     ocr_func,
 ) -> TemplateGradeOutput:
     alignment = align_student_to_template(student_png, template_png)
+    if not alignment.ok:
+        raise TemplateAlignmentError(alignment.error or "alignment_failed")
     aligned_img = Image.open(BytesIO(alignment.aligned_png)).convert("RGB")
 
     items: List[QuestionGrade] = []
     answers: List[Dict[str, Any]] = []
-    needs_review = not alignment.ok
+    needs_review = False
 
     for region in template_regions:
         qid = str(region.get("qid") or "")
-        box = region.get("box") or []
-        if not box or len(box) < 4:
+        answer_box = region.get("answer_box") or {}
+        if not answer_box:
             needs_review = True
             continue
-        x0, y0, x1, y1 = [float(v) for v in box[:4]]
-        expected = str(region.get("expected_answer") or "").strip()
+        x0 = float(answer_box.get("x") or 0.0)
+        y0 = float(answer_box.get("y") or 0.0)
+        w = float(answer_box.get("w") or 0.0)
+        h = float(answer_box.get("h") or 0.0)
+        x1 = x0 + w
+        y1 = y0 + h
+        expected = str(region.get("expected_answer_text") or "").strip()
         crop_png = _crop_to_png(aligned_img, (x0, y0, x1, y1))
         raw = await ocr_func(image_bytes=crop_png)
         student_text = str((raw or {}).get("text") or "").strip()
@@ -193,14 +209,18 @@ def _build_template_overlay(
         region = next((r for r in template_regions if str(r.get("qid")) == item.question_id), None)
         if not region:
             continue
-        box = region.get("box") or []
-        if len(box) < 4:
+        answer_box = region.get("answer_box") or {}
+        if not answer_box:
             continue
-        x0, y0, x1, _ = [float(v) for v in box[:4]]
-        anchor_x_px = x1 - 20.0
-        anchor_y_px = y0 + 12.0
+        x0 = float(answer_box.get("x") or 0.0)
+        y0 = float(answer_box.get("y") or 0.0)
+        w = float(answer_box.get("w") or 0.0)
+        h = float(answer_box.get("h") or 0.0)
+        anchor_x_px = x0 + w - 18.0
+        anchor_y_px = y0 + 6.0
         x_pt, y_pt = px_to_pdf(anchor_x_px, anchor_y_px, (norm_w, norm_h), (page_w_pt, page_h_pt))
         tool = "check" if item.score >= item.max_score * 0.5 else "cross"
         marks.append(OverlayMark(tool=tool, coords=[x_pt, y_pt], text=None))
 
     return Overlay(page=1, marks=marks)
+

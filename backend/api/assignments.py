@@ -15,7 +15,7 @@ from ..services.db import get_assignment, require_supabase
 from ..services.storage import strip_bucket_prefix, upload_bytes
 from ..services.scanner import normalize_image_bytes
 from ..services import ocr as ocr_service
-from ..services.template import detect_answer_boxes, extract_regions
+from ..services.template import extract_template_regions
 from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
@@ -277,14 +277,23 @@ async def upload_template(
     template_key = f"{owner_id}/templates/{assignment_id}.png"
     upload_bytes(SUBMISSIONS_BUCKET, template_key, scan.normalized_png, "image/png")
 
-    boxes = detect_answer_boxes(scan.normalized_png)
-    regions = await extract_regions(scan.normalized_png, boxes, ocr_service.extract_text)
+    try:
+        regions = await extract_template_regions(scan.normalized_png, ocr_service.extract_text)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     template_regions = [
         {
             "qid": region.qid,
-            "box": list(region.box),
-            "label_text": region.label_text,
-            "expected_answer": region.expected_answer,
+            "region": {"x": region.region[0], "y": region.region[1], "w": region.region[2], "h": region.region[3]},
+            "answer_box": {
+                "x": region.answer_box[0],
+                "y": region.answer_box[1],
+                "w": region.answer_box[2],
+                "h": region.answer_box[3],
+            },
+            "expected_answer_text": region.expected_answer_text,
+            "label_method": region.label_method,
             "index": region.index,
         }
         for region in regions
