@@ -3,7 +3,7 @@ import logging
 import os
 from io import BytesIO
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from ..auth import get_current_user_id
@@ -12,6 +12,14 @@ from ..services.db import get_upload, update_upload
 from ..services.ocr import normalize_ocr_result
 from ..services.scan_pipeline import prepare_ocr_image
 from ..services.storage import download_submission_bytes
+from ..services.debug_artifacts import (
+    debug_enabled,
+    draw_ocr_overlay,
+    log_debug,
+    serialize_json,
+    to_png_bytes,
+    upload_debug_artifact,
+)
 from PIL import Image
 
 router = APIRouter(prefix="/api/ocr", tags=["ocr"])
@@ -38,7 +46,7 @@ def _log_ocr_image_size(tag: str, image_bytes: bytes) -> None:
         return
 
 
-async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
+async def run_ocr_for_upload(upload_id: str, user_id: str, *, debug: bool = False) -> dict:
     row = get_upload(
         upload_id,
         user_id,
@@ -137,10 +145,44 @@ async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
                 }
             )
         update_upload(row["id"], payload)
+
+        if debug_enabled(debug):
+            owner_id = row.get("owner_id") or user_id or "unknown"
+            debug_fields = {
+                "normalized_w_px": scan_artifacts.width_px if scan_artifacts else None,
+                "normalized_h_px": scan_artifacts.height_px if scan_artifacts else None,
+            }
+            log_debug("ocr", debug_fields)
+            try:
+                upload_debug_artifact(
+                    owner_id,
+                    row["id"],
+                    "normalized.png",
+                    to_png_bytes(ocr_bytes),
+                    "image/png",
+                )
+                upload_debug_artifact(
+                    owner_id,
+                    row["id"],
+                    "ocr_raw.json",
+                    serialize_json(raw),
+                    "application/json",
+                )
+                overlay_png, counts = draw_ocr_overlay(ocr_bytes, norm.get("boxes") or {})
+                upload_debug_artifact(
+                    owner_id,
+                    row["id"],
+                    "ocr_overlay.png",
+                    overlay_png,
+                    "image/png",
+                )
+                log_debug("ocr_boxes", counts)
+            except Exception:
+                logger.exception("Failed to create OCR debug bundle for %s", row["id"])
         try:
             from .uploads import run_grade_pipeline
 
-            await run_grade_pipeline(row["id"], user_id)
+            await run_grade_pipeline(row["id"], user_id, debug=debug)
         except HTTPException as exc:
             logger.warning("Auto-grade failed for %s: %s", row["id"], exc.detail)
         except Exception:
@@ -171,8 +213,9 @@ async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
 async def start_ocr(
     body: StartOCRBody,
     user_id: str = Depends(get_current_user_id),
+    debug: bool = Query(False),
 ):
-    return await run_ocr_for_upload(body.upload_id, user_id)
+    return await run_ocr_for_upload(body.upload_id, user_id, debug=debug)
 
 
 @router.get("/status/{upload_id}")

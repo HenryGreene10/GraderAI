@@ -2,7 +2,7 @@ import datetime as dt
 import os
 from typing import Optional, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from ..auth import get_current_user_id
@@ -13,6 +13,12 @@ from ..services.marking import build_overlay_from_answers
 from ..services.report import get_page_sizes, render_debug_layout_pdf, render_marked_pdf
 from ..services.storage import download_submission_bytes, strip_bucket_prefix, upload_bytes, upload_json
 from ..services.supabase_client import get_supabase
+from ..services.debug_artifacts import (
+    debug_enabled,
+    draw_marks_overlay,
+    log_debug,
+    upload_debug_artifact,
+)
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
 
@@ -100,14 +106,20 @@ class OverridePayload(BaseModel):
     note: Optional[str] = None
 
 
-async def run_grade_pipeline(upload_id: str, user_id: str, *, force: bool = False) -> dict:
+async def run_grade_pipeline(
+    upload_id: str,
+    user_id: str,
+    *,
+    force: bool = False,
+    debug: bool = False,
+) -> dict:
     row = get_upload(
         upload_id,
         user_id,
         columns=(
             "id,owner_id,storage_path,ocr_status,ocr_text,ocr_boxes,mime_type,"
             "graded_pdf_path,status,normalized_pdf_path,normalized_width_px,"
-            "normalized_height_px,needs_review"
+            "normalized_height_px,needs_review,normalized_image_path"
         ),
     )
     status = (row.get("status") or "").strip().lower()
@@ -143,10 +155,30 @@ async def run_grade_pipeline(upload_id: str, user_id: str, *, force: bool = Fals
         pdf_source_bytes = download_submission_bytes(pdf_source_path)
         pdf_mime = "application/pdf" if row.get("normalized_pdf_path") else row.get("mime_type")
         page_sizes = get_page_sizes(pdf_source_bytes, pdf_mime)
+        page_width_pt, page_height_pt = page_sizes[0]
+        page_width_in = page_width_pt / 72.0
+        page_height_in = page_height_pt / 72.0
         normalized_size = (
             float(row.get("normalized_width_px") or 0.0),
             float(row.get("normalized_height_px") or 0.0),
         )
+        if debug_enabled(debug):
+            norm_w, norm_h = normalized_size
+            sx = page_width_pt / norm_w if norm_w else None
+            sy = page_height_pt / norm_h if norm_h else None
+            log_debug(
+                "pdf_map",
+                {
+                    "page_w_pt": round(page_width_pt, 2),
+                    "page_h_pt": round(page_height_pt, 2),
+                    "page_w_in": round(page_width_in, 3),
+                    "page_h_in": round(page_height_in, 3),
+                    "dpi": 300,
+                    "sx": sx,
+                    "sy": sy,
+                    "y_flip": True,
+                },
+            )
 
         overlay, needs_review_from_overlay, unplaced_items, debug_layout = build_overlay_from_answers(
             answers,
@@ -190,6 +222,36 @@ async def run_grade_pipeline(upload_id: str, user_id: str, *, force: bool = Fals
                 upload_bytes(GRADED_BUCKET, debug_layout_path, debug_pdf, "application/pdf")
             except Exception:
                 debug_layout_path = None
+
+        if debug_enabled(debug):
+            owner_id = row.get("owner_id") or user_id or "unknown"
+            try:
+                normalized_image_path = row.get("normalized_image_path")
+                if normalized_image_path:
+                    normalized_bytes = download_submission_bytes(normalized_image_path)
+                    marks_png, mark_info = draw_marks_overlay(
+                        normalized_bytes,
+                        overlay,
+                        normalized_size,
+                        (page_width_pt, page_height_pt),
+                    )
+                    upload_debug_artifact(
+                        owner_id,
+                        row["id"],
+                        "marks_overlay.png",
+                        marks_png,
+                        "image/png",
+                    )
+                    log_debug("marks", {"count": mark_info.get("marks"), "bboxes": mark_info.get("mark_bboxes")})
+                upload_debug_artifact(
+                    owner_id,
+                    row["id"],
+                    "marked.pdf",
+                    pdf_bytes,
+                    "application/pdf",
+                )
+            except Exception:
+                logger.exception("Failed to create marks debug bundle for %s", row["id"])
 
         update_upload(
             row["id"],
@@ -241,6 +303,7 @@ async def grade_upload(
 async def retry_upload(
     upload_id: str,
     user_id: str = Depends(get_current_user_id),
+    debug: bool = Query(False),
 ):
     row = get_upload(
         upload_id,
@@ -252,8 +315,8 @@ async def retry_upload(
     if (row.get("ocr_status") or "").strip().lower() != "done":
         from .ocr import run_ocr_for_upload
 
-        return await run_ocr_for_upload(row["id"], user_id)
-    return await run_grade_pipeline(row["id"], user_id, force=True)
+        return await run_ocr_for_upload(row["id"], user_id, debug=debug)
+    return await run_grade_pipeline(row["id"], user_id, force=True, debug=debug)
 
 
 @router.post("/{upload_id}/override")
