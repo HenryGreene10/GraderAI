@@ -13,6 +13,9 @@ from ..auth import get_current_user_id
 from ..config import GRADED_BUCKET, OVERLAYS_BUCKET, SUBMISSIONS_BUCKET
 from ..services.db import get_assignment, require_supabase
 from ..services.storage import strip_bucket_prefix, upload_bytes
+from ..services.scanner import normalize_image_bytes
+from ..services import ocr as ocr_service
+from ..services.template import detect_answer_boxes, extract_regions
 from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
@@ -212,6 +215,65 @@ def delete_assignment(
         raise HTTPException(status_code=500, detail=f"assignment_delete_failed: {exc}")
 
     return {"ok": True, "assignment_id": assignment_id, "uploads_deleted": len(rows)}
+
+
+@router.post("/{assignment_id}/template")
+async def upload_template(
+    assignment_id: str,
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    assignment = get_assignment(
+        assignment_id,
+        user_id,
+        columns="id,owner_id,template_version",
+    )
+    ext = _file_extension(file.filename, file.content_type)
+    if ext not in {".png", ".jpg", ".jpeg"}:
+        raise HTTPException(status_code=400, detail="template_image_only")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="template_empty")
+
+    scan = normalize_image_bytes(payload)
+    owner_id = assignment.get("owner_id") or user_id or "unknown"
+    template_key = f"{owner_id}/templates/{assignment_id}.png"
+    upload_bytes(SUBMISSIONS_BUCKET, template_key, scan.normalized_png, "image/png")
+
+    boxes = detect_answer_boxes(scan.normalized_png)
+    regions = await extract_regions(scan.normalized_png, boxes, ocr_service.extract_text)
+    template_regions = [
+        {
+            "qid": region.qid,
+            "box": list(region.box),
+            "label_text": region.label_text,
+            "expected_answer": region.expected_answer,
+            "index": region.index,
+        }
+        for region in regions
+    ]
+
+    template_version = int(assignment.get("template_version") or 0) + 1
+    sb = require_supabase()
+    sb.table("assignments").update(
+        {
+            "template_storage_path": f"{SUBMISSIONS_BUCKET}/{template_key}",
+            "template_width_px": scan.width_px,
+            "template_height_px": scan.height_px,
+            "template_regions_json": template_regions,
+            "template_version": template_version,
+        }
+    ).eq("id", assignment_id).execute()
+
+    return {
+        "ok": True,
+        "assignment_id": assignment_id,
+        "template_storage_path": f"{SUBMISSIONS_BUCKET}/{template_key}",
+        "template_version": template_version,
+        "boxes_detected": len(template_regions),
+        "qids": [r["qid"] for r in template_regions],
+    }
 
 
 @router.post("/{assignment_id}/uploads")
