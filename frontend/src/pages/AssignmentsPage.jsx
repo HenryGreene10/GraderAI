@@ -42,12 +42,21 @@ import supa from "../lib/supa";
 
 const ACCEPTED_MIME = ["image/png", "image/jpeg", "application/pdf"];
 const ACCEPTED_EXT = [".png", ".jpg", ".jpeg", ".pdf"];
+const TEMPLATE_MIME = ["image/png", "image/jpeg"];
+const TEMPLATE_EXT = [".png", ".jpg", ".jpeg"];
 
 function isAllowedFile(file) {
   if (!file) return false;
   if (ACCEPTED_MIME.includes(file.type)) return true;
   const name = String(file.name || "").toLowerCase();
   return ACCEPTED_EXT.some((ext) => name.endsWith(ext));
+}
+
+function isAllowedTemplate(file) {
+  if (!file) return false;
+  if (TEMPLATE_MIME.includes(file.type)) return true;
+  const name = String(file.name || "").toLowerCase();
+  return TEMPLATE_EXT.some((ext) => name.endsWith(ext));
 }
 
 function statusLabel(status) {
@@ -116,6 +125,8 @@ export default function AssignmentsPage() {
   const [files, setFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef(null);
+  const masterKeyInputRef = useRef(null);
+  const [masterKeyUploading, setMasterKeyUploading] = useState(false);
 
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerTab, setViewerTab] = useState("original");
@@ -160,14 +171,13 @@ export default function AssignmentsPage() {
 
   async function loadAssignment() {
     try {
-      const resp = await apiFetch("/api/assignments");
+      const resp = await apiFetch(`/api/assignments/${assignmentId}`);
       if (!resp.ok) {
         const text = await resp.text().catch(() => "");
         throw new Error(text || `Failed: ${resp.status}`);
       }
       const data = await resp.json();
-      const match = (data.assignments || []).find((row) => row.id === assignmentId);
-      setAssignment(match || null);
+      setAssignment(data.assignment || null);
     } catch (err) {
       toast({
         variant: "destructive",
@@ -223,6 +233,50 @@ export default function AssignmentsPage() {
       });
       return merged;
     });
+  };
+
+  const openMasterKeyPicker = () => {
+    masterKeyInputRef.current?.click();
+  };
+
+  const handleMasterKeySelected = async (file) => {
+    if (!file) return;
+    if (!isAllowedTemplate(file)) {
+      toast({
+        variant: "destructive",
+        title: "Unsupported file type",
+        description: "Master Key must be a PNG or JPG.",
+      });
+      return;
+    }
+    if (!assignmentId) return;
+    setMasterKeyUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const resp = await apiFetch(`/api/assignments/${assignmentId}/template`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `Upload failed: ${resp.status}`);
+      }
+      toast({ title: "Master Key uploaded" });
+      await loadAssignment();
+      await loadUploads();
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Master Key upload failed",
+        description: err?.message || "Try again.",
+      });
+    } finally {
+      setMasterKeyUploading(false);
+      if (masterKeyInputRef.current) {
+        masterKeyInputRef.current.value = "";
+      }
+    }
   };
 
   const removeFileAt = (index) => {
@@ -486,11 +540,11 @@ export default function AssignmentsPage() {
         <div className="flex items-center gap-2">
           <Dialog open={uploadOpen} onOpenChange={setUploadOpen}>
             <DialogTrigger asChild>
-              <Button>Upload files</Button>
+              <Button>Upload student worksheets</Button>
             </DialogTrigger>
             <DialogContent className="sm:max-w-[520px]">
               <DialogHeader>
-                <DialogTitle>Upload files</DialogTitle>
+                <DialogTitle>Upload student worksheets</DialogTitle>
                 <DialogDescription>
                   Add more student files to this assignment.
                 </DialogDescription>
@@ -545,7 +599,46 @@ export default function AssignmentsPage() {
         </div>
       </header>
 
-      <div className="rounded-lg border border-border">
+      <section className="rounded-lg border border-border p-4 space-y-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold">Step 1: Upload Master Key</h2>
+            <p className="text-sm text-muted-foreground">
+              Draw thick black boxes around each answer, label Q1/Q2…, and write the correct answer inside each box.
+              Use a straight-on photo.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              ref={masterKeyInputRef}
+              type="file"
+              accept={TEMPLATE_MIME.join(",")}
+              className="hidden"
+              onChange={(e) => handleMasterKeySelected(e.target.files?.[0])}
+            />
+            <Button variant="secondary" onClick={openMasterKeyPicker} disabled={masterKeyUploading}>
+              {assignment?.template_storage_path ? "Replace Master Key" : "Upload Master Key"}
+            </Button>
+          </div>
+        </div>
+        {assignment?.template_storage_path ? (
+          <div className="text-sm text-muted-foreground">
+            Master Key uploaded ✅{" "}
+            {assignment?.template_regions_count ? `(${assignment.template_regions_count} boxes)` : ""}
+          </div>
+        ) : (
+          <div className="text-sm text-muted-foreground">
+            No Master Key yet. Upload one to enable deterministic grading.
+          </div>
+        )}
+      </section>
+
+      <section className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold">Step 2: Upload Student Worksheets</h2>
+        </div>
+
+        <div className="rounded-lg border border-border">
         <Table>
           <TableHeader>
             <TableRow>
@@ -648,7 +741,8 @@ export default function AssignmentsPage() {
             ))}
           </TableBody>
         </Table>
-      </div>
+        </div>
+      </section>
 
       <Dialog open={viewerOpen} onOpenChange={setViewerOpen}>
         <DialogContent className="sm:max-w-[900px]">

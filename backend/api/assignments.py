@@ -47,6 +47,25 @@ def _assignment_payload(row: dict, uploads_count: int = 0) -> dict:
     }
 
 
+def _assignment_detail_payload(row: dict) -> dict:
+    base = _assignment_payload(row, uploads_count=0)
+    regions = row.get("template_regions_json") or []
+    detected_qids = []
+    if isinstance(regions, list):
+        detected_qids = [str(r.get("qid")) for r in regions if isinstance(r, dict) and r.get("qid")]
+    base.update(
+        {
+            "template_storage_path": row.get("template_storage_path"),
+            "template_regions_count": len(regions) if isinstance(regions, list) else 0,
+            "template_detected_qids": detected_qids,
+            "template_width_px": row.get("template_width_px"),
+            "template_height_px": row.get("template_height_px"),
+            "template_version": row.get("template_version"),
+        }
+    )
+    return base
+
+
 def _file_extension(filename: Optional[str], content_type: Optional[str]) -> str:
     ext = os.path.splitext(filename or "")[1].lower()
     if ext in ALLOWED_EXTS:
@@ -89,6 +108,23 @@ def list_assignments(user_id: str = Depends(get_current_user_id)):
             for row in rows
         ]
     }
+
+
+@router.get("/{assignment_id}")
+def get_assignment_detail(
+    assignment_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    row = get_assignment(
+        assignment_id,
+        user_id,
+        columns=(
+            "id,owner_id,title,due_date,created_at,rubric_json,"
+            "template_storage_path,template_regions_json,template_width_px,"
+            "template_height_px,template_version"
+        ),
+    )
+    return {"assignment": _assignment_detail_payload(row)}
 
 
 @router.post("")
