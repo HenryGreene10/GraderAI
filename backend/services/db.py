@@ -14,6 +14,17 @@ from .supabase_client import get_supabase
 logger = logging.getLogger(__name__)
 
 
+def _error_dict(exc: Exception) -> Optional[dict]:
+    raw = getattr(exc, "message", None)
+    if isinstance(raw, dict):
+        return raw
+    args = getattr(exc, "args", None)
+    if isinstance(args, (list, tuple)) and args:
+        if isinstance(args[0], dict):
+            return args[0]
+    return None
+
+
 def _missing_column(err: dict) -> Optional[str]:
     details = str(err.get("details") or err.get("message") or "")
     match = re.search(r"Could not find the '([^']+)' column", details)
@@ -51,7 +62,7 @@ def get_assignment(assignment_id: str, caller_id: Optional[str], columns: str = 
             row = resp.data
             break
         except APIError as exc:
-            err = getattr(exc, "message", None) or getattr(exc, "args", [""])[0]
+            err = _error_dict(exc)
             if isinstance(err, dict):
                 code = str(err.get("code") or "")
                 if code == "204":
@@ -80,7 +91,7 @@ def get_upload(upload_id: str, caller_id: Optional[str], columns: str = "*") -> 
             row = resp.data
             break
         except APIError as exc:
-            err = getattr(exc, "message", None) or getattr(exc, "args", [""])[0]
+            err = _error_dict(exc)
             if isinstance(err, dict):
                 code = str(err.get("code") or "")
                 if code == "204":
@@ -109,7 +120,7 @@ def update_upload(upload_id: str, payload: dict[str, Any]) -> None:
             sb.table("uploads").update(data).eq("id", upload_id).execute()
             return
         except APIError as exc:
-            err = getattr(exc, "message", None) or getattr(exc, "args", [""])[0]
+            err = _error_dict(exc)
             if isinstance(err, dict) and str(err.get("code")) == "PGRST204":
                 missing = _missing_column(err)
                 if missing and missing in data:

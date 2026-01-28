@@ -93,6 +93,15 @@ async def run_ocr_for_upload(upload_id: str, user_id: str) -> dict:
         norm = normalize_ocr_result(raw)
         text = (norm.get("text") or "").strip()
         if not text:
+            update_upload(
+                row["id"],
+                {
+                    "ocr_status": OCR_ERROR,
+                    "status": "error",
+                    "ocr_error": "OCR returned empty text",
+                    "updated_at": _utc_iso(),
+                },
+            )
             raise HTTPException(status_code=422, detail="OCR returned empty text")
 
         scan_failed = bool(scan_artifacts and not scan_artifacts.scan_ok) or bool(scan_error)

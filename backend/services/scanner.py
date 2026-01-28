@@ -241,12 +241,20 @@ def normalize_image_bytes(image_bytes: bytes) -> ScanResult:
 
     try:
         cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        img_h, img_w = cv_img.shape[:2]
         gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
         contour = _find_page_contour(gray)
         if contour is None:
             raise ValueError("page_contour_not_found")
+        contour_area = float(cv2.contourArea(contour))
+        img_area = float(img_w * img_h) if img_w and img_h else 0.0
+        if img_area and (contour_area / img_area) < 0.2:
+            raise ValueError("page_contour_too_small")
 
         warped = _four_point_warp(cv_img, contour)
+        warped_h, warped_w = warped.shape[:2]
+        if min(warped_w, warped_h) < 200:
+            raise ValueError("page_warp_too_small")
         warped = _deskew(warped)
         warped = _normalize_contrast(warped)
         warped = _clamp_cv(warped)
