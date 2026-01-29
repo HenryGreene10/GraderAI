@@ -12,6 +12,16 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Table,
   TableBody,
   TableCell,
@@ -65,6 +75,9 @@ export default function Dashboard() {
   const [files, setFiles] = useState([]);
   const [submitting, setSubmitting] = useState(false);
   const fileInputRef = useRef(null);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const fileCount = useMemo(() => files.length, [files]);
 
@@ -201,6 +214,30 @@ export default function Dashboard() {
     await supabase.auth.signOut();
     window.location.href = "/auth";
   };
+
+  async function handleDeleteAssignment() {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
+    try {
+      const resp = await apiFetch(`/api/assignments/${deleteTarget.id}`, { method: "DELETE" });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `Delete failed: ${resp.status}`);
+      }
+      setAssignments((prev) => prev.filter((row) => row.id !== deleteTarget.id));
+      toast({ title: "Assignment deleted" });
+      setDeleteOpen(false);
+      setDeleteTarget(null);
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Delete failed",
+        description: err?.message || "Try again.",
+      });
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   return (
     <div className="p-6 space-y-6">
@@ -351,19 +388,50 @@ export default function Dashboard() {
                 <TableCell>{formatDate(assignment.created_at)}</TableCell>
                 <TableCell>{assignment.uploads_count ?? 0}</TableCell>
                 <TableCell className="text-right">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => navigate(`/assignments?assignmentId=${assignment.id}`)}
-                  >
-                    Open
-                  </Button>
+                  <div className="flex justify-end gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => navigate(`/assignments?assignmentId=${assignment.id}`)}
+                    >
+                      Open
+                    </Button>
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => {
+                        setDeleteTarget(assignment);
+                        setDeleteOpen(true);
+                      }}
+                    >
+                      Delete
+                    </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}
           </TableBody>
         </Table>
       </div>
+
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Delete assignment “{deleteTarget?.title || "Assignment"}”?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This will remove the assignment and its uploads. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDeleteAssignment} disabled={deleting}>
+              {deleting ? "Deleting..." : "Delete"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
