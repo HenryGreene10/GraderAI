@@ -20,6 +20,9 @@ from .scanner import MIN_DIM_PX, MAX_DIM_PX
 logger = logging.getLogger(__name__)
 
 GIANT_REGION_RATIO = 0.35
+FALLBACK_TOP_PAD = 200
+FALLBACK_BOTTOM_PAD = 80
+FALLBACK_SIDE_PAD = 120
 
 
 @dataclass
@@ -168,19 +171,35 @@ def detect_question_regions(image_bytes: bytes) -> List[Tuple[float, float, floa
     thresh = cv2.adaptiveThreshold(
         blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, 5
     )
-    kernel_size = _adaptive_kernel(min(gray.shape[:2]), 0.015, 5, 25)
+    kernel_size = _adaptive_kernel(min(gray.shape[:2]), 0.018, 5, 27)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     img_h, img_w = image.shape[:2]
     img_area = float(img_w * img_h)
-    min_w = max(60, int(round(img_w * 0.18)))
-    min_h = max(60, int(round(img_h * 0.12)))
+    min_w = max(50, int(round(img_w * 0.15)))
+    min_h = max(50, int(round(img_h * 0.10)))
     rects = _find_rects(
         thresh,
         img_area,
         min_area_ratio=0.03,
         max_area_ratio=0.98,
+        min_w=min_w,
+        min_h=min_h,
+        aspect_range=(0.2, 5.0),
+    )
+    rects = _filter_giant_regions(rects, img_area)
+    if rects:
+        return rects
+
+    kernel_size = _adaptive_kernel(min(gray.shape[:2]), 0.025, 7, 35)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    thresh2 = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    rects = _find_rects(
+        thresh2,
+        img_area,
+        min_area_ratio=0.02,
+        max_area_ratio=0.92,
         min_w=min_w,
         min_h=min_h,
         aspect_range=(0.2, 5.0),
@@ -226,6 +245,25 @@ def _filter_giant_regions(
     if removed:
         logger.info("template_region_giant_guard removed_total=%s", removed)
     return filtered
+
+
+def _regions_from_answer_boxes(
+    answer_boxes: List[Tuple[float, float, float, float]],
+    image_size: Tuple[int, int],
+) -> List[Tuple[float, float, float, float]]:
+    img_w = float(image_size[0] or 0)
+    img_h = float(image_size[1] or 0)
+    if img_w <= 0 or img_h <= 0:
+        return []
+    sorted_boxes = sorted(answer_boxes, key=lambda b: (b[1], b[0]))
+    regions: List[Tuple[float, float, float, float]] = []
+    for bx, by, bw, bh in sorted_boxes:
+        x0 = max(0.0, bx - FALLBACK_SIDE_PAD)
+        y0 = max(0.0, by - FALLBACK_TOP_PAD)
+        x1 = min(img_w, bx + bw + FALLBACK_SIDE_PAD)
+        y1 = min(img_h, by + bh + FALLBACK_BOTTOM_PAD)
+        regions.append((x0, y0, x1 - x0, y1 - y0))
+    return regions
 
 
 def detect_answer_boxes(image_bytes: bytes) -> List[Tuple[float, float, float, float]]:
@@ -316,10 +354,6 @@ async def extract_template_regions(
 ) -> Tuple[List[TemplateRegionV1], List[Dict[str, object]]]:
     warnings: List[Dict[str, object]] = []
     regions = detect_question_regions(image_bytes)
-    if not regions:
-        raise ValueError(
-            "Couldn't detect question regions. Please draw a dashed outline around each question area."
-        )
     answer_boxes = detect_answer_boxes(image_bytes)
     if not answer_boxes:
         raise ValueError(
@@ -329,6 +363,32 @@ async def extract_template_regions(
     if image_size is None:
         with Image.open(BytesIO(image_bytes)) as img:
             image_size = img.size
+
+    if not regions and answer_boxes and image_size:
+        regions = _regions_from_answer_boxes(answer_boxes, image_size)
+        if regions:
+            warnings.append(
+                {
+                    "code": "REGIONS_FALLBACK_FROM_ANSWER_BOXES",
+                    "regions_count": len(regions),
+                    "message": (
+                        "We couldn't detect dashed question boxes, so we inferred question areas from answer boxes. "
+                        "If grading looks off, re-upload a clearer photo."
+                    ),
+                }
+            )
+            logger.warning(
+                "template_regions_fallback_from_answer_boxes regions=%s",
+                len(regions),
+            )
+        else:
+            raise ValueError(
+                "Couldn't detect question regions. Please draw a dashed outline around each question area."
+            )
+    if not regions:
+        raise ValueError(
+            "Couldn't detect question regions. Please draw a dashed outline around each question area."
+        )
     img_w = float(image_size[0] if image_size else 0)
     img_h = float(image_size[1] if image_size else 0)
     img_area = img_w * img_h if img_w and img_h else 0.0

@@ -69,6 +69,21 @@ def _make_template_with_double_answer() -> bytes:
     return buf.getvalue()
 
 
+def _make_boxes_only() -> bytes:
+    img = np.full((900, 700, 3), 255, dtype=np.uint8)
+    answer_boxes = [
+        (480, 160, 620, 220),
+        (480, 420, 620, 480),
+    ]
+    for box in answer_boxes:
+        cv2.rectangle(img, (box[0], box[1]), (box[2], box[3]), (0, 0, 0), 5)
+    buf = BytesIO()
+    from PIL import Image
+
+    Image.fromarray(img).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def test_detect_regions_and_answers():
     payload = _make_template()
     regions = detect_question_regions(payload)
@@ -103,6 +118,18 @@ async def test_extract_template_regions_missing_regions():
 
     with pytest.raises(ValueError):
         await extract_template_regions(buf.getvalue(), fake_ocr)
+
+
+@pytest.mark.asyncio
+async def test_extract_template_regions_fallback_from_answers():
+    payload = _make_boxes_only()
+
+    async def fake_ocr(*_args, **_kwargs):
+        return {"text": "Q1"}
+
+    regions, warnings = await extract_template_regions(payload, fake_ocr)
+    assert len(regions) == 2
+    assert any(w.get("code") == "REGIONS_FALLBACK_FROM_ANSWER_BOXES" for w in warnings)
 
 
 @pytest.mark.asyncio
