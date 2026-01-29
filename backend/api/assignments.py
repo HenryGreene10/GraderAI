@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import date, datetime, timezone
 from typing import Optional
 from uuid import uuid4
@@ -19,7 +20,12 @@ from PIL import Image
 
 from ..services.scanner import MAX_DIM_PX, normalize_image_bytes
 from ..services import ocr as ocr_service
-from ..services.template import TemplateValidationError, extract_template_regions
+from ..services.template import (
+    TemplateValidationError,
+    detect_answer_boxes,
+    detect_question_regions,
+    extract_template_regions,
+)
 from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
@@ -86,6 +92,35 @@ def _file_extension(filename: Optional[str], content_type: Optional[str]) -> str
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _template_debug_enabled() -> bool:
+    return os.getenv("TEMPLATE_DEBUG_OVERLAY") == "1"
+
+
+def _save_template_debug_overlay(
+    template_png: bytes,
+    assignment_id: str,
+    regions: list[tuple[float, float, float, float]],
+    answer_boxes: list[tuple[float, float, float, float]],
+) -> str:
+    from PIL import ImageDraw
+
+    image = Image.open(BytesIO(template_png)).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    for idx, (x, y, w, h) in enumerate(regions, start=1):
+        draw.rectangle([x, y, x + w, y + h], outline=(0, 120, 255), width=3)
+        draw.text((x + 6, y + 6), f"R{idx}", fill=(0, 120, 255))
+    for idx, (x, y, w, h) in enumerate(answer_boxes, start=1):
+        draw.rectangle([x, y, x + w, y + h], outline=(220, 0, 0), width=3)
+        draw.text((x + 6, y + 6), f"A{idx}", fill=(220, 0, 0))
+
+    tmp_dir = os.path.join(os.path.dirname(__file__), "..", "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    filename = f"template_overlay_{assignment_id}_{int(time.time())}.png"
+    path = os.path.join(tmp_dir, filename)
+    image.save(path, format="PNG")
+    return path
 
 
 @router.get("")
@@ -304,6 +339,26 @@ async def upload_template(
     owner_id = assignment.get("owner_id") or user_id or "unknown"
     template_key = f"{owner_id}/templates/{assignment_id}.png"
     upload_bytes(SUBMISSIONS_BUCKET, template_key, template_png, "image/png")
+
+    if _template_debug_enabled():
+        try:
+            debug_regions = detect_question_regions(template_png)
+            debug_answers = detect_answer_boxes(template_png)
+            overlay_path = _save_template_debug_overlay(
+                template_png,
+                assignment_id,
+                debug_regions,
+                debug_answers,
+            )
+            logger.info(
+                "template_debug_overlay_saved assignment_id=%s path=%s regions=%s answers=%s",
+                assignment_id,
+                overlay_path,
+                len(debug_regions),
+                len(debug_answers),
+            )
+        except Exception as exc:
+            logger.warning("template_debug_overlay_failed assignment_id=%s error=%s", assignment_id, exc)
 
     try:
         regions = await extract_template_regions(

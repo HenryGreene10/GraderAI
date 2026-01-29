@@ -246,6 +246,36 @@ def _area(box: Tuple[float, float, float, float]) -> float:
     return float(box[2] * box[3])
 
 
+def _iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax1, ay1 = ax + aw, ay + ah
+    bx1, by1 = bx + bw, by + bh
+    inter_w = max(0.0, min(ax1, bx1) - max(ax, bx))
+    inter_h = max(0.0, min(ay1, by1) - max(ay, by))
+    inter = inter_w * inter_h
+    if inter <= 0:
+        return 0.0
+    union = _area(a) + _area(b) - inter
+    return inter / union if union else 0.0
+
+
+def _suppress_overlaps(
+    boxes: List[Tuple[float, float, float, float]],
+    threshold: float = 0.85,
+) -> Tuple[List[int], int]:
+    order = sorted(range(len(boxes)), key=lambda i: _area(boxes[i]))
+    kept: List[int] = []
+    removed = 0
+    for idx in order:
+        if any(_iou(boxes[idx], boxes[kept_idx]) > threshold for kept_idx in kept):
+            removed += 1
+            continue
+        kept.append(idx)
+    kept.sort()
+    return kept, removed
+
+
 async def extract_template_regions(
     image_bytes: bytes,
     ocr_func,
@@ -278,8 +308,26 @@ async def extract_template_regions(
                 ratio = _area(answer_boxes[idx]) / region_area if region_area else 0.0
                 if ratio <= 0.6:
                     filtered.append(idx)
-            if len(filtered) == 1:
+            if filtered:
+                removed = len(inside) - len(filtered)
+                if removed:
+                    logger.info(
+                        "template_answer_box_area_filter region_index=%s removed=%s",
+                        region_index,
+                        removed,
+                    )
                 inside = filtered
+        removed_nms = 0
+        if len(inside) > 1:
+            subset = [answer_boxes[idx] for idx in inside]
+            kept, removed_nms = _suppress_overlaps(subset, threshold=0.85)
+            if removed_nms:
+                logger.info(
+                    "template_answer_box_nms region_index=%s removed=%s",
+                    region_index,
+                    removed_nms,
+                )
+            inside = [inside[idx] for idx in kept]
         if len(inside) > 1:
             debug = {
                 "image_size": image_size,
@@ -288,6 +336,7 @@ async def extract_template_regions(
                 "region": region,
                 "answer_boxes_count": len(inside),
                 "answer_boxes": [answer_boxes[idx] for idx in inside],
+                "removed_overlaps": removed_nms,
             }
             raise TemplateValidationError(
                 "Multiple answer boxes found inside one region. Use one answer box per question region.",
