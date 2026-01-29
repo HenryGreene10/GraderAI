@@ -19,6 +19,8 @@ from .scanner import MIN_DIM_PX, MAX_DIM_PX
 
 logger = logging.getLogger(__name__)
 
+GIANT_REGION_RATIO = 0.35
+
 
 @dataclass
 class TemplateRegionV1:
@@ -130,18 +132,23 @@ def _find_rects(
     min_w: int,
     min_h: int,
     aspect_range: Tuple[float, float],
+    min_rectangularity: float = 0.55,
 ) -> List[Tuple[float, float, float, float]]:
     cnts = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = cnts[0] if len(cnts) == 2 else cnts[1]
     rects: List[Tuple[float, float, float, float]] = []
     for contour in contours:
+        contour_area = float(cv2.contourArea(contour))
         peri = cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-        if len(approx) < 4:
+        if len(approx) < 4 and contour_area <= 0:
             continue
         x, y, w, h = cv2.boundingRect(approx)
         area = float(w * h)
         if area < img_area * min_area_ratio or area > img_area * max_area_ratio:
+            continue
+        rectangularity = contour_area / area if area else 0.0
+        if rectangularity < min_rectangularity:
             continue
         if w < min_w or h < min_h:
             continue
@@ -161,9 +168,9 @@ def detect_question_regions(image_bytes: bytes) -> List[Tuple[float, float, floa
     thresh = cv2.adaptiveThreshold(
         blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, 5
     )
-    kernel_size = _adaptive_kernel(min(gray.shape[:2]), 0.02, 7, 31)
+    kernel_size = _adaptive_kernel(min(gray.shape[:2]), 0.015, 5, 25)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     img_h, img_w = image.shape[:2]
     img_area = float(img_w * img_h)
@@ -178,6 +185,7 @@ def detect_question_regions(image_bytes: bytes) -> List[Tuple[float, float, floa
         min_h=min_h,
         aspect_range=(0.2, 5.0),
     )
+    rects = _filter_giant_regions(rects, img_area)
     if rects:
         return rects
 
@@ -185,7 +193,7 @@ def detect_question_regions(image_bytes: bytes) -> List[Tuple[float, float, floa
     edges = cv2.dilate(edges, None, iterations=2)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return _find_rects(
+    rects = _find_rects(
         edges,
         img_area,
         min_area_ratio=0.02,
@@ -194,6 +202,30 @@ def detect_question_regions(image_bytes: bytes) -> List[Tuple[float, float, floa
         min_h=min_h,
         aspect_range=(0.2, 5.5),
     )
+    return _filter_giant_regions(rects, img_area)
+
+
+def _filter_giant_regions(
+    rects: List[Tuple[float, float, float, float]],
+    img_area: float,
+    threshold: float = GIANT_REGION_RATIO,
+) -> List[Tuple[float, float, float, float]]:
+    filtered: List[Tuple[float, float, float, float]] = []
+    removed = 0
+    for rect in rects:
+        area_ratio = _area(rect) / img_area if img_area else 0.0
+        if area_ratio > threshold:
+            removed += 1
+            logger.info(
+                "template_region_giant_guard removed=1 ratio=%.3f rect=%s",
+                area_ratio,
+                rect,
+            )
+            continue
+        filtered.append(rect)
+    if removed:
+        logger.info("template_region_giant_guard removed_total=%s", removed)
+    return filtered
 
 
 def detect_answer_boxes(image_bytes: bytes) -> List[Tuple[float, float, float, float]]:
@@ -281,7 +313,8 @@ async def extract_template_regions(
     ocr_func,
     *,
     image_size: Optional[Tuple[int, int]] = None,
-) -> List[TemplateRegionV1]:
+) -> Tuple[List[TemplateRegionV1], List[Dict[str, object]]]:
+    warnings: List[Dict[str, object]] = []
     regions = detect_question_regions(image_bytes)
     if not regions:
         raise ValueError(
@@ -292,6 +325,35 @@ async def extract_template_regions(
         raise ValueError(
             "Answer box not found inside region Q?. Please draw a solid box around the final answer inside each region."
         )
+
+    if image_size is None:
+        with Image.open(BytesIO(image_bytes)) as img:
+            image_size = img.size
+    img_w = float(image_size[0] if image_size else 0)
+    img_h = float(image_size[1] if image_size else 0)
+    img_area = img_w * img_h if img_w and img_h else 0.0
+
+    if len(regions) == 1 and len(answer_boxes) > 1 and img_area:
+        rx, ry, rw, rh = regions[0]
+        region_ratio = _area(regions[0]) / img_area
+        inside = [box for box in answer_boxes if _contains(regions[0], box)]
+        if region_ratio > GIANT_REGION_RATIO and len(inside) >= 2:
+            pad_top, pad_lr, pad_bottom = 150, 80, 80
+            new_regions: List[Tuple[float, float, float, float]] = []
+            for box in inside:
+                bx, by, bw, bh = box
+                x0 = max(0.0, bx - pad_lr)
+                y0 = max(0.0, by - pad_top)
+                x1 = min(img_w, bx + bw + pad_lr)
+                y1 = min(img_h, by + bh + pad_bottom)
+                new_regions.append((x0, y0, x1 - x0, y1 - y0))
+            regions = new_regions
+            warnings.append({"code": "REGION_SPLIT_FALLBACK", "n_regions": len(new_regions)})
+            logger.warning(
+                "template_region_split_fallback regions=%s ratio=%.3f",
+                len(new_regions),
+                region_ratio,
+            )
 
     region_to_answer: List[Tuple[Tuple[float, float, float, float], Tuple[float, float, float, float]]] = []
     used_answers: set[int] = set()
@@ -345,6 +407,8 @@ async def extract_template_regions(
                     "code": "MULTIPLE_ANSWER_BOXES",
                     "region_index": region_index,
                     "answer_boxes_count": len(inside),
+                    "region_bbox": region,
+                    "image_size": image_size,
                 },
                 debug=debug,
             )
@@ -409,7 +473,7 @@ async def extract_template_regions(
             entry.qid = f"Q{idx}"
             entry.label_method = "order"
 
-    return entries
+    return entries, warnings
 
 
 async def _ocr_text(ocr_func, image_bytes: bytes) -> str:

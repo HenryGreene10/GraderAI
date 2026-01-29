@@ -361,7 +361,7 @@ async def upload_template(
             logger.warning("template_debug_overlay_failed assignment_id=%s error=%s", assignment_id, exc)
 
     try:
-        regions = await extract_template_regions(
+        regions, warnings = await extract_template_regions(
             template_png,
             ocr_service.extract_text,
             image_size=(template_w, template_h),
@@ -433,6 +433,7 @@ async def upload_template(
         "template_uploaded_at": template_uploaded_at,
         "boxes_detected": len(template_regions),
         "qids": [r["qid"] for r in template_regions],
+        "warnings": warnings,
     }
 
 

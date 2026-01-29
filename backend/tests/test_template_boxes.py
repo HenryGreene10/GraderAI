@@ -84,15 +84,15 @@ async def test_extract_template_regions_association():
     async def fake_ocr(*_args, **_kwargs):
         return {"text": "Q1"}
 
-    regions = await extract_template_regions(payload, fake_ocr)
+    regions, warnings = await extract_template_regions(payload, fake_ocr)
     assert len(regions) >= 3
     assert all(region.answer_box for region in regions)
+    assert warnings == []
 
 
 @pytest.mark.asyncio
 async def test_extract_template_regions_missing_regions():
     img = np.full((500, 500, 3), 255, dtype=np.uint8)
-    cv2.rectangle(img, (300, 300), (420, 360), (0, 0, 0), 5)
     buf = BytesIO()
     from PIL import Image
 
@@ -117,3 +117,19 @@ async def test_extract_template_regions_multiple_answer_boxes():
 
     assert exc.value.code == "MULTIPLE_ANSWER_BOXES"
     assert exc.value.detail["answer_boxes_count"] >= 2
+
+
+def test_detect_regions_no_merge():
+    img = np.full((900, 800, 3), 255, dtype=np.uint8)
+    regions = [
+        (60, 80, 740, 300),
+        (60, 360, 740, 580),
+    ]
+    for rect in regions:
+        _draw_dashed_rect(img, rect, thickness=2)
+    buf = BytesIO()
+    from PIL import Image
+
+    Image.fromarray(img).save(buf, format="PNG")
+    detected = detect_question_regions(buf.getvalue())
+    assert len(detected) >= 2
