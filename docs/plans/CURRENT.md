@@ -103,6 +103,15 @@ Do NOT do
 - Scan-first flow MUST NOT call legacy clamp/warp/normalization paths except the single rectify step in Ticket 2.
 - If legacy code remains, it must be bypassed for scan-first placement.
 
+## Local dev networking (phone scan, no LAN backend)
+- Start backend (loopback only):
+  `uvicorn backend.app:app --host 127.0.0.1 --port 8000`
+- Start Vite (LAN reachable):
+  `npm --prefix frontend run dev -- --host 0.0.0.0 --port 5173`
+- Set `VITE_PUBLIC_BASE_URL=http://192.168.1.26:5173` in `frontend/.env.local`.
+- Phone opens `http://192.168.1.26:5173/scan/<token>`.
+- Vite proxies `/api/*` to `http://127.0.0.1:8000`, so backend stays off-LAN.
+
 ## Debug protocol (required)
 For any failing upload, record:
 - Canonical PNG width/height (px)

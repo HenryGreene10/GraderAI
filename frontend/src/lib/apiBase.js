@@ -5,11 +5,7 @@ export function publicBase() {
 }
 
 export function apiBase() {
-  const envBase = import.meta.env.VITE_API_BASE_URL;
-  if (envBase) return envBase;
-  const { protocol, hostname, port, origin } = window.location;
-  if (!port || port !== "5173") return origin;
-  return `${protocol}//${hostname}:8000`;
+  return window.location.origin;
 }
 
 export async function getAuthHeaders() {

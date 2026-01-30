@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
+import { useToast } from "@/hooks/use-toast";
 import { apiBase } from "../lib/apiBase";
 
 function scanLabel(mode) {
@@ -12,6 +13,7 @@ function scanLabel(mode) {
 export default function ScanCapturePage() {
   const { token } = useParams();
   const fileRef = useRef(null);
+  const { toast } = useToast();
   const [mode, setMode] = useState("");
   const [status, setStatus] = useState("pending");
   const [message, setMessage] = useState("");
@@ -38,17 +40,30 @@ export default function ScanCapturePage() {
     if (!file || uploading) return;
     setUploading(true);
     setMessage("Uploading...");
+    const uploadUrl = `${apiBase()}/api/scan/${token}/upload`;
     try {
       const form = new FormData();
       form.append("file", file);
-      const resp = await fetch(`${apiBase()}/api/scan/${token}/upload`, {
+      const resp = await fetch(uploadUrl, {
         method: "POST",
         body: form,
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) {
-        const detail = data?.detail || `Upload failed: ${resp.status}`;
-        throw new Error(detail);
+        const detail = data?.detail || "Upload failed";
+        console.error("Scan upload failed", {
+          url: uploadUrl,
+          status: resp.status,
+          statusText: resp.statusText,
+        });
+        const errorMessage = `Status ${resp.status}: ${detail}`;
+        toast({
+          variant: "destructive",
+          title: "Upload failed",
+          description: errorMessage,
+        });
+        setMessage(errorMessage);
+        return;
       }
       setStatus("complete");
       if (mode === "master_key") {
@@ -58,7 +73,14 @@ export default function ScanCapturePage() {
       }
       if (fileRef.current) fileRef.current.value = "";
     } catch (err) {
-      setMessage(err?.message || "Upload failed");
+      console.error("Scan upload error", { url: uploadUrl, error: err });
+      const errorMessage = `Status network_error: ${err?.message || "Upload failed"}`;
+      toast({
+        variant: "destructive",
+        title: "Upload failed",
+        description: errorMessage,
+      });
+      setMessage(errorMessage);
     } finally {
       setUploading(false);
     }
