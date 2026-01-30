@@ -1,11 +1,6 @@
 import { supabase } from "./supabaseClient";
 
-export const API_BASE =
-  import.meta?.env?.VITE_API_BASE_URL ||
-  import.meta?.env?.VITE_BACKEND_BASE ||
-  import.meta?.env?.VITE_BACKEND_URL ||
-  import.meta?.env?.VITE_API_BASE ||
-  "http://localhost:8000";
+export const API_BASE = import.meta.env.VITE_API_BASE_URL ?? window.location.origin;
 
 export async function getAuthHeaders() {
   const { data } = await supabase.auth.getSession();

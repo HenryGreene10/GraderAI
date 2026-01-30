@@ -109,6 +109,12 @@ def scan_status(token: str):
 
 @router.post("/{token}/upload")
 async def scan_upload(token: str, file: UploadFile = File(...)):
+    logger.info(
+        "SCAN UPLOAD RECEIVED token=%s content_type=%s size=%s",
+        token,
+        getattr(file, "content_type", None),
+        getattr(file, "size", "unknown"),
+    )
     row = _load_session(token)
     status = str(row.get("status") or "pending")
     if status != "pending":
