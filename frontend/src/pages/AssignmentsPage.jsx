@@ -37,7 +37,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useToast } from "@/hooks/use-toast";
-import { API_BASE, apiFetch } from "../lib/apiBase";
+import { apiBase, apiFetch, publicBase } from "../lib/apiBase";
 import supa from "../lib/supa";
 
 const ACCEPTED_MIME = ["image/png", "image/jpeg", "application/pdf"];
@@ -342,8 +342,7 @@ export default function AssignmentsPage() {
       const data = await resp.json();
       const token = data?.token;
       if (!token) throw new Error("Missing scan token");
-      const baseUrl = import.meta.env.VITE_PUBLIC_BASE_URL ?? window.location.origin;
-      const link = `${baseUrl}/scan/${token}`;
+      const link = `${publicBase()}/scan/${token}`;
       setScanLink(link);
       setScanSession({ token, expires_at: data?.expires_at, mode });
       const qr = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(link)}`;
@@ -356,7 +355,7 @@ export default function AssignmentsPage() {
   }
 
   async function fetchScanStatus(token) {
-    const resp = await fetch(`${API_BASE}/api/scan/${token}/status`);
+    const resp = await fetch(`${apiBase()}/api/scan/${token}/status`);
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
       throw new Error(text || `Status failed: ${resp.status}`);

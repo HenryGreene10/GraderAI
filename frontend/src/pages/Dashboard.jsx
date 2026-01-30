@@ -39,6 +39,19 @@ function formatDate(value) {
   return date.toLocaleDateString();
 }
 
+async function readErrorResponse(resp) {
+  const text = await resp.text().catch(() => "");
+  let message = text;
+  try {
+    const data = JSON.parse(text);
+    message = data?.detail || data?.message || text;
+  } catch {
+    // ignore JSON parse errors
+  }
+  if (!message) message = resp.statusText || "Request failed";
+  return { status: resp.status, message };
+}
+
 export default function Dashboard() {
   const navigate = useNavigate();
   const { toast } = useToast();
@@ -73,8 +86,14 @@ export default function Dashboard() {
     try {
       const resp = await apiFetch("/api/assignments");
       if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        throw new Error(text || `Failed: ${resp.status}`);
+        const { status, message } = await readErrorResponse(resp);
+        toast({
+          variant: "destructive",
+          title: "Failed to load assignments",
+          description: `Status ${status}: ${message}`,
+        });
+        setAssignments([]);
+        return;
       }
       const data = await resp.json();
       setAssignments(data.assignments || []);
@@ -82,7 +101,7 @@ export default function Dashboard() {
       toast({
         variant: "destructive",
         title: "Failed to load assignments",
-        description: err?.message || "Try again.",
+        description: `Status network_error: ${err?.message || "Try again."}`,
       });
       setAssignments([]);
     } finally {
@@ -112,8 +131,13 @@ export default function Dashboard() {
         }),
       });
       if (!createResp.ok) {
-        const text = await createResp.text().catch(() => "");
-        throw new Error(text || `Create failed: ${createResp.status}`);
+        const { status, message } = await readErrorResponse(createResp);
+        toast({
+          variant: "destructive",
+          title: "Create failed",
+          description: `Status ${status}: ${message}`,
+        });
+        return;
       }
       const createData = await createResp.json();
       const assignmentId = createData.assignment?.id || createData.id;
@@ -132,7 +156,7 @@ export default function Dashboard() {
       toast({
         variant: "destructive",
         title: "Create failed",
-        description: err?.message || "Try again.",
+        description: `Status network_error: ${err?.message || "Try again."}`,
       });
     } finally {
       setSubmitting(false);

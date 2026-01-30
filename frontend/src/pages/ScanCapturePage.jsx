@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
-import { API_BASE } from "../lib/apiBase";
+import { apiBase } from "../lib/apiBase";
 
 function scanLabel(mode) {
   if (mode === "master_key") return "Master key";
@@ -21,7 +21,7 @@ export default function ScanCapturePage() {
     if (!token) return;
     const fetchStatus = async () => {
       try {
-        const resp = await fetch(`${API_BASE}/api/scan/${token}/status`);
+        const resp = await fetch(`${apiBase()}/api/scan/${token}/status`);
         if (!resp.ok) return;
         const data = await resp.json();
         setMode(String(data?.mode || ""));
@@ -41,7 +41,7 @@ export default function ScanCapturePage() {
     try {
       const form = new FormData();
       form.append("file", file);
-      const resp = await fetch(`${API_BASE}/api/scan/${token}/upload`, {
+      const resp = await fetch(`${apiBase()}/api/scan/${token}/upload`, {
         method: "POST",
         body: form,
       });
