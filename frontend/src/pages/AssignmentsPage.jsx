@@ -146,6 +146,9 @@ export default function AssignmentsPage() {
   const assignmentId = useMemo(() => {
     return new URLSearchParams(location.search).get("assignmentId");
   }, [location.search]);
+  const scanParam = useMemo(() => {
+    return new URLSearchParams(location.search).get("scan");
+  }, [location.search]);
 
   const [assignment, setAssignment] = useState(null);
   const [uploads, setUploads] = useState([]);
@@ -185,6 +188,7 @@ export default function AssignmentsPage() {
   const [overrideStatus, setOverrideStatus] = useState("correct");
   const [overrideNote, setOverrideNote] = useState("");
   const [overrideSaving, setOverrideSaving] = useState(false);
+  const scanAutoOpenedRef = useRef(false);
 
   const masterKeyReady = SCAN_REQUIRED
     ? Boolean(assignment?.template_storage_path)
@@ -213,6 +217,13 @@ export default function AssignmentsPage() {
     loadAssignment();
     loadUploads();
   }, [assignmentId]);
+
+  useEffect(() => {
+    if (!assignmentId || scanParam !== "master_key") return;
+    if (scanAutoOpenedRef.current) return;
+    scanAutoOpenedRef.current = true;
+    startScanSession("master_key");
+  }, [assignmentId, scanParam]);
 
   useEffect(() => {
     if (!assignmentId) return;

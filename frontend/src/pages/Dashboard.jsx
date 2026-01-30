@@ -1,7 +1,6 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import {
   Dialog,
   DialogContent,
@@ -33,33 +32,11 @@ import { useToast } from "@/hooks/use-toast";
 import { apiFetch } from "../lib/apiBase";
 import { supabase } from "../lib/supabaseClient";
 
-const ACCEPTED_MIME = ["image/png", "image/jpeg", "application/pdf"];
-const ACCEPTED_EXT = [".png", ".jpg", ".jpeg", ".pdf"];
-
 function formatDate(value) {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "-";
   return date.toLocaleDateString();
-}
-
-function formatSize(bytes) {
-  if (!bytes && bytes !== 0) return "";
-  const units = ["B", "KB", "MB", "GB"];
-  let size = bytes;
-  let idx = 0;
-  while (size >= 1024 && idx < units.length - 1) {
-    size /= 1024;
-    idx += 1;
-  }
-  return `${size.toFixed(size < 10 ? 1 : 0)} ${units[idx]}`;
-}
-
-function isAllowedFile(file) {
-  if (!file) return false;
-  if (ACCEPTED_MIME.includes(file.type)) return true;
-  const name = String(file.name || "").toLowerCase();
-  return ACCEPTED_EXT.some((ext) => name.endsWith(ext));
 }
 
 export default function Dashboard() {
@@ -72,14 +49,10 @@ export default function Dashboard() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [files, setFiles] = useState([]);
   const [submitting, setSubmitting] = useState(false);
-  const fileInputRef = useRef(null);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
-
-  const fileCount = useMemo(() => files.length, [files]);
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
@@ -91,7 +64,6 @@ export default function Dashboard() {
     if (!dialogOpen) {
       setTitle("");
       setDescription("");
-      setFiles([]);
       setSubmitting(false);
     }
   }, [dialogOpen]);
@@ -122,41 +94,10 @@ export default function Dashboard() {
     loadAssignments();
   }, []);
 
-  const addFiles = (incoming) => {
-    const list = Array.from(incoming || []);
-    if (!list.length) return;
-    const rejected = list.filter((file) => !isAllowedFile(file));
-    if (rejected.length) {
-      toast({
-        variant: "destructive",
-        title: "Unsupported file type",
-        description: "Answer key must be a PNG, JPG, or PDF.",
-      });
-    }
-    const accepted = list.filter(isAllowedFile);
-    if (!accepted.length) return;
-    setFiles([accepted[0]]);
-  };
-
-  const removeFileAt = (index) => {
-    setFiles((prev) => prev.filter((_, idx) => idx !== index));
-  };
-
-  const openPicker = () => {
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-      fileInputRef.current.click();
-    }
-  };
-
-  async function handleCreateAndUpload() {
+  async function handleCreateAssignment() {
     const trimmed = title.trim();
     if (!trimmed) {
       toast({ variant: "destructive", title: "Assignment name is required" });
-      return;
-    }
-    if (files.length === 0) {
-      toast({ variant: "destructive", title: "Add the answer key file" });
       return;
     }
 
@@ -180,29 +121,17 @@ export default function Dashboard() {
         throw new Error("Missing assignment id from server");
       }
 
-      const formData = new FormData();
-      formData.append("file", files[0]);
-
-      const uploadResp = await apiFetch(`/api/assignments/${assignmentId}/template`, {
-        method: "POST",
-        body: formData,
-      });
-      if (!uploadResp.ok) {
-        const text = await uploadResp.text().catch(() => "");
-        throw new Error(text || `Upload failed: ${uploadResp.status}`);
-      }
-
       toast({
         title: "Assignment created",
-        description: "Answer key uploaded.",
+        description: "Scan the master key to continue.",
       });
       setDialogOpen(false);
       await loadAssignments();
-      navigate(`/assignments?assignmentId=${assignmentId}`);
+      navigate(`/assignments?assignmentId=${assignmentId}&scan=master_key`);
     } catch (err) {
       toast({
         variant: "destructive",
-        title: "Create & upload failed",
+        title: "Create failed",
         description: err?.message || "Try again.",
       });
     } finally {
@@ -266,7 +195,7 @@ export default function Dashboard() {
             <DialogHeader>
               <DialogTitle>Create assignment</DialogTitle>
               <DialogDescription>
-                Name the assignment, then upload the answer key.
+                Name the assignment, then scan the master key.
               </DialogDescription>
             </DialogHeader>
 
@@ -291,56 +220,6 @@ export default function Dashboard() {
                   onChange={(e) => setDescription(e.target.value)}
                 />
               </div>
-
-              {title.trim() ? (
-                <div className="space-y-2">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <label className="text-sm font-medium">Upload answer key</label>
-                    <Badge variant="outline">Step 1 of 2: Answer Key</Badge>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept={ACCEPTED_MIME.join(",")}
-                      className="hidden"
-                      onChange={(e) => addFiles(e.target.files)}
-                    />
-                    <Button variant="secondary" type="button" onClick={openPicker}>
-                      Add file
-                    </Button>
-                    <span className="text-xs text-muted-foreground">
-                      Upload the answer key (PNG, JPG, or PDF). Student worksheets are uploaded after creation.
-                    </span>
-                  </div>
-
-                  {fileCount > 0 && (
-                    <div className="max-h-48 overflow-auto rounded-md border border-border p-2">
-                      <div className="space-y-2">
-                        {files.map((file, idx) => (
-                          <div key={`${file.name}-${file.size}`} className="flex items-center justify-between gap-2 text-sm">
-                            <div className="truncate">
-                              {file.name} <span className="text-muted-foreground">({formatSize(file.size)})</span>
-                            </div>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              type="button"
-                              onClick={() => removeFileAt(idx)}
-                            >
-                              Remove
-                            </Button>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
-                  Enter a name to select the answer key.
-                </div>
-              )}
             </div>
 
             <DialogFooter className="gap-2 sm:gap-0">
@@ -354,10 +233,10 @@ export default function Dashboard() {
               </Button>
               <Button
                 type="button"
-                onClick={handleCreateAndUpload}
-                disabled={!title.trim() || files.length === 0 || submitting}
+                onClick={handleCreateAssignment}
+                disabled={!title.trim() || submitting}
               >
-                {submitting ? "Uploading..." : "Create & Upload Answer Key"}
+                {submitting ? "Creating..." : "Create assignment"}
               </Button>
             </DialogFooter>
           </DialogContent>
@@ -378,7 +257,7 @@ export default function Dashboard() {
             {assignments.length === 0 && !loading && (
               <TableRow>
                 <TableCell colSpan={4} className="text-center text-muted-foreground">
-                  No assignments yet. Create one to start uploading.
+                  No assignments yet. Create one to start scanning.
                 </TableCell>
               </TableRow>
             )}

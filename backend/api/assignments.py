@@ -34,6 +34,11 @@ router = APIRouter(prefix="/api/assignments", tags=["assignments"])
 TEMPLATE_MIN_LONG_EDGE = 1200
 logger = logging.getLogger(__name__)
 
+try:  # pragma: no cover - optional postgrest error typing
+    from postgrest.exceptions import APIError
+except Exception:  # pragma: no cover
+    APIError = Exception  # type: ignore
+
 ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".pdf"}
 ALLOWED_MIME = {
     "image/png": ".png",
@@ -50,6 +55,20 @@ class AssignmentCreate(BaseModel):
 
 class ScanSessionCreate(BaseModel):
     mode: Literal["master_key", "student"]
+
+
+def _scan_sessions_missing(exc: Exception) -> bool:
+    err = getattr(exc, "message", None)
+    if isinstance(err, dict):
+        code = str(err.get("code") or "")
+        msg = str(err.get("message") or err.get("details") or "")
+        if code in {"PGRST205", "PGRST204", "42P01"}:
+            return True
+        lower = msg.lower()
+        if "scan_sessions" in lower and ("schema cache" in lower or "does not exist" in lower or "not found" in lower):
+            return True
+    text = str(exc).lower()
+    return "scan_sessions" in text and ("schema cache" in text or "does not exist" in text or "not found" in text)
 
 
 def _assignment_payload(row: dict, uploads_count: int = 0) -> dict:
@@ -237,7 +256,25 @@ def create_scan_session(
     sb = require_supabase()
     try:
         sb.table("scan_sessions").insert(payload).execute()
+    except APIError as exc:
+        if _scan_sessions_missing(exc):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "scan_sessions table missing. Apply migrations/2026-01-30_add_scan_sessions.sql "
+                    "to your Supabase project and reload schema cache."
+                ),
+            )
+        raise HTTPException(status_code=500, detail=f"scan_session_create_failed: {exc}")
     except Exception as exc:
+        if _scan_sessions_missing(exc):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "scan_sessions table missing. Apply migrations/2026-01-30_add_scan_sessions.sql "
+                    "to your Supabase project and reload schema cache."
+                ),
+            )
         raise HTTPException(status_code=500, detail=f"scan_session_create_failed: {exc}")
     logger.info(
         "scan_session_created assignment_id=%s owner_id=%s mode=%s session_id=%s expires_at=%s",
