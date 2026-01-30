@@ -342,7 +342,8 @@ export default function AssignmentsPage() {
       const data = await resp.json();
       const token = data?.token;
       if (!token) throw new Error("Missing scan token");
-      const link = `${window.location.origin}/scan/${token}`;
+      const baseUrl = import.meta.env.VITE_PUBLIC_BASE_URL ?? window.location.origin;
+      const link = `${baseUrl}/scan/${token}`;
       setScanLink(link);
       setScanSession({ token, expires_at: data?.expires_at, mode });
       const qr = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(link)}`;
