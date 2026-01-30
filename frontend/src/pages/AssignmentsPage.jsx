@@ -37,13 +37,14 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useToast } from "@/hooks/use-toast";
-import { apiFetch } from "../lib/apiBase";
+import { API_BASE, apiFetch } from "../lib/apiBase";
 import supa from "../lib/supa";
 
 const ACCEPTED_MIME = ["image/png", "image/jpeg", "application/pdf"];
 const ACCEPTED_EXT = [".png", ".jpg", ".jpeg", ".pdf"];
 const TEMPLATE_MIME = ["image/png", "image/jpeg"];
 const TEMPLATE_EXT = [".png", ".jpg", ".jpeg"];
+const SCAN_REQUIRED = true;
 
 function isAllowedFile(file) {
   if (!file) return false;
@@ -71,6 +72,15 @@ function statusLabel(status) {
   if (normalized === "pending" || normalized === "uploaded") return "Uploaded";
   if (normalized === "processing" || normalized === "running") return "Processing";
   if (normalized === "failed" || normalized === "error") return "Error";
+  return normalized.replace(/_/g, " ");
+}
+
+function scanStatusLabel(status) {
+  const normalized = String(status || "pending").toLowerCase();
+  if (normalized === "complete") return "Complete";
+  if (normalized === "expired") return "Expired";
+  if (normalized === "error") return "Error";
+  if (normalized === "pending") return "Waiting";
   return normalized.replace(/_/g, " ");
 }
 
@@ -147,6 +157,16 @@ export default function AssignmentsPage() {
   const fileInputRef = useRef(null);
   const masterKeyInputRef = useRef(null);
   const [masterKeyUploading, setMasterKeyUploading] = useState(false);
+  const [scanDialogOpen, setScanDialogOpen] = useState(false);
+  const [scanMode, setScanMode] = useState("student");
+  const [scanSession, setScanSession] = useState(null);
+  const [scanQrUrl, setScanQrUrl] = useState("");
+  const [scanLink, setScanLink] = useState("");
+  const [scanStatus, setScanStatus] = useState("pending");
+  const [scanResultId, setScanResultId] = useState(null);
+  const [scanError, setScanError] = useState("");
+  const [scanLoading, setScanLoading] = useState(false);
+  const [scanCompleted, setScanCompleted] = useState(false);
 
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerTab, setViewerTab] = useState("original");
@@ -166,9 +186,9 @@ export default function AssignmentsPage() {
   const [overrideNote, setOverrideNote] = useState("");
   const [overrideSaving, setOverrideSaving] = useState(false);
 
-  const masterKeyReady = Boolean(
-    assignment?.template_storage_path && assignment?.template_regions_count
-  );
+  const masterKeyReady = SCAN_REQUIRED
+    ? Boolean(assignment?.template_storage_path)
+    : Boolean(assignment?.template_storage_path && assignment?.template_regions_count);
   const masterKeyFilename = assignment?.template_original_name
     || (assignment?.template_storage_path || "").split("/").pop()
     || "";
@@ -203,6 +223,45 @@ export default function AssignmentsPage() {
     }, 4000);
     return () => clearInterval(timer);
   }, [uploads, assignmentId]);
+
+  useEffect(() => {
+    if (!scanDialogOpen || !scanSession?.token) return;
+    if (["complete", "expired", "error"].includes(scanStatus)) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const data = await fetchScanStatus(scanSession.token);
+        if (!active) return;
+        const status = data?.status || "pending";
+        setScanStatus(status);
+        if (data?.resulting_upload_id) {
+          setScanResultId(data.resulting_upload_id);
+        }
+        if (status === "expired") {
+          setScanError("Scan session expired");
+        }
+        if (status === "complete" && !scanCompleted) {
+          setScanCompleted(true);
+          if (scanSession.mode === "master_key") {
+            await loadAssignment();
+          }
+          await loadUploads({ silent: true });
+          toast({
+            title: scanSession.mode === "master_key" ? "Master key saved" : "Scan saved",
+          });
+        }
+      } catch (err) {
+        if (!active) return;
+        setScanError(err?.message || "Scan status failed");
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 2000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [scanDialogOpen, scanSession?.token, scanSession?.mode, scanStatus, scanCompleted]);
 
   async function loadAssignment() {
     try {
@@ -244,6 +303,62 @@ export default function AssignmentsPage() {
       if (!silent) setUploads([]);
     } finally {
       if (!silent) setLoading(false);
+    }
+  }
+
+  async function startScanSession(mode) {
+    if (!assignmentId) return;
+    setScanMode(mode);
+    setScanDialogOpen(true);
+    setScanLoading(true);
+    setScanError("");
+    setScanQrUrl("");
+    setScanLink("");
+    setScanSession(null);
+    setScanStatus("pending");
+    setScanResultId(null);
+    setScanCompleted(false);
+    try {
+      const resp = await apiFetch(`/api/assignments/${assignmentId}/scan-sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      if (!resp.ok) {
+        const text = await readErrorMessage(resp);
+        throw new Error(text || `Failed: ${resp.status}`);
+      }
+      const data = await resp.json();
+      const token = data?.token;
+      if (!token) throw new Error("Missing scan token");
+      const link = `${window.location.origin}/scan/${token}`;
+      setScanLink(link);
+      setScanSession({ token, expires_at: data?.expires_at, mode });
+      const qr = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(link)}`;
+      setScanQrUrl(qr);
+    } catch (err) {
+      setScanError(err?.message || "Failed to create scan session");
+    } finally {
+      setScanLoading(false);
+    }
+  }
+
+  async function fetchScanStatus(token) {
+    const resp = await fetch(`${API_BASE}/api/scan/${token}/status`);
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(text || `Status failed: ${resp.status}`);
+    }
+    return resp.json();
+  }
+
+  async function copyScanLink() {
+    if (!scanLink) return;
+    try {
+      await navigator.clipboard.writeText(scanLink);
+      toast({ title: "Scan link copied" });
+    } catch {
+      toast({ variant: "destructive", title: "Copy failed" });
     }
   }
 
@@ -551,6 +666,14 @@ export default function AssignmentsPage() {
   }
 
   const handleUploadDialogOpen = (nextOpen) => {
+    if (SCAN_REQUIRED) {
+      toast({
+        variant: "destructive",
+        title: "Scan required",
+        description: "Use Scan Students to capture worksheets.",
+      });
+      return;
+    }
     if (nextOpen && !masterKeyReady) {
       toast({
         variant: "destructive",
@@ -585,73 +708,130 @@ export default function AssignmentsPage() {
           )}
         </div>
         <div className="flex items-center gap-2">
-          <Dialog open={uploadOpen} onOpenChange={handleUploadDialogOpen}>
-            <DialogTrigger asChild>
-              <Button disabled={!masterKeyReady} title={!masterKeyReady ? "Upload master key first" : undefined}>
-                Upload student worksheets
-              </Button>
-            </DialogTrigger>
-            <DialogContent className="sm:max-w-[520px]">
-              <DialogHeader>
-                <DialogTitle>Upload student worksheets</DialogTitle>
-                <DialogDescription>
-                  Add more student files to this assignment.
-                </DialogDescription>
-              </DialogHeader>
-
-              <div className="space-y-3">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple
-                  accept={ACCEPTED_MIME.join(",")}
-                  className="hidden"
-                  onChange={(e) => addFiles(e.target.files)}
-                />
-                <Button variant="secondary" type="button" onClick={openPicker} disabled={!masterKeyReady}>
-                  Add files
+          {!SCAN_REQUIRED && (
+            <Dialog open={uploadOpen} onOpenChange={handleUploadDialogOpen}>
+              <DialogTrigger asChild>
+                <Button disabled={!masterKeyReady} title={!masterKeyReady ? "Upload master key first" : undefined}>
+                  Upload student worksheets
                 </Button>
+              </DialogTrigger>
+              <DialogContent className="sm:max-w-[520px]">
+                <DialogHeader>
+                  <DialogTitle>Upload student worksheets</DialogTitle>
+                  <DialogDescription>
+                    Add more student files to this assignment.
+                  </DialogDescription>
+                </DialogHeader>
 
-                {files.length > 0 ? (
-                  <div className="max-h-48 overflow-auto rounded-md border border-border p-2">
-                    <div className="space-y-2">
-                      {files.map((file, idx) => (
-                        <div key={`${file.name}-${file.size}`} className="flex items-center justify-between gap-2 text-sm">
-                          <div className="truncate">{file.name}</div>
-                          <Button size="sm" variant="ghost" onClick={() => removeFileAt(idx)}>
-                            Remove
-                          </Button>
-                        </div>
-                      ))}
+                <div className="space-y-3">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    accept={ACCEPTED_MIME.join(",")}
+                    className="hidden"
+                    onChange={(e) => addFiles(e.target.files)}
+                  />
+                  <Button variant="secondary" type="button" onClick={openPicker} disabled={!masterKeyReady}>
+                    Add files
+                  </Button>
+
+                  {files.length > 0 ? (
+                    <div className="max-h-48 overflow-auto rounded-md border border-border p-2">
+                      <div className="space-y-2">
+                        {files.map((file, idx) => (
+                          <div key={`${file.name}-${file.size}`} className="flex items-center justify-between gap-2 text-sm">
+                            <div className="truncate">{file.name}</div>
+                            <Button size="sm" variant="ghost" onClick={() => removeFileAt(idx)}>
+                              Remove
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                ) : (
-                  <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
-                    PNG, JPG, or PDF only.
-                  </div>
-                )}
-              </div>
+                  ) : (
+                    <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
+                      PNG, JPG, or PDF only.
+                    </div>
+                  )}
+                </div>
 
-              <DialogFooter className="gap-2 sm:gap-0">
-                <Button variant="outline" onClick={() => setUploadOpen(false)} disabled={uploading}>
-                  Cancel
-                </Button>
-                <Button onClick={handleUpload} disabled={files.length === 0 || uploading || !masterKeyReady}>
-                  {uploading ? "Uploading..." : "Upload"}
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
+                <DialogFooter className="gap-2 sm:gap-0">
+                  <Button variant="outline" onClick={() => setUploadOpen(false)} disabled={uploading}>
+                    Cancel
+                  </Button>
+                  <Button onClick={handleUpload} disabled={files.length === 0 || uploading || !masterKeyReady}>
+                    {uploading ? "Uploading..." : "Upload"}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+          )}
           <Button variant="destructive" onClick={() => setDeleteAssignmentOpen(true)}>
             Delete assignment
           </Button>
         </div>
       </header>
 
+      <Dialog open={scanDialogOpen} onOpenChange={setScanDialogOpen}>
+        <DialogContent className="sm:max-w-[520px]">
+          <DialogHeader>
+            <DialogTitle>
+              {scanMode === "master_key" ? "Scan Master Key" : "Scan Students"}
+            </DialogTitle>
+            <DialogDescription>
+              Scan this QR code with your phone to open the scanner.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="flex flex-col items-center gap-3">
+              {scanLoading && (
+                <div className="text-sm text-muted-foreground">Generating QR...</div>
+              )}
+              {!scanLoading && scanQrUrl && (
+                <img src={scanQrUrl} alt="Scan QR" className="h-56 w-56" />
+              )}
+              {!scanLoading && !scanQrUrl && (
+                <div className="text-sm text-muted-foreground">QR unavailable</div>
+              )}
+              {scanLink && (
+                <div className="text-xs text-muted-foreground break-all text-center">
+                  {scanLink}
+                </div>
+              )}
+              {scanLink && (
+                <Button variant="outline" size="sm" onClick={copyScanLink}>
+                  Copy link
+                </Button>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <Badge variant="secondary">{scanStatusLabel(scanStatus)}</Badge>
+              {scanSession?.expires_at && (
+                <span className="text-muted-foreground">
+                  Expires {formatTimestamp(scanSession.expires_at)}
+                </span>
+              )}
+              {scanResultId && (
+                <span className="text-muted-foreground">Upload {scanResultId}</span>
+              )}
+            </div>
+            {scanError && (
+              <div className="text-sm text-destructive">{scanError}</div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setScanDialogOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <section className="rounded-lg border border-border p-4 space-y-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h2 className="text-lg font-semibold">Step 1: Upload Master Key (Required)</h2>
+            <h2 className="text-lg font-semibold">Step 1: Scan Master Key (Required)</h2>
             <ul className="mt-2 space-y-1 text-sm text-muted-foreground">
               <li>1) Dashed/thin outline around EACH question region (includes Q label + answer box)</li>
               <li>2) Circled Q1/Q2… label inside the region</li>
@@ -660,16 +840,28 @@ export default function AssignmentsPage() {
             </ul>
           </div>
           <div className="flex items-center gap-2">
-            <input
-              ref={masterKeyInputRef}
-              type="file"
-              accept={TEMPLATE_MIME.join(",")}
-              className="hidden"
-              onChange={(e) => handleMasterKeySelected(e.target.files?.[0])}
-            />
-            <Button variant="secondary" onClick={openMasterKeyPicker} disabled={masterKeyUploading}>
-              {assignment?.template_storage_path ? "Replace Master Key" : "Upload Master Key"}
-            </Button>
+            {SCAN_REQUIRED ? (
+              <Button
+                variant="secondary"
+                onClick={() => startScanSession("master_key")}
+                disabled={scanLoading && scanMode === "master_key"}
+              >
+                {assignment?.template_storage_path ? "Rescan Master Key" : "Scan Master Key"}
+              </Button>
+            ) : (
+              <>
+                <input
+                  ref={masterKeyInputRef}
+                  type="file"
+                  accept={TEMPLATE_MIME.join(",")}
+                  className="hidden"
+                  onChange={(e) => handleMasterKeySelected(e.target.files?.[0])}
+                />
+                <Button variant="secondary" onClick={openMasterKeyPicker} disabled={masterKeyUploading}>
+                  {assignment?.template_storage_path ? "Replace Master Key" : "Upload Master Key"}
+                </Button>
+              </>
+            )}
           </div>
         </div>
         {assignment?.template_storage_path ? (
@@ -689,17 +881,25 @@ export default function AssignmentsPage() {
           </div>
         ) : (
           <div className="text-sm text-muted-foreground">
-            No Master Key yet. Upload one to enable deterministic grading.
+            No Master Key yet. Scan one to enable deterministic grading.
           </div>
         )}
       </section>
 
       <section className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Step 2: Upload Student Worksheets</h2>
-          {!masterKeyReady && (
-            <Badge variant="outline">Upload master key first</Badge>
-          )}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-lg font-semibold">Step 2: Scan Student Worksheets</h2>
+          <div className="flex items-center gap-2">
+            {!masterKeyReady && (
+              <Badge variant="outline">Scan master key first</Badge>
+            )}
+            <Button
+              onClick={() => startScanSession("student")}
+              disabled={!masterKeyReady || (scanLoading && scanMode === "student")}
+            >
+              Scan Students
+            </Button>
+          </div>
         </div>
         {latestUpload && (
           <div className="text-sm text-muted-foreground">
@@ -711,7 +911,7 @@ export default function AssignmentsPage() {
         )}
         {!masterKeyReady && (
           <div className="text-sm text-muted-foreground">
-            Student uploads unlock after the master key has been validated.
+            Student scans unlock after the master key has been saved.
           </div>
         )}
 
@@ -736,7 +936,7 @@ export default function AssignmentsPage() {
             {!loading && uploads.length === 0 && (
               <TableRow>
                 <TableCell colSpan={4} className="text-center text-muted-foreground">
-                  No uploads yet. Add files to start OCR and grading.
+                  No scans yet. Scan a worksheet to start OCR and grading.
                 </TableCell>
               </TableRow>
             )}

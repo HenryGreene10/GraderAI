@@ -1,155 +1,113 @@
-# Current Plan (GraderAI MVP)
+# Current Plan (GraderAI) — Scan-Required Pivot
 
-## Current objective
-Beta-ready reliability + consistency: upload → OCR → grade → marked artifact → teacher review/override → export. Ensure viewer consistency (Original vs Marked) and never silently skip mark placement.
+## Why this plan is changing
+- Misaligned marks + distorted PDFs come from inconsistent coordinate spaces and hidden resizes.
+- A scan-first (phone-as-scanner) flow lets us control capture, rectify once, and treat one artifact as truth.
+- We are committing to **SCAN-FIRST + SCAN-REQUIRED** for production (no random photo uploads).
 
-## Supabase setup checklist
-- Status: DONE / verified for local dev.
-- Migration applied: `migrations/2025-01-21_init_schema.sql`.
-- Buckets created: `submissions`, `graded-pdfs`, `overlays`.
-- RLS policies verified:
-  - Tables: owner/teacher rows scoped by `auth.uid()`.
-  - Storage: enforce `auth.uid()` prefix in object paths and bucket name allowlists.
+## Policy: Scan-Required
+- Capture must go through **QR → mobile scanner page → upload**.
+- Teacher convenience is handled by **rapid capture loop (tap-tap)** + optional retake prompts.
 
-## Local dev setup (short)
-- Backend env includes `SUPABASE_JWT_SECRET` (JWT auth).
-- Frontend uses `frontend/.env.local` with `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_API_BASE_URL`.
-- Do not commit `.env.local`.
+## Canonical artifact storage mapping (invariant)
+- For scan-first flows, `uploads.normalized_image_path` **is the canonical scan_png**.
+- `uploads.normalized_width_px` / `uploads.normalized_height_px` **must match the actual PNG dimensions**.
+- OCR / template / grading / overlay / PDF **MUST use normalized_* only** for placement (no other image inputs).
+- Naming can change later to `scan_*`, **no schema change in this pivot**.
 
-## Backend env vars
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `SUPABASE_JWT_SECRET`
-- `SUBMISSIONS_BUCKET`
-- `GRADED_BUCKET`
-- `OVERLAYS_BUCKET`
-- `CORS_ALLOW_ORIGINS`
-- Optional OCR: `OCR_*`
+## Scan session implementation (table-based)
+- Add a minimal Supabase table `scan_sessions` with columns:
+  `id (uuid), token (random), owner_id, assignment_id, mode ('master_key'|'student'), status, created_at, expires_at, resulting_upload_id (nullable)`.
+- TTL: `expires_at` <= 15 minutes; backend rejects expired tokens.
+- RLS: owner_id = auth.uid() can create/read their sessions; token-use is validated server-side (no broad access).
+- Keep it minimal—no extra fields.
 
-## Tickets
+## Scan modes + write targets (explicit)
+- **master_key scan** writes:
+  - Store canonical PNG under templates at `submissions/{owner}/templates/{assignment}.png`.
+  - Update `assignments.template_storage_path` and `template_width_px/height_px` from canonical PNG.
+- **student scan** writes:
+  - Create uploads row; store canonical `normalized_image_path` + width/height.
+  - Trigger OCR + grading pipeline **against canonical PNG**.
+- Artifacts generated:
+  - `submissions/{owner}/templates/{assignment}.png` (master key)
+  - `submissions/{owner}/normalized/{upload}.png` + width/height (student)
+  - `graded-pdfs/{owner}/{upload}.pdf` + `overlays/{owner}/{upload}.json`
 
-### Ticket 1 — Supabase foundation (DONE)
-Scope: schema, buckets, RLS, and verified backend read/write via service role.
-Acceptance checks
-- Migration applied and schema matches `migrations/2025-01-21_init_schema.sql`.
-- Buckets exist with expected names.
-- RLS policies enforce `auth.uid()` ownership and storage path prefix constraints.
-- Backend read/write succeeds to tables and buckets.
+## Tickets (4–5 total, minimal-risk ordering)
 
-### Ticket 2 — Local dev wiring (DONE)
-Scope: local env wiring for frontend and backend auth.
-Acceptance checks
-- `frontend/.env.local` drives Supabase client via `import.meta.env`.
-- `VITE_API_BASE_URL` routes frontend to local backend.
-- App no longer shows "Missing Supabase env" when vars are present.
-
-### Ticket 3 — Uploads UI becomes source of truth (DONE)
-Scope: the uploads list is the canonical view for storage + DB state.
-Acceptance checks
-- Uploaded items appear in the UI list.
-- Preview works for each upload.
-- Delete removes the storage object and its DB row.
-Notes
-- Upload succeeds and preview shows the original file.
-- Delete is available.
-- Known non-blocking toast issue deferred.
-
-### Ticket 4 — OCR pipeline (internal only) (DONE)
-Scope: auto-run OCR after upload for downstream grading only.
-Acceptance checks
-- Upload triggers OCR automatically.
-- OCR result is persisted and accessible to backend grading logic.
-- No frontend UI added for viewing OCR output.
-Evidence
-- Uploads row `d818c641-af5e-4dcf-8369-78b991b1823f` shows `ocr_status=done`, `ocr_text` populated, `ocr_error` null, `ocr_boxes` populated (Azure Read).
-Known OCR quirks
-- OCR may confuse commas/periods and spelling; grading must be tolerant and rely on rubric rules + context rather than exact string match.
-
-### Ticket 5 — Grade + PDF (DONE)
-Scope: use OCR output to identify questions/answers and generate a marked PDF.
-Acceptance checks
-- Teacher sees the original uploaded file and the marked PDF.
-Note
-- Layout/region accuracy is approximate in MVP; refinement deferred.
-
-### Ticket 6A — Review state (DONE)
-Scope: teacher can set status to Reviewed / Flagged / Overridden (review-level) with a note; does NOT change grades or PDFs.
-Acceptance checks
-- State + note persist in DB and survive refresh.
-- Badge updates to Reviewed/Flagged/Overridden in the uploads list.
-- Badge persists; controls only show when `pdf_ready`.
-
-### Ticket 6B — Real overrides (no PDF editor) (NEXT — Beta-ready minimal)
+### Ticket 1 — Scan Sessions + QR + Mobile Capture (Scan Required)
 Scope
-- Teacher sets final score override (e.g., 3/4).
-- Optional per-question toggles (correct/incorrect) in a simple list; no drawing.
-- Note required when overriding score.
-- Store who/when/note; UI shows “Final: 3/4 (Overridden)”.
-- Optional later (explicitly not required now): regenerate marked PDF with a small “override stamp” box (do not redraw all marks).
+- Implement scan session creation + QR display on desktop.
+- Mobile scanner page for `/scan/<token>` with rapid capture loop.
+- Upload stores canonical PNG + width/height; links to assignment/upload.
 Acceptance checks
-- Override changes the displayed final score (and exported metadata if present).
-- Per-question toggles persist and are visible on refresh.
-- Clear state in uploads list + viewer; tooltip shows note + timestamp.
-- No PDF editing UI.
+- QR opens scanner; scan completes and desktop updates.
+- Capture loop allows fast multi-capture loop (each capture = one upload row); optional retake prompt.
+Evidence to capture
+- Session logs (token, mode, assignment_id, status transitions).
+- Stored canonical PNG path + width/height.
+Do NOT do
+- No alternate upload entry points in production flow.
+- No image rectification yet.
 
-### Ticket 7 — Frontend polish + automated workflow (DONE)
+### Ticket 2 — Rectify + Quality Gate (Retake UX)
 Scope
-1) Workflow automation (Option A)
-   - Auto-run grade + marked PDF generation after OCR completes.
-   - Remove or hide per-row “Generate marked PDF” button (deprecated).
-   - Row states reflect progress: Uploading → OCR… → Grading… → PDF ready (or Error).
-   - Disable actions during processing; show loading indicators.
-2) In-app document viewer (same window)
-   - Replace “Open marked PDF” new tab behavior with an in-app viewer (modal/drawer).
-   - Viewer supports Original + Marked PDF (tabs/toggle).
-   - Download controls inside viewer; optional “Open in new tab” link is secondary.
-3) Actions cleanup (reduce button clutter)
-   - One primary per-row action: “View”.
-   - Secondary actions in overflow menu (⋯): Review/Override (6A), Download original, Download marked PDF, Delete (confirm).
-   - Delete is destructive and always confirmed.
-4) UX quality / consistency
-   - Fix console warnings / encoding issues.
-   - Improve empty states (no assignments / no uploads).
-   - Consistent toast messages for success/failure.
-   - Better responsive spacing for action area.
-5) Safety / correctness guards
-   - If PDF not ready, hide/disable view-marked and review actions.
-   - Show clear error status + “Retry” action for failed OCR/grade/PDF (retry can be stubbed initially).
+- Corner detect + perspective warp to produce canonical PNG.
+- Blur/edge/contrast checks; require retake if below threshold.
 Acceptance checks
-- Uploading a file automatically results in a marked PDF without any manual “Generate” action.
-- Marked PDF can be viewed in-app without opening a new browser tab/window.
-- Row actions are simplified (View + overflow); no more 5-button row clusters.
-- Status/progress chips update correctly and persist after refresh.
-- No obvious console warnings; key flows show clear success/error messaging.
-Evidence
-- Auto-run grade + PDF after OCR.
-- In-app viewer with Original/Marked tabs.
-- Actions simplified: View + overflow menu.
-- Status chips / processing states are visible and consistent.
+- Rectified PNG looks aligned; low-quality scans prompt retake.
+Evidence to capture
+- Before/after images for 2 scans + quality metrics.
+Do NOT do
+- No 3rd‑party scanner SDK unless OpenCV path is insufficient.
 
-### Ticket 8 — Viewer consistency (NEXT)
-Goal: make Original and Marked use the same rendering surface so the before/after experience is clean.
-Preferred approach: normalize Originals to PDF for viewing.
-- If upload is image/*, generate “normalized original PDF” (single-page) for viewer so both tabs are PDFs.
-- Viewer uses the same PDF renderer for both.
-- “Download original” still downloads the true original file.
+### Ticket 3 — Wire Canonical PNG Through OCR + Template + Grading
+Scope
+- OCR input is canonical PNG only.
+- Template detection and grading use canonical PNG coordinates only.
 Acceptance checks
-- Original and Marked tabs have consistent chrome/zoom behavior and layout.
-- No new-tab by default; keep optional “Open in new tab” as secondary.
-- Works for image uploads and pdf uploads.
+- OCR/Template overlays align to canonical PNG.
+- Mark placement matches expected locations on known scans.
+Evidence to capture
+- OCR overlay PNG + template overlay PNG on canonical PNG.
+Do NOT do
+- No new OCR provider or LLM work.
+- No fallback to legacy inputs for placement.
 
-### Ticket 9 — Mark placement reliability + better mark style (NEXT)
-Reliability
-- Never silently skip a question mark placement.
-- If any grade item cannot be placed (missing anchor/box), set `needs_review=true` and include `unplaced_items` metadata (e.g., ["Q4"]).
-- UI shows a small warning in viewer: “1 unplaced mark: Q4” (or similar), and row status indicates needs_review.
-Style
-- Add a small score box at top-right: “Score: X/Y” and “Needs review” if applicable.
-- Use consistent ✓/✗ glyphs at target locations; keep it minimal.
+### Ticket 4 — Lock PDF Sizing + Overlay Mapping (Hard Invariants)
+Scope
+- PDF page size MUST be derived from canonical PNG at 300 DPI:
+  - `W_pt = W_px * 72 / 300`, `H_pt = H_px * 72 / 300`.
+- Background image placed to **exactly fill** that page size.
+- Overlay mapping uses the **same DPI conversion**.
+- **No clamp/rescale after overlay math; mediabox must equal derived size.**
 Acceptance checks
-- For a known case where the last question previously lacked a mark, system now flags needs_review and lists the unplaced item.
-- Marked output includes score box and consistent ✓/✗.
+- Mediabox equals derived size; overlays land correctly.
+Evidence to capture
+- Log: PNG size, mediabox size, overlay assumed size, sx/sy.
+Do NOT do
+- No PDF post-processing that rescales the page.
 
-## Engineering notes / CI
-- User pushed; GitHub Actions checks are running but may be outdated.
-- TODO: Audit `.github/workflows`; remove/disable deprecated checks or align them with current backend/frontend commands.
+### Ticket 5 (Optional) — Deprecate Legacy Paths (After Scan-First is Proven)
+Scope
+- Keep legacy code for non-scan inputs but bypass it for scan-first placement.
+Acceptance checks
+- Scan-first path never calls legacy clamp/warp/normalization except Ticket 2 rectify.
+Evidence to capture
+- Logs showing scan-first bypass of legacy paths.
+Do NOT do
+- No large refactor or feature removal yet.
+
+## Guardrail: Prevent Legacy Path Leakage
+- Scan-first flow MUST NOT call legacy clamp/warp/normalization paths except the single rectify step in Ticket 2.
+- If legacy code remains, it must be bypassed for scan-first placement.
+
+## Debug protocol (required)
+For any failing upload, record:
+- Canonical PNG width/height (px)
+- PDF mediabox size (pt)
+- Overlay assumed page size (pt)
+- sx/sy ratios used for px→pt mapping
+- Two sample boxes before mapping + after mapping
+- Save debug artifacts (canonical PNG, OCR overlay, marks overlay, marked PDF)

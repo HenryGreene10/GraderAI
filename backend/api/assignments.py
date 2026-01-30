@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import time
-from datetime import date, datetime, timezone
-from typing import Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Literal, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
@@ -45,6 +46,10 @@ class AssignmentCreate(BaseModel):
     title: str
     description: Optional[str] = None
     due_date: Optional[date] = None
+
+
+class ScanSessionCreate(BaseModel):
+    mode: Literal["master_key", "student"]
 
 
 def _assignment_payload(row: dict, uploads_count: int = 0) -> dict:
@@ -206,6 +211,43 @@ def create_assignment(
         row = payload
 
     return {"assignment": _assignment_payload(row, uploads_count=0)}
+
+
+@router.post("/{assignment_id}/scan-sessions")
+def create_scan_session(
+    assignment_id: str,
+    body: ScanSessionCreate,
+    user_id: str = Depends(get_current_user_id),
+):
+    assignment = get_assignment(assignment_id, user_id, columns="id,owner_id")
+    owner_id = assignment.get("owner_id") or user_id
+    token = secrets.token_urlsafe(16)
+    session_id = str(uuid4())
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).replace(microsecond=0)
+    expires_at_iso = expires_at.isoformat().replace("+00:00", "Z")
+    payload = {
+        "id": session_id,
+        "token": token,
+        "owner_id": owner_id,
+        "assignment_id": assignment_id,
+        "mode": body.mode,
+        "status": "pending",
+        "expires_at": expires_at_iso,
+    }
+    sb = require_supabase()
+    try:
+        sb.table("scan_sessions").insert(payload).execute()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"scan_session_create_failed: {exc}")
+    logger.info(
+        "scan_session_created assignment_id=%s owner_id=%s mode=%s session_id=%s expires_at=%s",
+        assignment_id,
+        owner_id,
+        body.mode,
+        session_id,
+        expires_at_iso,
+    )
+    return {"token": token, "expires_at": expires_at_iso}
 
 
 @router.get("/{assignment_id}/uploads")

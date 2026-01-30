@@ -127,6 +127,47 @@ class FakeTable:
                 if match:
                     rows.append(row)
             return _Resp(rows)
+        if self.name == "scan_sessions":
+            if self._op == "insert":
+                payload = self._payload or {}
+                if isinstance(payload, list):
+                    for row in payload:
+                        self.db["scan_sessions"][row["id"]] = row
+                    return _Resp(payload)
+                self.db["scan_sessions"][payload["id"]] = payload
+                return _Resp(payload)
+            if self._op == "update":
+                updated = None
+                for row in self.db["scan_sessions"].values():
+                    match = True
+                    for key, value in self._where.items():
+                        if row.get(key) != value:
+                            match = False
+                            break
+                    if match:
+                        row.update(self._payload or {})
+                        updated = row
+                return _Resp(updated)
+
+            sid = self._where.get("id")
+            if sid:
+                return _Resp(self.db["scan_sessions"].get(sid))
+            token = self._where.get("token")
+            if token:
+                for row in self.db["scan_sessions"].values():
+                    if row.get("token") == token:
+                        return _Resp(row)
+
+            rows = []
+            for row in self.db["scan_sessions"].values():
+                match = True
+                for key, value in self._where.items():
+                    if row.get(key) != value:
+                        match = False
+                        break
+                if match:
+                    rows.append(row)
+            return _Resp(rows)
         return _Resp(None)
 
 
@@ -195,7 +236,7 @@ def test_env(monkeypatch):
 
 @pytest.fixture()
 def fake_supabase():
-    db = {"uploads": {}, "overrides": [], "assignments": {}}
+    db = {"uploads": {}, "overrides": [], "assignments": {}, "scan_sessions": {}}
     client = FakeSupabase(db)
     set_supabase(client)
     try:
