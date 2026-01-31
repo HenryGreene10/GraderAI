@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 from io import BytesIO
 from typing import List, Tuple, Optional
 
@@ -17,7 +18,6 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 from ..models.schemas import Overlay, OverlayMark, GradeResult
-from .coords import px_to_pdf, rect_px_to_pdf
 from .marking import DebugLayout
 
 logger = logging.getLogger(__name__)
@@ -114,6 +114,40 @@ def get_page_sizes(original_bytes: bytes, mime_type: str | None) -> List[Tuple[f
     return [(float(width), float(height))]
 
 
+def _convert_point(
+    x_px: float,
+    y_px: float,
+    normalized_size_px: tuple[float, float],
+    page_size_pt: tuple[float, float],
+) -> tuple[float, float]:
+    norm_w, norm_h = normalized_size_px
+    page_w, page_h = page_size_pt
+    if norm_w <= 0 or norm_h <= 0:
+        return x_px, y_px
+    x_pt = x_px * page_w / norm_w
+    y_pt = page_h - (y_px * page_h / norm_h)
+    return x_pt, y_pt
+
+
+def _convert_rect(
+    x_px: float,
+    y_px: float,
+    w_px: float,
+    h_px: float,
+    normalized_size_px: tuple[float, float],
+    page_size_pt: tuple[float, float],
+) -> tuple[float, float, float, float]:
+    norm_w, norm_h = normalized_size_px
+    page_w, page_h = page_size_pt
+    if norm_w <= 0 or norm_h <= 0:
+        return x_px, y_px, w_px, h_px
+    scale_x = page_w / norm_w
+    scale_y = page_h / norm_h
+    x_pt = x_px * scale_x
+    y_pt = page_h - ((y_px + h_px) * scale_y)
+    return x_pt, y_pt, w_px * scale_x, h_px * scale_y
+
+
 def _draw_marks(
     c: canvas.Canvas,
     overlay: Overlay,
@@ -121,10 +155,11 @@ def _draw_marks(
     normalized_size_px: tuple[float, float] | None = None,
     page_size_pt: tuple[float, float] | None = None,
 ) -> None:
+    # Assume overlay mark coords are in normalized px when normalized_size_px is provided.
     for mark in overlay.marks:
         x, y = mark.coords[:2]
         if normalized_size_px and page_size_pt:
-            x, y = px_to_pdf(x, y, normalized_size_px, page_size_pt)
+            x, y = _convert_point(x, y, normalized_size_px, page_size_pt)
         if mark.tool == "check":
             c.setFont("Helvetica-Bold", 18)
             c.drawString(x, y, "✓")
@@ -139,11 +174,7 @@ def _draw_marks(
             if len(mark.coords) >= 4:
                 _, _, w, h = mark.coords[:4]
                 if normalized_size_px and page_size_pt:
-                    x, y, w, h = rect_px_to_pdf(
-                        [mark.coords[0], mark.coords[1], mark.coords[0] + w, mark.coords[1] + h],
-                        normalized_size_px,
-                        page_size_pt,
-                    )
+                    x, y, w, h = _convert_rect(x, y, w, h, normalized_size_px, page_size_pt)
                 c.setFillColorRGB(1, 1, 1)
                 c.rect(x, y, w, h, stroke=1, fill=1)
                 c.setFillColorRGB(0, 0, 0)
@@ -153,11 +184,7 @@ def _draw_marks(
         elif mark.tool == "highlight" and len(mark.coords) >= 4:
             _, _, w, h = mark.coords[:4]
             if normalized_size_px and page_size_pt:
-                x, y, w, h = rect_px_to_pdf(
-                    [mark.coords[0], mark.coords[1], mark.coords[0] + w, mark.coords[1] + h],
-                    normalized_size_px,
-                    page_size_pt,
-                )
+                x, y, w, h = _convert_rect(x, y, w, h, normalized_size_px, page_size_pt)
             c.setFillColorRGB(1, 1, 0)
             c.rect(x, y, w, h, stroke=0, fill=1)
             c.setFillColorRGB(0, 0, 0)
@@ -171,12 +198,15 @@ def _overlay_pdf_bytes(
     *,
     normalized_size_px: tuple[float, float] | None = None,
     page_size_pt: tuple[float, float] | None = None,
+    debug: bool = False,
 ) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_width, page_height))
     _draw_marks(c, overlay, normalized_size_px=normalized_size_px, page_size_pt=page_size_pt)
     if extra_marks:
         _draw_marks(c, Overlay(page=overlay.page, marks=extra_marks))
+    if debug:
+        _draw_debug_stamp(c, page_width, page_height)
     c.save()
     return buf.getvalue()
 
@@ -201,6 +231,12 @@ def _banner_overlay_pdf_bytes(page_width: float, page_height: float, text: str) 
     return buf.getvalue()
 
 
+def _draw_debug_stamp(c: canvas.Canvas, page_width: float, page_height: float) -> None:
+    c.setFont("Helvetica-Bold", 12)
+    c.setFillColorRGB(0.1, 0.4, 0.8)
+    c.drawString(36.0, max(36.0, page_height - 72.0), "DEBUG: overlay renderer alive")
+
+
 def render_marked_pdf(
     original_bytes: bytes,
     mime_type: str | None,
@@ -210,6 +246,7 @@ def render_marked_pdf(
     smoke_score_text: Optional[str] = None,
     normalized_size_px: tuple[float, float] | None = None,
 ) -> bytes:
+    debug_stamp = os.getenv("OVERLAY_DEBUG") == "1"
     missing = overlay is None
     banner_text = missing_overlay_text or MISSING_OVERLAY_BANNER
     if missing:
@@ -219,6 +256,7 @@ def render_marked_pdf(
     mark_count = len(marks)
     first = marks[0] if marks else None
     first_info = f"{first.tool}:{(first.text or '')}" if first else "none"
+    first_raw = first.coords if first else None
 
     if (mime_type or "").lower().endswith("pdf") or original_bytes.startswith(b"%PDF"):
         if PdfReader is None or PdfWriter is None:
@@ -256,6 +294,7 @@ def render_marked_pdf(
                         extra_marks=extra_marks,
                         normalized_size_px=normalized_size_px,
                         page_size_pt=(page_width, page_height),
+                        debug=debug_stamp,
                     )
                 overlay_reader = PdfReader(BytesIO(overlay_bytes))
                 page.merge_page(overlay_reader.pages[0])
@@ -267,6 +306,31 @@ def render_marked_pdf(
             mark_count,
             first_info,
         )
+        first_converted = None
+        if first_raw and normalized_size_px:
+            if len(first_raw) >= 4:
+                first_converted = _convert_rect(
+                    first_raw[0],
+                    first_raw[1],
+                    first_raw[2],
+                    first_raw[3],
+                    normalized_size_px,
+                    (page_width, page_height),
+                )
+            else:
+                first_converted = _convert_point(
+                    first_raw[0],
+                    first_raw[1],
+                    normalized_size_px,
+                    (page_width, page_height),
+                )
+        logger.info(
+            "render_marked_pdf_sizes page_size_pt=%s normalized_size_px=%s first_raw=%s first_converted=%s",
+            (page_width, page_height),
+            normalized_size_px,
+            first_raw,
+            first_converted,
+        )
         return output.getvalue()
 
     img = ImageReader(BytesIO(original_bytes))
@@ -277,7 +341,7 @@ def render_marked_pdf(
     if missing:
         _draw_missing_overlay_banner(c, width, height, banner_text)
     else:
-        _draw_marks(c, overlay)
+        _draw_marks(c, overlay, normalized_size_px=normalized_size_px, page_size_pt=(width, height))
         if mark_count == 0:
             _draw_marks(
                 c,
@@ -306,11 +370,38 @@ def render_marked_pdf(
                     ],
                 ),
             )
+    if debug_stamp:
+        _draw_debug_stamp(c, width, height)
     c.save()
     logger.info(
         "render_marked_pdf: drew background then %s marks first=%s",
         mark_count,
         first_info,
+    )
+    first_converted = None
+    if first_raw and normalized_size_px:
+        if len(first_raw) >= 4:
+            first_converted = _convert_rect(
+                first_raw[0],
+                first_raw[1],
+                first_raw[2],
+                first_raw[3],
+                normalized_size_px,
+                (width, height),
+            )
+        else:
+            first_converted = _convert_point(
+                first_raw[0],
+                first_raw[1],
+                normalized_size_px,
+                (width, height),
+            )
+    logger.info(
+        "render_marked_pdf_sizes page_size_pt=%s normalized_size_px=%s first_raw=%s first_converted=%s",
+        (width, height),
+        normalized_size_px,
+        first_raw,
+        first_converted,
     )
     return buf.getvalue()
 

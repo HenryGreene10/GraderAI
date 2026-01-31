@@ -26,20 +26,7 @@ class _CanvasSpy:
         self.draw_calls.append((x, y, text))
 
 
-def test_draw_marks_converts_px_to_pdf(monkeypatch):
-    calls = {"px": [], "rect": []}
-
-    def fake_px_to_pdf(x, y, norm, page):
-        calls["px"].append((x, y, norm, page))
-        return (10.0, 20.0)
-
-    def fake_rect_px_to_pdf(rect, norm, page):
-        calls["rect"].append((tuple(rect), norm, page))
-        return (1.0, 2.0, 3.0, 4.0)
-
-    monkeypatch.setattr(report_mod, "px_to_pdf", fake_px_to_pdf)
-    monkeypatch.setattr(report_mod, "rect_px_to_pdf", fake_rect_px_to_pdf)
-
+def test_draw_marks_converts_px_to_pdf():
     overlay = Overlay(
         page=1,
         marks=[
@@ -55,8 +42,13 @@ def test_draw_marks_converts_px_to_pdf(monkeypatch):
         normalized_size_px=(3000.0, 4000.0),
         page_size_pt=(612.0, 792.0),
     )
+    def _close(a, b, tol=0.01):
+        return abs(a - b) <= tol
 
-    assert calls["px"]
-    assert calls["rect"]
-    assert (10.0, 20.0, "hi") in canvas.draw_calls
-    assert (1.0, 2.0, 3.0, 4.0) in canvas.rect_calls
+    # 100px -> 20.4pt (612/3000), 200px -> 792 - (200*792/4000) = 752.4
+    assert any(_close(x, 20.4) and _close(y, 752.4) and text == "hi" for x, y, text in canvas.draw_calls)
+    # 300px -> 61.2pt, y=(400+60) -> 792 - (460*792/4000)=701.88, w=10.2, h=11.88
+    assert any(
+        _close(x, 61.2) and _close(y, 701.88) and _close(w, 10.2) and _close(h, 11.88)
+        for x, y, w, h in canvas.rect_calls
+    )

@@ -337,7 +337,7 @@ async def run_grade_pipeline(
                 smoke_score_text = "Score: (unavailable) — NEEDS REVIEW"
 
         normalized_size_px = None
-        if normalized_size[0] > 0 and normalized_size[1] > 0:
+        if not template_used and normalized_size[0] > 0 and normalized_size[1] > 0:
             normalized_size_px = normalized_size
 
         pdf_bytes = render_marked_pdf(
