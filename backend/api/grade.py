@@ -27,7 +27,7 @@ from ..services.grader import (
 from ..services.ocr import normalize_ocr_result
 from ..services.report import build_minimal_overlay, flatten_to_pdf
 from ..services.scan_pipeline import prepare_ocr_image
-from ..services.storage import download_submission_bytes, upload_bytes, upload_json
+from ..services.storage import download_submission_bytes, normalize_storage_path, upload_bytes, upload_json
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -196,7 +196,7 @@ async def start_grade(
 
     owner_id = row.get("owner_id") or caller_id or "unknown"
     overlay_key = f"{owner_id}/{row['id']}.json"
-    overlay_path = f"{OVERLAYS_BUCKET}/{overlay_key}"
+    overlay_path = normalize_storage_path(OVERLAYS_BUCKET, overlay_key)
     pdf_key = f"{owner_id}/{row['id']}.pdf"
 
     overlay_upload_failed = False

@@ -25,7 +25,13 @@ from ..services.report import (
 )
 from ..services.scanner import image_bytes_to_pdf
 from ..services.template_grader import TemplateAlignmentError, grade_with_template
-from ..services.storage import download_submission_bytes, strip_bucket_prefix, upload_bytes, upload_json
+from ..services.storage import (
+    download_submission_bytes,
+    normalize_storage_path,
+    strip_bucket_prefix,
+    upload_bytes,
+    upload_json,
+)
 from ..services.supabase_client import get_supabase
 from ..services.debug_artifacts import (
     debug_enabled,
@@ -218,7 +224,7 @@ async def run_grade_pipeline(
             except TemplateAlignmentError as exc:
                 owner_id = row.get("owner_id") or user_id or "unknown"
                 overlay_key = f"{owner_id}/{row['id']}.json"
-                overlay_path = f"{OVERLAYS_BUCKET}/{overlay_key}"
+                overlay_path = normalize_storage_path(OVERLAYS_BUCKET, overlay_key)
                 overlay_payload = build_minimal_overlay(row["id"], 0.0, 0.0).model_dump()
                 try:
                     upload_json(OVERLAYS_BUCKET, overlay_key, overlay_payload)
@@ -323,17 +329,25 @@ async def run_grade_pipeline(
                 },
             )
 
+        smoke_score_text = None
+        if needs_review_from_overlay:
+            if grade_result.total_max > 0:
+                smoke_score_text = f"Score: {grade_result.total_score:.0f}/{grade_result.total_max:.0f}"
+            else:
+                smoke_score_text = "Score: (unavailable) — NEEDS REVIEW"
+
         pdf_bytes = render_marked_pdf(
             pdf_source_bytes,
             pdf_mime,
             overlay,
             missing_overlay_text=MISSING_OVERLAY_BANNER,
+            smoke_score_text=smoke_score_text,
         )
 
         owner_id = row.get("owner_id") or user_id or "unknown"
         pdf_key = f"{owner_id}/{row['id']}.pdf"
         overlay_key = f"{owner_id}/{row['id']}.json"
-        overlay_path = f"{OVERLAYS_BUCKET}/{overlay_key}"
+        overlay_path = normalize_storage_path(OVERLAYS_BUCKET, overlay_key)
         overlay_payload = overlay.model_dump()
 
         logger.info(

@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from ..auth import get_current_user_id
 from ..config import GRADED_BUCKET, OVERLAYS_BUCKET, SUBMISSIONS_BUCKET
 from ..services.db import get_assignment, require_supabase
-from ..services.storage import strip_bucket_prefix, upload_bytes
+from ..services.storage import normalize_storage_path, strip_bucket_prefix, upload_bytes
 from io import BytesIO
 
 from PIL import Image
@@ -356,7 +356,9 @@ def delete_assignment(
             graded_keys.append(strip_bucket_prefix(graded_path, GRADED_BUCKET))
         overlay_path = row.get("overlay_path")
         if overlay_path:
-            overlay_keys.append(strip_bucket_prefix(overlay_path, OVERLAYS_BUCKET))
+            normalized = normalize_storage_path(OVERLAYS_BUCKET, overlay_path)
+            if normalized:
+                overlay_keys.append(normalized)
 
     try:
         if submission_keys:

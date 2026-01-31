@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Any, Optional
 
 from ..config import SUBMISSIONS_BUCKET
 from .supabase_client import get_supabase
@@ -10,6 +10,12 @@ def strip_bucket_prefix(path: str, bucket: str) -> str:
     if p.startswith(f"{bucket}/"):
         return p[len(bucket) + 1 :]
     return p
+
+
+def normalize_storage_path(bucket: str, path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    return strip_bucket_prefix(path, bucket)
 
 
 def download_submission_bytes(storage_path: str) -> bytes:

@@ -143,10 +143,17 @@ def _draw_marks(c: canvas.Canvas, overlay: Overlay) -> None:
             c.setFillColorRGB(0, 0, 0)
 
 
-def _overlay_pdf_bytes(page_width: float, page_height: float, overlay: Overlay) -> bytes:
+def _overlay_pdf_bytes(
+    page_width: float,
+    page_height: float,
+    overlay: Overlay,
+    extra_marks: Optional[List[OverlayMark]] = None,
+) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_width, page_height))
     _draw_marks(c, overlay)
+    if extra_marks:
+        _draw_marks(c, Overlay(page=overlay.page, marks=extra_marks))
     c.save()
     return buf.getvalue()
 
@@ -177,11 +184,17 @@ def render_marked_pdf(
     overlay: Optional[Overlay],
     *,
     missing_overlay_text: Optional[str] = None,
+    smoke_score_text: Optional[str] = None,
 ) -> bytes:
-    missing = overlay is None or not getattr(overlay, "marks", None)
+    missing = overlay is None
     banner_text = missing_overlay_text or MISSING_OVERLAY_BANNER
     if missing:
         logger.warning("render_marked_pdf missing overlay; stamping banner=%s", banner_text)
+
+    marks = overlay.marks if overlay else []
+    mark_count = len(marks)
+    first = marks[0] if marks else None
+    first_info = f"{first.tool}:{(first.text or '')}" if first else "none"
 
     if (mime_type or "").lower().endswith("pdf") or original_bytes.startswith(b"%PDF"):
         if PdfReader is None or PdfWriter is None:
@@ -192,15 +205,37 @@ def render_marked_pdf(
             if page_index == 0:
                 page_width = float(page.mediabox.width)
                 page_height = float(page.mediabox.height)
+                extra_marks: List[OverlayMark] = []
+                if not missing and mark_count == 0:
+                    extra_marks.append(
+                        OverlayMark(
+                            tool="note",
+                            coords=[36.0, max(36.0, page_height - 48.0)],
+                            text="OVERLAY EMPTY — NEEDS REVIEW",
+                        )
+                    )
+                if smoke_score_text:
+                    extra_marks.append(
+                        OverlayMark(
+                            tool="bubble",
+                            coords=[36.0, max(36.0, page_height - 72.0), 260.0, 26.0],
+                            text=smoke_score_text,
+                        )
+                    )
                 if missing:
                     overlay_bytes = _banner_overlay_pdf_bytes(page_width, page_height, banner_text)
                 else:
-                    overlay_bytes = _overlay_pdf_bytes(page_width, page_height, overlay)
+                    overlay_bytes = _overlay_pdf_bytes(page_width, page_height, overlay, extra_marks=extra_marks)
                 overlay_reader = PdfReader(BytesIO(overlay_bytes))
                 page.merge_page(overlay_reader.pages[0])
             writer.add_page(page)
         output = BytesIO()
         writer.write(output)
+        logger.info(
+            "render_marked_pdf: drew background then %s marks first=%s",
+            mark_count,
+            first_info,
+        )
         return output.getvalue()
 
     img = ImageReader(BytesIO(original_bytes))
@@ -212,7 +247,40 @@ def render_marked_pdf(
         _draw_missing_overlay_banner(c, width, height, banner_text)
     else:
         _draw_marks(c, overlay)
+        if mark_count == 0:
+            _draw_marks(
+                c,
+                Overlay(
+                    page=overlay.page,
+                    marks=[
+                        OverlayMark(
+                            tool="note",
+                            coords=[36.0, max(36.0, height - 48.0)],
+                            text="OVERLAY EMPTY — NEEDS REVIEW",
+                        )
+                    ],
+                ),
+            )
+        if smoke_score_text:
+            _draw_marks(
+                c,
+                Overlay(
+                    page=overlay.page,
+                    marks=[
+                        OverlayMark(
+                            tool="bubble",
+                            coords=[36.0, max(36.0, height - 72.0), 260.0, 26.0],
+                            text=smoke_score_text,
+                        )
+                    ],
+                ),
+            )
     c.save()
+    logger.info(
+        "render_marked_pdf: drew background then %s marks first=%s",
+        mark_count,
+        first_info,
+    )
     return buf.getvalue()
 
 

@@ -90,7 +90,7 @@ def test_upload_grade_sets_pdf(fake_supabase, monkeypatch):
     assert rows["u9"]["graded_pdf_path"] == "owner-1/u9.pdf"
     assert rows["u9"]["grade_json"]
     assert rows["u9"]["overlay_json"]
-    assert rows["u9"]["overlay_path"] == "overlays/owner-1/u9.json"
+    assert rows["u9"]["overlay_path"] == "owner-1/u9.json"
     assert ("overlays", "owner-1/u9.json") in fake_supabase.storage.objects
     assert seen.get("overlay_used") is True
     assert ("graded-pdfs", "owner-1/u9.pdf") in fake_supabase.storage.objects
