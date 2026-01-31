@@ -62,20 +62,26 @@ def _load_session(token: str) -> dict:
 
 async def _run_ocr_and_grade(upload_id: str, owner_id: str, image_bytes: bytes) -> None:
     logger.info("scan_ocr_start upload_id=%s", upload_id)
-    raw = await ocr_service.extract_text(image_bytes=image_bytes)
-    norm = normalize_ocr_result(raw)
-    text = (norm.get("text") or "").strip()
-    if not text:
+    try:
+        raw = await ocr_service.extract_text(image_bytes=image_bytes)
+        norm = normalize_ocr_result(raw)
+        text = (norm.get("text") or "").strip()
+        if not text:
+            raise ValueError("OCR returned empty text")
+    except Exception as exc:
+        error = str(exc) or "OCR failed"
+        logger.warning("scan_ocr_failed upload_id=%s error=%s", upload_id, error)
         update_upload(
             upload_id,
             {
                 "ocr_status": "error",
                 "status": "error",
-                "ocr_error": "OCR returned empty text",
+                "ocr_error": error,
+                "needs_review": True,
                 "updated_at": _utc_iso(),
             },
         )
-        raise HTTPException(status_code=422, detail="OCR returned empty text")
+        return
 
     update_upload(
         upload_id,
@@ -90,7 +96,12 @@ async def _run_ocr_and_grade(upload_id: str, owner_id: str, image_bytes: bytes) 
             "updated_at": _utc_iso(),
         },
     )
-    await run_grade_pipeline(upload_id, owner_id)
+    try:
+        await run_grade_pipeline(upload_id, owner_id)
+    except HTTPException as exc:
+        logger.warning("scan_grade_failed upload_id=%s error=%s", upload_id, exc.detail)
+    except Exception as exc:
+        logger.exception("scan_grade_failed upload_id=%s error=%s", upload_id, exc)
     logger.info("scan_ocr_complete upload_id=%s", upload_id)
 
 

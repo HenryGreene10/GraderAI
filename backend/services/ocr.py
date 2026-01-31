@@ -1,11 +1,18 @@
 import os
 import logging
 import asyncio
-from typing import Any, Optional
+from io import BytesIO
+from typing import Any, Optional, Tuple
 
 import httpx
+from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
+
+OCR_MAX_BYTES = int(3.5 * 1024 * 1024)
+OCR_MAX_DIM_PX = 2500
+OCR_TARGET_LONG_SIDE = 2400
+OCR_JPEG_QUALITY = 80
 
 
 class BaseOCRProvider:
@@ -110,6 +117,44 @@ class AzureReadOCRProvider(BaseOCRProvider):
             raise RuntimeError("Azure OCR timeout waiting for result")
 
 
+def _inspect_image_bytes(image_bytes: bytes) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            fmt = img.format
+            img = ImageOps.exif_transpose(img)
+            width, height = img.size
+            mime = Image.MIME.get((fmt or "").upper()) if fmt else None
+            return width, height, mime
+    except Exception:
+        return None, None, None
+
+
+def _prepare_azure_ocr_bytes(image_bytes: bytes) -> Tuple[bytes, Optional[int], Optional[int], Optional[str]]:
+    width, height, mime = _inspect_image_bytes(image_bytes)
+    bytes_len = len(image_bytes)
+    max_dim = max(width or 0, height or 0)
+    needs_resize = bytes_len > OCR_MAX_BYTES or (max_dim and max_dim > OCR_MAX_DIM_PX)
+    if not needs_resize:
+        return image_bytes, width, height, mime
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            width, height = img.size
+            max_dim = max(width, height)
+            scale = min(1.0, OCR_TARGET_LONG_SIDE / float(max_dim)) if max_dim else 1.0
+            if scale < 1.0:
+                new_w = max(1, int(round(width * scale)))
+                new_h = max(1, int(round(height * scale)))
+                img = img.resize((new_w, new_h), Image.LANCZOS)
+                width, height = img.size
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=OCR_JPEG_QUALITY, optimize=True)
+            return buf.getvalue(), width, height, "image/jpeg"
+    except Exception:
+        logger.exception("Failed to downscale Azure OCR input; using original bytes")
+        return image_bytes, width, height, mime
+
 
 def _normalize_hf(json_obj: Any) -> str:
     try:
@@ -174,8 +219,30 @@ def _provider() -> BaseOCRProvider:
 
 
 async def extract_text(image_bytes: Optional[bytes] = None, image_url: Optional[str] = None) -> dict:
+    provider_name = (
+        "mock" if os.getenv("OCR_MOCK") == "1" else (os.environ.get("OCR_PROVIDER", "mock").strip().lower() or "mock")
+    )
     prov = _provider()
-    return await prov.extract_text(image_bytes=image_bytes, image_url=image_url)
+    ocr_bytes = image_bytes
+    width = None
+    height = None
+    mime = None
+
+    if image_bytes is not None:
+        if provider_name == "azure":
+            ocr_bytes, width, height, mime = _prepare_azure_ocr_bytes(image_bytes)
+        else:
+            width, height, mime = _inspect_image_bytes(image_bytes)
+
+    logger.info(
+        "[ocr] request provider=%s bytes_len=%s width_px=%s height_px=%s mime=%s",
+        provider_name,
+        len(ocr_bytes) if ocr_bytes is not None else None,
+        width,
+        height,
+        mime,
+    )
+    return await prov.extract_text(image_bytes=ocr_bytes, image_url=image_url)
 
 
 def normalize_ocr_result(raw: dict) -> dict:
