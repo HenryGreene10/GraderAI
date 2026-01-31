@@ -35,6 +35,8 @@ def test_upload_grade_sets_pdf(fake_supabase, monkeypatch):
             }
         },
         "mime_type": "application/pdf",
+        "normalized_width_px": 3000,
+        "normalized_height_px": 4000,
     }
     fake_supabase.storage.objects[("submissions", "owner-1/file.pdf")] = b"%PDF-1.4 mock"
 
@@ -76,6 +78,7 @@ def test_upload_grade_sets_pdf(fake_supabase, monkeypatch):
     def fake_render_marked_pdf(_bytes, _mime, overlay, **_kwargs):
         texts = [m.text for m in (overlay.marks if overlay else []) if m.text]
         assert any("Score:" in t for t in texts)
+        assert _kwargs.get("normalized_size_px") == (3000.0, 4000.0)
         seen["overlay_used"] = True
         return b"%PDF-1.4\n%mock"
 

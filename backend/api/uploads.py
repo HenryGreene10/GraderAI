@@ -336,12 +336,17 @@ async def run_grade_pipeline(
             else:
                 smoke_score_text = "Score: (unavailable) — NEEDS REVIEW"
 
+        normalized_size_px = None
+        if normalized_size[0] > 0 and normalized_size[1] > 0:
+            normalized_size_px = normalized_size
+
         pdf_bytes = render_marked_pdf(
             pdf_source_bytes,
             pdf_mime,
             overlay,
             missing_overlay_text=MISSING_OVERLAY_BANNER,
             smoke_score_text=smoke_score_text,
+            normalized_size_px=normalized_size_px,
         )
 
         owner_id = row.get("owner_id") or user_id or "unknown"

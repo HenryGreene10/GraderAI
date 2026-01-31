@@ -114,9 +114,17 @@ def get_page_sizes(original_bytes: bytes, mime_type: str | None) -> List[Tuple[f
     return [(float(width), float(height))]
 
 
-def _draw_marks(c: canvas.Canvas, overlay: Overlay) -> None:
+def _draw_marks(
+    c: canvas.Canvas,
+    overlay: Overlay,
+    *,
+    normalized_size_px: tuple[float, float] | None = None,
+    page_size_pt: tuple[float, float] | None = None,
+) -> None:
     for mark in overlay.marks:
         x, y = mark.coords[:2]
+        if normalized_size_px and page_size_pt:
+            x, y = px_to_pdf(x, y, normalized_size_px, page_size_pt)
         if mark.tool == "check":
             c.setFont("Helvetica-Bold", 18)
             c.drawString(x, y, "✓")
@@ -130,6 +138,12 @@ def _draw_marks(c: canvas.Canvas, overlay: Overlay) -> None:
             c.setFont("Helvetica-Bold", 12)
             if len(mark.coords) >= 4:
                 _, _, w, h = mark.coords[:4]
+                if normalized_size_px and page_size_pt:
+                    x, y, w, h = rect_px_to_pdf(
+                        [mark.coords[0], mark.coords[1], mark.coords[0] + w, mark.coords[1] + h],
+                        normalized_size_px,
+                        page_size_pt,
+                    )
                 c.setFillColorRGB(1, 1, 1)
                 c.rect(x, y, w, h, stroke=1, fill=1)
                 c.setFillColorRGB(0, 0, 0)
@@ -138,6 +152,12 @@ def _draw_marks(c: canvas.Canvas, overlay: Overlay) -> None:
                 c.drawString(x, y, mark.text or "")
         elif mark.tool == "highlight" and len(mark.coords) >= 4:
             _, _, w, h = mark.coords[:4]
+            if normalized_size_px and page_size_pt:
+                x, y, w, h = rect_px_to_pdf(
+                    [mark.coords[0], mark.coords[1], mark.coords[0] + w, mark.coords[1] + h],
+                    normalized_size_px,
+                    page_size_pt,
+                )
             c.setFillColorRGB(1, 1, 0)
             c.rect(x, y, w, h, stroke=0, fill=1)
             c.setFillColorRGB(0, 0, 0)
@@ -148,10 +168,13 @@ def _overlay_pdf_bytes(
     page_height: float,
     overlay: Overlay,
     extra_marks: Optional[List[OverlayMark]] = None,
+    *,
+    normalized_size_px: tuple[float, float] | None = None,
+    page_size_pt: tuple[float, float] | None = None,
 ) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_width, page_height))
-    _draw_marks(c, overlay)
+    _draw_marks(c, overlay, normalized_size_px=normalized_size_px, page_size_pt=page_size_pt)
     if extra_marks:
         _draw_marks(c, Overlay(page=overlay.page, marks=extra_marks))
     c.save()
@@ -185,6 +208,7 @@ def render_marked_pdf(
     *,
     missing_overlay_text: Optional[str] = None,
     smoke_score_text: Optional[str] = None,
+    normalized_size_px: tuple[float, float] | None = None,
 ) -> bytes:
     missing = overlay is None
     banner_text = missing_overlay_text or MISSING_OVERLAY_BANNER
@@ -225,7 +249,14 @@ def render_marked_pdf(
                 if missing:
                     overlay_bytes = _banner_overlay_pdf_bytes(page_width, page_height, banner_text)
                 else:
-                    overlay_bytes = _overlay_pdf_bytes(page_width, page_height, overlay, extra_marks=extra_marks)
+                    overlay_bytes = _overlay_pdf_bytes(
+                        page_width,
+                        page_height,
+                        overlay,
+                        extra_marks=extra_marks,
+                        normalized_size_px=normalized_size_px,
+                        page_size_pt=(page_width, page_height),
+                    )
                 overlay_reader = PdfReader(BytesIO(overlay_bytes))
                 page.merge_page(overlay_reader.pages[0])
             writer.add_page(page)
