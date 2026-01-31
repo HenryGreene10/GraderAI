@@ -25,7 +25,7 @@ from ..services.grader import (
     parse_questions,
 )
 from ..services.ocr import normalize_ocr_result
-from ..services.report import flatten_to_pdf
+from ..services.report import build_minimal_overlay, flatten_to_pdf
 from ..services.scan_pipeline import prepare_ocr_image
 from ..services.storage import download_submission_bytes, upload_bytes, upload_json
 from PIL import Image
@@ -181,6 +181,11 @@ async def start_grade(
     result.prompt_version = PROMPT_VERSION
 
     overlay: Overlay = build_overlay_for_result(result)
+    overlay_missing = False
+    if not overlay or not overlay.marks:
+        overlay_missing = True
+        logger.warning("overlay_missing upload_id=%s using minimal overlay", row["id"])
+        overlay = build_minimal_overlay(row["id"], result.total_score, result.total_max)
     summary = (
         f"Submission: {row['id']}\n"
         f"Total: {result.total_score}/{result.total_max}\n"
@@ -191,20 +196,34 @@ async def start_grade(
 
     owner_id = row.get("owner_id") or caller_id or "unknown"
     overlay_key = f"{owner_id}/{row['id']}.json"
+    overlay_path = f"{OVERLAYS_BUCKET}/{overlay_key}"
     pdf_key = f"{owner_id}/{row['id']}.pdf"
 
+    overlay_upload_failed = False
     try:
         upload_json(OVERLAYS_BUCKET, overlay_key, overlay.model_dump())
-    except Exception:
-        # Best-effort overlay upload
-        pass
+    except Exception as exc:
+        overlay_upload_failed = True
+        logger.warning("overlay_upload_failed upload_id=%s error=%s", row["id"], exc)
 
     try:
         upload_bytes(GRADED_BUCKET, pdf_key, pdf_bytes, "application/pdf")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"PDF upload failed: {exc}")
 
-    needs_review = _needs_review(result, ocr_result.get("confidence"), text) or bool(row.get("needs_review"))
+    needs_review = (
+        _needs_review(result, ocr_result.get("confidence"), text)
+        or bool(row.get("needs_review"))
+        or overlay_upload_failed
+        or overlay_missing
+    )
+
+    logger.info(
+        "overlay_generated upload_id=%s overlay_path=%s marks=%s",
+        row["id"],
+        overlay_path,
+        len(overlay.marks),
+    )
 
     update_upload(
         row["id"],
@@ -212,7 +231,7 @@ async def start_grade(
             "status": "graded",
             "needs_review": needs_review,
             "graded_pdf_path": pdf_key,
-            "overlay_path": overlay_key,
+            "overlay_path": overlay_path,
             "overlay_json": overlay.model_dump(),
             "grade_json": result.model_dump(),
             "rubric_version": result.rubric_version,
@@ -226,6 +245,6 @@ async def start_grade(
         "upload_id": row["id"],
         "needs_review": needs_review,
         "graded_pdf_path": pdf_key,
-        "overlay_path": overlay_key,
+        "overlay_path": overlay_path,
         "grade": result.model_dump(),
     }

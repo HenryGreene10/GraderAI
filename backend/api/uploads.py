@@ -1,7 +1,8 @@
 import datetime as dt
+import logging
 import os
 from io import BytesIO
-from typing import Optional, Literal
+from typing import Optional, Literal, Tuple
 
 from PIL import Image
 
@@ -14,7 +15,14 @@ from ..services.db import get_assignment, get_upload, update_upload
 from ..services import ocr as ocr_service
 from ..services.llm_grader import grade_with_llm
 from ..services.marking import build_overlay_from_answers
-from ..services.report import get_page_sizes, render_debug_layout_pdf, render_marked_pdf
+from ..models.schemas import Overlay, GradeResult
+from ..services.report import (
+    MISSING_OVERLAY_BANNER,
+    build_minimal_overlay,
+    get_page_sizes,
+    render_debug_layout_pdf,
+    render_marked_pdf,
+)
 from ..services.scanner import image_bytes_to_pdf
 from ..services.template_grader import TemplateAlignmentError, grade_with_template
 from ..services.storage import download_submission_bytes, strip_bucket_prefix, upload_bytes, upload_json
@@ -29,6 +37,7 @@ from ..services.debug_artifacts import (
 )
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
+logger = logging.getLogger(__name__)
 
 
 def _extract_signed_url(result: object) -> Optional[str]:
@@ -114,6 +123,17 @@ class OverridePayload(BaseModel):
     note: Optional[str] = None
 
 
+def _ensure_overlay(
+    upload_id: str,
+    result: GradeResult,
+    overlay: Optional[Overlay],
+) -> Tuple[Overlay, bool]:
+    if overlay and overlay.marks:
+        return overlay, False
+    fallback = build_minimal_overlay(upload_id, result.total_score, result.total_max)
+    return fallback, True
+
+
 async def run_grade_pipeline(
     upload_id: str,
     user_id: str,
@@ -196,6 +216,18 @@ async def run_grade_pipeline(
                     ocr_service.extract_text,
                 )
             except TemplateAlignmentError as exc:
+                owner_id = row.get("owner_id") or user_id or "unknown"
+                overlay_key = f"{owner_id}/{row['id']}.json"
+                overlay_path = f"{OVERLAYS_BUCKET}/{overlay_key}"
+                overlay_payload = build_minimal_overlay(row["id"], 0.0, 0.0).model_dump()
+                try:
+                    upload_json(OVERLAYS_BUCKET, overlay_key, overlay_payload)
+                except Exception as upload_exc:
+                    logger.warning(
+                        "overlay_upload_failed upload_id=%s error=%s",
+                        row["id"],
+                        upload_exc,
+                    )
                 update_upload(
                     row["id"],
                     {
@@ -206,6 +238,8 @@ async def run_grade_pipeline(
                             "template_used": False,
                             "template_error": f"Template alignment failed: {exc}",
                         },
+                        "overlay_path": overlay_path,
+                        "overlay_json": overlay_payload,
                         "updated_at": _utc_iso(),
                     },
                 )
@@ -247,6 +281,11 @@ async def run_grade_pipeline(
                 total_max=grade_result.total_max,
             )
 
+        overlay, overlay_missing = _ensure_overlay(row["id"], grade_result, overlay)
+        if overlay_missing:
+            logger.warning("overlay_missing upload_id=%s using minimal overlay", row["id"])
+            needs_review_from_overlay = True
+
         page_width_pt, page_height_pt = page_sizes[0]
         page_width_in = page_width_pt / 72.0
         page_height_in = page_height_pt / 72.0
@@ -284,17 +323,32 @@ async def run_grade_pipeline(
                 },
             )
 
-        pdf_bytes = render_marked_pdf(pdf_source_bytes, pdf_mime, overlay)
+        pdf_bytes = render_marked_pdf(
+            pdf_source_bytes,
+            pdf_mime,
+            overlay,
+            missing_overlay_text=MISSING_OVERLAY_BANNER,
+        )
 
         owner_id = row.get("owner_id") or user_id or "unknown"
         pdf_key = f"{owner_id}/{row['id']}.pdf"
         overlay_key = f"{owner_id}/{row['id']}.json"
+        overlay_path = f"{OVERLAYS_BUCKET}/{overlay_key}"
+        overlay_payload = overlay.model_dump()
+
+        logger.info(
+            "overlay_generated upload_id=%s overlay_path=%s marks=%s",
+            row["id"],
+            overlay_path,
+            len(overlay.marks),
+        )
 
         upload_bytes(GRADED_BUCKET, pdf_key, pdf_bytes, "application/pdf")
         try:
-            upload_json(OVERLAYS_BUCKET, overlay_key, overlay.model_dump())
-        except Exception:
-            pass
+            upload_json(OVERLAYS_BUCKET, overlay_key, overlay_payload)
+        except Exception as exc:
+            logger.warning("overlay_upload_failed upload_id=%s error=%s", row["id"], exc)
+            needs_review_from_overlay = True
 
         debug_layout_path = None
         if os.getenv("DEBUG_LAYOUT") == "1" and debug_layout:
@@ -398,8 +452,8 @@ async def run_grade_pipeline(
                 "status": "pdf_ready",
                 "needs_review": needs_review,
                 "graded_pdf_path": pdf_key,
-                "overlay_path": overlay_key,
-                "overlay_json": overlay.model_dump(),
+                "overlay_path": overlay_path,
+                "overlay_json": overlay_payload,
                 "grade_json": grade_json,
                 "rubric_version": grade_result.rubric_version,
                 "prompt_version": grade_result.prompt_version,

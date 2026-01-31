@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 
@@ -57,3 +57,4 @@ class OverlayMark(BaseModel):
 class Overlay(BaseModel):
     page: int = 1
     marks: List[OverlayMark] = Field(default_factory=list)
+    meta: Optional[Dict[str, Any]] = None

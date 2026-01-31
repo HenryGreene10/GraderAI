@@ -71,7 +71,15 @@ def test_upload_grade_sets_pdf(fake_supabase, monkeypatch):
 
     monkeypatch.setattr("backend.api.uploads.grade_with_llm", fake_grade_with_llm)
     monkeypatch.setattr("backend.api.uploads.get_page_sizes", lambda *_args, **_kwargs: [(612.0, 792.0)])
-    monkeypatch.setattr("backend.api.uploads.render_marked_pdf", lambda *_args, **_kwargs: b"%PDF-1.4\n%mock")
+    seen = {}
+
+    def fake_render_marked_pdf(_bytes, _mime, overlay, **_kwargs):
+        texts = [m.text for m in (overlay.marks if overlay else []) if m.text]
+        assert any("Score:" in t for t in texts)
+        seen["overlay_used"] = True
+        return b"%PDF-1.4\n%mock"
+
+    monkeypatch.setattr("backend.api.uploads.render_marked_pdf", fake_render_marked_pdf)
 
     client = TestClient(app)
     resp = client.post("/api/uploads/u9/grade", headers=_auth_headers())
@@ -81,4 +89,8 @@ def test_upload_grade_sets_pdf(fake_supabase, monkeypatch):
 
     assert rows["u9"]["graded_pdf_path"] == "owner-1/u9.pdf"
     assert rows["u9"]["grade_json"]
+    assert rows["u9"]["overlay_json"]
+    assert rows["u9"]["overlay_path"] == "overlays/owner-1/u9.json"
+    assert ("overlays", "owner-1/u9.json") in fake_supabase.storage.objects
+    assert seen.get("overlay_used") is True
     assert ("graded-pdfs", "owner-1/u9.pdf") in fake_supabase.storage.objects
