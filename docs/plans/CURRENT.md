@@ -1,122 +1,200 @@
-# Current Plan (GraderAI) — Scan-Required Pivot
+# Current Plan (GraderAI) — Scan-Required, Batch Web Scanner
 
 ## Why this plan is changing
-- Misaligned marks + distorted PDFs come from inconsistent coordinate spaces and hidden resizes.
-- A scan-first (phone-as-scanner) flow lets us control capture, rectify once, and treat one artifact as truth.
-- We are committing to **SCAN-FIRST + SCAN-REQUIRED** for production (no random photo uploads).
+
+• Misaligned marks and distorted PDFs come from inconsistent coordinate spaces,
+hidden resizes, and uncontrolled photo uploads.  
+• A scan-first (phone-as-scanner) flow lets us control capture, rectify once,
+and treat one canonical document artifact as truth.  
+• We are committing to **SCAN-FIRST + SCAN-REQUIRED** for production
+(no random photo or gallery uploads).
+
+---
 
 ## Policy: Scan-Required
-- Capture must go through **QR → mobile scanner page → upload**.
-- Teacher convenience is handled by **rapid capture loop (tap-tap)** + optional retake prompts.
 
-## Canonical artifact storage mapping (invariant)
-- For scan-first flows, `uploads.normalized_image_path` **is the canonical scan_png**.
-- `uploads.normalized_width_px` / `uploads.normalized_height_px` **must match the actual PNG dimensions**.
-- OCR / template / grading / overlay / PDF **MUST use normalized_* only** for placement (no other image inputs).
-- Naming can change later to `scan_*`, **no schema change in this pivot**.
+• All production capture must go through **QR → mobile scanner page**.  
+• The mobile page behaves like a **document scanner**, not a photo uploader.  
+• Teacher convenience is handled by:
+  – rapid capture loop (tap / auto-capture)  
+  – preview + retake gate  
+  – batch scanning per student (no per-page uploads)
+
+---
+
+## Canonical artifact (NEW invariant)
+
+**Canonical grading input = one multi-page PDF per student submission.**
+
+• Each PDF page originates from a rectified scan page.  
+• OCR, grading, overlays, and marked PDFs are **page-indexed** against this PDF.  
+• No downstream system consumes raw photos or unrectified images.
+
+Internal details:
+• Rectified page images may exist transiently or as debug artifacts.  
+• Placement math always references:
+  – page index  
+  – page width/height derived from the rectified scan  
+
+---
 
 ## Scan session implementation (table-based)
-- Add a minimal Supabase table `scan_sessions` with columns:
-  `id (uuid), token (random), owner_id, assignment_id, mode ('master_key'|'student'), status, created_at, expires_at, resulting_upload_id (nullable)`.
-- TTL: `expires_at` <= 15 minutes; backend rejects expired tokens.
-- RLS: owner_id = auth.uid() can create/read their sessions; token-use is validated server-side (no broad access).
-- Keep it minimal—no extra fields.
 
-## Scan modes + write targets (explicit)
-- **master_key scan** writes:
-  - Store canonical PNG under templates at `submissions/{owner}/templates/{assignment}.png`.
-  - Update `assignments.template_storage_path` and `template_width_px/height_px` from canonical PNG.
-- **student scan** writes:
-  - Create uploads row; store canonical `normalized_image_path` + width/height.
-  - Trigger OCR + grading pipeline **against canonical PNG**.
-- Artifacts generated:
-  - `submissions/{owner}/templates/{assignment}.png` (master key)
-  - `submissions/{owner}/normalized/{upload}.png` + width/height (student)
-  - `graded-pdfs/{owner}/{upload}.pdf` + `overlays/{owner}/{upload}.json`
+• Add minimal Supabase table `scan_sessions`:
+  - id (uuid)  
+  - token (random)  
+  - owner_id  
+  - assignment_id  
+  - status  
+  - created_at  
+  - expires_at  
 
-## Tickets (4–5 total, minimal-risk ordering)
+• TTL: `expires_at ≤ 15 minutes`  
+• RLS:
+  - owner_id = auth.uid() can create/read sessions  
+  - token use validated server-side  
+• Scan session may produce **multiple student submissions**.
 
-### Ticket 1 — Scan Sessions + QR + Mobile Capture (Scan Required)
-Scope
-- Implement scan session creation + QR display on desktop.
-- Mobile scanner page for `/scan/<token>` with rapid capture loop.
-- Upload stores canonical PNG + width/height; links to assignment/upload.
-Acceptance checks
-- QR opens scanner; scan completes and desktop updates.
-- Capture loop allows fast multi-capture loop (each capture = one upload row); optional retake prompt.
-Evidence to capture
-- Session logs (token, mode, assignment_id, status transitions).
-- Stored canonical PNG path + width/height.
-Do NOT do
-- No alternate upload entry points in production flow.
-- No image rectification yet.
+---
 
-### Ticket 2 — Rectify + Quality Gate (Retake UX)
-Scope
-- Corner detect + perspective warp to produce canonical PNG.
-- Blur/edge/contrast checks; require retake if below threshold.
-Acceptance checks
-- Rectified PNG looks aligned; low-quality scans prompt retake.
-Evidence to capture
-- Before/after images for 2 scans + quality metrics.
-Do NOT do
-- No 3rd‑party scanner SDK unless OpenCV path is insufficient.
+## Scan workflow (QR → batch → per student)
 
-### Ticket 3 — Wire Canonical PNG Through OCR + Template + Grading
-Scope
-- OCR input is canonical PNG only.
-- Template detection and grading use canonical PNG coordinates only.
-Acceptance checks
-- OCR/Template overlays align to canonical PNG.
-- Mark placement matches expected locations on known scans.
-Evidence to capture
-- OCR overlay PNG + template overlay PNG on canonical PNG.
-Do NOT do
-- No new OCR provider or LLM work.
-- No fallback to legacy inputs for placement.
+### Mobile scanner behavior
+
+• Live camera with document frame overlay  
+• Capture → **rectify + preview** → Use / Retake  
+• Accepted pages accumulate in a **current student packet**  
+• Teacher taps **Finish student** to close the packet  
+• Packet is converted into **one multi-page PDF** and uploaded once  
+• Memory is cleared; scanning continues for next student  
+
+No individual photo uploads. No per-page upload rows.
+
+---
+
+## Storage & write targets
+
+### Student scan output
+
+• For each finished student packet:
+  - Create **one submission row**
+  - Store canonical PDF at:
+    `submissions/{owner}/{submission}.pdf`
+  - Store metadata:
+    – page_count
+    – per-page width/height (from rectified pages)
+
+### Artifacts generated
+
+• Canonical input:
+  - `submissions/{owner}/{submission}.pdf`
+
+• Derived:
+  - `graded-pdfs/{owner}/{submission}.pdf`
+  - `overlays/{owner}/{submission}.json` (page-indexed)
+
+---
+
+## Tickets (minimal-risk ordering)
+
+### Ticket 0 — Overlay styling scale (readability)
+_(unchanged, but must be completed first)_
+
+---
+
+### Ticket 1 — Batch Web Scanner (QR → Rectify → Student Packets)
+
+Scope  
+• Scan session creation + QR display on desktop  
+• Mobile scanner page `/scan/<token>`  
+• OpenCV.js rectification (client-side)  
+• Preview + retake gate  
+• Page tray per student  
+• “Finish student” → build multi-page PDF (client) → upload once  
+
+Acceptance checks  
+• Scan 5–10 pages rapidly into one student PDF  
+• No per-page uploads created  
+• Session continues cleanly to next student  
+
+Do NOT do  
+• No OCR / grading  
+• No legacy upload paths  
+
+---
+
+### Ticket 2 — Quality Gate + Scan Enforcement
+
+Scope  
+• Blur / edge / confidence checks  
+• Force retake if scan quality is insufficient  
+• Backend rejects non-scan uploads in production mode  
+
+Acceptance checks  
+• Bad scans cannot proceed  
+• Scan-required invariant enforced  
+
+---
+
+### Ticket 3 — Page-Aware OCR + Grading
+
+Scope  
+• Render PDF pages to images  
+• OCR per page  
+• Grading operates per page index  
+• Overlay JSON becomes `{ pages: [...] }`
+
+Acceptance checks  
+• OCR + overlays align page-by-page  
+• Known scans render correct marks  
+
+---
 
 ### Ticket 4 — Lock PDF Sizing + Overlay Mapping (Hard Invariants)
-Scope
-- PDF page size MUST be derived from canonical PNG at 300 DPI:
-  - `W_pt = W_px * 72 / 300`, `H_pt = H_px * 72 / 300`.
-- Background image placed to **exactly fill** that page size.
-- Overlay mapping uses the **same DPI conversion**.
-- **No clamp/rescale after overlay math; mediabox must equal derived size.**
-Acceptance checks
-- Mediabox equals derived size; overlays land correctly.
-Evidence to capture
-- Log: PNG size, mediabox size, overlay assumed size, sx/sy.
-Do NOT do
-- No PDF post-processing that rescales the page.
 
-### Ticket 5 (Optional) — Deprecate Legacy Paths (After Scan-First is Proven)
-Scope
-- Keep legacy code for non-scan inputs but bypass it for scan-first placement.
-Acceptance checks
-- Scan-first path never calls legacy clamp/warp/normalization except Ticket 2 rectify.
-Evidence to capture
-- Logs showing scan-first bypass of legacy paths.
-Do NOT do
-- No large refactor or feature removal yet.
+Scope  
+• PDF page size derived from rectified scan page size  
+• No rescaling after placement math  
+• Overlay mapping is page-indexed  
+
+---
+
+### Ticket 5 (Optional) — Deprecate Legacy Paths
+
+Unchanged: keep legacy paths for non-scan inputs, but bypass entirely for scan sessions.
+
+---
 
 ## Guardrail: Prevent Legacy Path Leakage
-- Scan-first flow MUST NOT call legacy clamp/warp/normalization paths except the single rectify step in Ticket 2.
-- If legacy code remains, it must be bypassed for scan-first placement.
+
+• Scan-first flow MUST NOT call legacy photo or normalization paths.  
+• If legacy code remains, it must be bypassed entirely for scan sessions.
+
+---
 
 ## Local dev networking (phone scan, no LAN backend)
-- Start backend (loopback only):
-  `uvicorn backend.app:app --host 127.0.0.1 --port 8000`
-- Start Vite (LAN reachable):
-  `npm --prefix frontend run dev -- --host 0.0.0.0 --port 5173`
-- Set `VITE_PUBLIC_BASE_URL=http://192.168.1.26:5173` in `frontend/.env.local`.
-- Phone opens `http://192.168.1.26:5173/scan/<token>`.
-- Vite proxies `/api/*` to `http://127.0.0.1:8000`, so backend stays off-LAN.
 
-## Debug protocol (required)
-For any failing upload, record:
-- Canonical PNG width/height (px)
-- PDF mediabox size (pt)
-- Overlay assumed page size (pt)
-- sx/sy ratios used for px→pt mapping
-- Two sample boxes before mapping + after mapping
-- Save debug artifacts (canonical PNG, OCR overlay, marks overlay, marked PDF)
+• Start backend (loopback only):
+  uvicorn backend.app:app --host 127.0.0.1 --port 8000
+• Start Vite (LAN reachable):
+  npm --prefix frontend run dev -- --host 0.0.0.0 --port 5173
+• Set `VITE_PUBLIC_BASE_URL=http://<LAN_IP>:5173` in `frontend/.env.local`.
+• Phone opens `http://<LAN_IP>:5173/scan/<token>`.
+• Vite proxies `/api/*` to `http://127.0.0.1:8000`, so backend stays off-LAN.
+
+---
+
+## Debug protocol (page-aware)
+
+For any failing submission, record:
+
+• Page count  
+• For one sample page:
+  – rectified width/height (px)  
+  – PDF mediabox size (pt)  
+  – overlay assumed size  
+  – sx/sy mapping ratios  
+• Save artifacts:
+  – rectified page image  
+  – overlay JSON  
+  – marked multi-page PDF
