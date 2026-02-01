@@ -37,6 +37,36 @@ npm --prefix frontend install
 npm --prefix frontend run dev
 ```
 
+### HTTPS dev for iPhone scanner (LAN)
+iOS Safari requires HTTPS for camera access on `/scan/:token`.
+
+1) Install mkcert (Ubuntu/WSL):
+```bash
+sudo apt-get update && sudo apt-get install -y mkcert libnss3-tools
+mkcert -install
+```
+
+2) Generate certs (includes localhost + LAN IP) and store in `frontend/.cert/`:
+```bash
+mkdir -p frontend/.cert
+LAN_IP=$(hostname -I | awk '{print $1}')
+mkcert -key-file frontend/.cert/localhost-key.pem -cert-file frontend/.cert/localhost.pem \
+  localhost 127.0.0.1 ::1 "$LAN_IP"
+```
+
+3) Run HTTPS dev server:
+```bash
+npm --prefix frontend run dev:https -- --host 0.0.0.0 --port 5173
+```
+Optional for QR links:
+```
+VITE_PUBLIC_BASE_URL=https://$LAN_IP:5173
+```
+
+4) iPhone trust steps:
+   - Find the mkcert CA with `mkcert -CAROOT`, copy `rootCA.pem` to the iPhone and install it.
+   - On the iPhone: Settings → General → About → Certificate Trust Settings → enable the mkcert CA → retry.
+
 ### Environment variables (required)
 Backend:
 - `SUPABASE_URL`
