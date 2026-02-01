@@ -124,8 +124,10 @@ def _convert_point(
     page_w, page_h = page_size_pt
     if norm_w <= 0 or norm_h <= 0:
         return x_px, y_px
-    x_pt = x_px * page_w / norm_w
-    y_pt = page_h - (y_px * page_h / norm_h)
+    sx = page_w / norm_w
+    sy = page_h / norm_h
+    x_pt = x_px * sx
+    y_pt = page_h - (y_px * sy)
     return x_pt, y_pt
 
 
@@ -157,34 +159,46 @@ def _draw_marks(
 ) -> None:
     # Assume overlay mark coords are in normalized px when normalized_size_px is provided.
     for mark in overlay.marks:
-        x, y = mark.coords[:2]
-        if normalized_size_px and page_size_pt:
-            x, y = _convert_point(x, y, normalized_size_px, page_size_pt)
+        x_px, y_px = mark.coords[:2]
         if mark.tool == "check":
+            x, y = (x_px, y_px)
+            if normalized_size_px and page_size_pt:
+                x, y = _convert_point(x_px, y_px, normalized_size_px, page_size_pt)
             c.setFont("Helvetica-Bold", 18)
             c.drawString(x, y, "✓")
         elif mark.tool == "cross":
+            x, y = (x_px, y_px)
+            if normalized_size_px and page_size_pt:
+                x, y = _convert_point(x_px, y_px, normalized_size_px, page_size_pt)
             c.setFont("Helvetica-Bold", 18)
             c.drawString(x, y, "✗")
         elif mark.tool == "note":
+            x, y = (x_px, y_px)
+            if normalized_size_px and page_size_pt:
+                x, y = _convert_point(x_px, y_px, normalized_size_px, page_size_pt)
             c.setFont("Helvetica-Bold", 12)
             c.drawString(x, y, mark.text or "")
         elif mark.tool == "bubble":
             c.setFont("Helvetica-Bold", 12)
             if len(mark.coords) >= 4:
-                _, _, w, h = mark.coords[:4]
+                w_px, h_px = mark.coords[2:4]
+                x, y, w, h = x_px, y_px, w_px, h_px
                 if normalized_size_px and page_size_pt:
-                    x, y, w, h = _convert_rect(x, y, w, h, normalized_size_px, page_size_pt)
+                    x, y, w, h = _convert_rect(x_px, y_px, w_px, h_px, normalized_size_px, page_size_pt)
                 c.setFillColorRGB(1, 1, 1)
                 c.rect(x, y, w, h, stroke=1, fill=1)
                 c.setFillColorRGB(0, 0, 0)
                 c.drawString(x + 6, y + max(6, (h - 12) / 2), mark.text or "")
             else:
+                x, y = (x_px, y_px)
+                if normalized_size_px and page_size_pt:
+                    x, y = _convert_point(x_px, y_px, normalized_size_px, page_size_pt)
                 c.drawString(x, y, mark.text or "")
         elif mark.tool == "highlight" and len(mark.coords) >= 4:
-            _, _, w, h = mark.coords[:4]
+            w_px, h_px = mark.coords[2:4]
+            x, y, w, h = x_px, y_px, w_px, h_px
             if normalized_size_px and page_size_pt:
-                x, y, w, h = _convert_rect(x, y, w, h, normalized_size_px, page_size_pt)
+                x, y, w, h = _convert_rect(x_px, y_px, w_px, h_px, normalized_size_px, page_size_pt)
             c.setFillColorRGB(1, 1, 0)
             c.rect(x, y, w, h, stroke=0, fill=1)
             c.setFillColorRGB(0, 0, 0)
