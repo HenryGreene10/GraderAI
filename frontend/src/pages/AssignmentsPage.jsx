@@ -77,6 +77,7 @@ function statusLabel(status) {
 
 function scanStatusLabel(status) {
   const normalized = String(status || "pending").toLowerCase();
+  if (normalized === "active") return "Active";
   if (normalized === "complete") return "Complete";
   if (normalized === "expired") return "Expired";
   if (normalized === "error") return "Error";
@@ -189,6 +190,7 @@ export default function AssignmentsPage() {
   const [overrideNote, setOverrideNote] = useState("");
   const [overrideSaving, setOverrideSaving] = useState(false);
   const scanAutoOpenedRef = useRef(false);
+  const lastScanResultRef = useRef(null);
 
   const masterKeyReady = SCAN_REQUIRED
     ? Boolean(assignment?.template_storage_path)
@@ -237,7 +239,7 @@ export default function AssignmentsPage() {
 
   useEffect(() => {
     if (!scanDialogOpen || !scanSession?.token) return;
-    if (["complete", "expired", "error"].includes(scanStatus)) return;
+    if (scanSession.mode === "master_key" && ["complete", "expired", "error"].includes(scanStatus)) return;
     let active = true;
     const poll = async () => {
       try {
@@ -245,21 +247,26 @@ export default function AssignmentsPage() {
         if (!active) return;
         const status = data?.status || "pending";
         setScanStatus(status);
-        if (data?.resulting_upload_id) {
-          setScanResultId(data.resulting_upload_id);
+        const resultId = data?.resulting_upload_id || null;
+        if (resultId) {
+          setScanResultId(resultId);
         }
         if (status === "expired") {
           setScanError("Scan session expired");
         }
-        if (status === "complete" && !scanCompleted) {
-          setScanCompleted(true);
-          if (scanSession.mode === "master_key") {
+        if (scanSession.mode === "master_key") {
+          if (status === "complete" && !scanCompleted) {
+            setScanCompleted(true);
             await loadAssignment();
+            await loadUploads({ silent: true });
+            toast({ title: "Master key saved" });
           }
+          return;
+        }
+        if (resultId && resultId !== lastScanResultRef.current) {
+          lastScanResultRef.current = resultId;
           await loadUploads({ silent: true });
-          toast({
-            title: scanSession.mode === "master_key" ? "Master key saved" : "Scan saved",
-          });
+          toast({ title: "Scan saved" });
         }
       } catch (err) {
         if (!active) return;
@@ -329,6 +336,7 @@ export default function AssignmentsPage() {
     setScanStatus("pending");
     setScanResultId(null);
     setScanCompleted(false);
+    lastScanResultRef.current = null;
     try {
       const resp = await apiFetch(`/api/assignments/${assignmentId}/scan-sessions`, {
         method: "POST",
@@ -792,6 +800,11 @@ export default function AssignmentsPage() {
             </DialogTitle>
             <DialogDescription>
               Scan this QR code with your phone to open the scanner.
+              {scanMode === "student" && (
+                <span className="block mt-1">
+                  Keep this open while you finish each student packet.
+                </span>
+              )}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">

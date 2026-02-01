@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from io import BytesIO
 from uuid import uuid4
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from PIL import Image, ImageOps
+from pypdf import PdfReader
 
 from ..config import SUBMISSIONS_BUCKET
 from ..services import ocr as ocr_service
@@ -109,7 +111,7 @@ async def _run_ocr_and_grade(upload_id: str, owner_id: str, image_bytes: bytes) 
 def scan_status(token: str):
     row = _load_session(token)
     status = str(row.get("status") or "pending")
-    if _is_expired(row.get("expires_at")) and status == "pending":
+    if _is_expired(row.get("expires_at")) and status in {"pending", "active"}:
         status = "expired"
     return {
         "status": status,
@@ -118,16 +120,75 @@ def scan_status(token: str):
     }
 
 
+def _parse_page_sizes(value: str | None) -> list[dict] | None:
+    if not value:
+        return None
+    try:
+        data = json.loads(value)
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    parsed = []
+    for item in data:
+        width = None
+        height = None
+        if isinstance(item, dict):
+            width = item.get("width_px") or item.get("width") or item.get("w")
+            height = item.get("height_px") or item.get("height") or item.get("h")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            width, height = item[0], item[1]
+        try:
+            width = int(width)
+            height = int(height)
+        except Exception:
+            continue
+        if width > 0 and height > 0:
+            parsed.append({"width_px": width, "height_px": height})
+    return parsed or None
+
+
+def _page_sizes_from_pdf(pdf_bytes: bytes) -> list[dict]:
+    reader = PdfReader(BytesIO(pdf_bytes))
+    sizes = []
+    for page in reader.pages:
+        box = page.mediabox
+        try:
+            width = float(box.width)
+            height = float(box.height)
+        except Exception:
+            continue
+        sizes.append({"width_px": int(round(width)), "height_px": int(round(height))})
+    return sizes
+
+
 @router.post("/{token}/upload")
-async def scan_upload(token: str, file: UploadFile = File(...)):
+async def scan_upload(
+    token: str,
+    file: UploadFile = File(...),
+    page_count: int | None = Form(None),
+    page_sizes: str | None = Form(None),
+):
     row = _load_session(token)
+    mode = str(row.get("mode") or "")
     status = str(row.get("status") or "pending")
-    if status != "pending":
+    if mode == "student":
+        if status not in {"pending", "active"}:
+            raise HTTPException(status_code=409, detail="scan_session_not_pending")
+    elif status != "pending":
         raise HTTPException(status_code=409, detail="scan_session_not_pending")
     if _is_expired(row.get("expires_at")):
         raise HTTPException(status_code=410, detail="scan_session_expired")
-    if not file or not (file.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="scan_image_required")
+    if not file:
+        raise HTTPException(status_code=400, detail="scan_file_required")
+    content_type = (file.content_type or "").lower()
+    filename = (file.filename or "").lower()
+    if mode == "student":
+        if "pdf" not in content_type and not filename.endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="scan_pdf_required")
+    else:
+        if not content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="scan_image_required")
 
     blob = await file.read()
     logger.info(
@@ -137,22 +198,10 @@ async def scan_upload(token: str, file: UploadFile = File(...)):
         len(blob),
     )
     if not blob:
-        raise HTTPException(status_code=400, detail="scan_image_empty")
-
-    try:
-        with Image.open(BytesIO(blob)) as img:
-            img = ImageOps.exif_transpose(img).convert("RGB")
-            width, height = img.size
-            buf = BytesIO()
-            img.save(buf, format="PNG")
-            png_bytes = buf.getvalue()
-    except Exception as exc:
-        logger.warning("scan_image_decode_failed token=%s error=%s", token, exc)
-        raise HTTPException(status_code=400, detail="scan_image_invalid")
+        raise HTTPException(status_code=400, detail="scan_file_empty")
 
     owner_id = str(row.get("owner_id") or "")
     assignment_id = str(row.get("assignment_id") or "")
-    mode = str(row.get("mode") or "")
     session_id = row.get("id")
 
     logger.info(
@@ -166,6 +215,16 @@ async def scan_upload(token: str, file: UploadFile = File(...)):
     resulting_upload_id = None
 
     if mode == "master_key":
+        try:
+            with Image.open(BytesIO(blob)) as img:
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                width, height = img.size
+                buf = BytesIO()
+                img.save(buf, format="PNG")
+                png_bytes = buf.getvalue()
+        except Exception as exc:
+            logger.warning("scan_image_decode_failed token=%s error=%s", token, exc)
+            raise HTTPException(status_code=400, detail="scan_image_invalid")
         key = f"{owner_id}/templates/{assignment_id}.png"
         upload_bytes(SUBMISSIONS_BUCKET, key, png_bytes, "image/png")
         storage_path = f"{SUBMISSIONS_BUCKET}/{key}"
@@ -177,9 +236,18 @@ async def scan_upload(token: str, file: UploadFile = File(...)):
             }
         ).eq("id", assignment_id).execute()
     elif mode == "student":
+        parsed_sizes = _parse_page_sizes(page_sizes)
+        if parsed_sizes is None:
+            try:
+                parsed_sizes = _page_sizes_from_pdf(blob)
+            except Exception as exc:
+                logger.warning("scan_pdf_parse_failed token=%s error=%s", token, exc)
+                parsed_sizes = []
+        if page_count is None:
+            page_count = len(parsed_sizes) if parsed_sizes else None
         upload_id = str(uuid4())
-        key = f"{owner_id}/normalized/{upload_id}.png"
-        upload_bytes(SUBMISSIONS_BUCKET, key, png_bytes, "image/png")
+        key = f"{owner_id}/{upload_id}.pdf"
+        upload_bytes(SUBMISSIONS_BUCKET, key, blob, "application/pdf")
         storage_path = f"{SUBMISSIONS_BUCKET}/{key}"
         now = _utc_iso()
         sb.table("uploads").insert(
@@ -188,14 +256,13 @@ async def scan_upload(token: str, file: UploadFile = File(...)):
                 "owner_id": owner_id,
                 "assignment_id": assignment_id,
                 "storage_path": storage_path,
-                "original_name": "scan.png",
-                "mime_type": "image/png",
-                "size_bytes": len(png_bytes),
-                "status": "uploading",
-                "ocr_status": "pending",
-                "normalized_image_path": storage_path,
-                "normalized_width_px": int(width),
-                "normalized_height_px": int(height),
+                "original_name": "scan.pdf",
+                "mime_type": "application/pdf",
+                "size_bytes": len(blob),
+                "status": "scanned",
+                "ocr_status": None,
+                "page_count": page_count,
+                "page_sizes_json": parsed_sizes or None,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -204,9 +271,12 @@ async def scan_upload(token: str, file: UploadFile = File(...)):
     else:
         raise HTTPException(status_code=400, detail="scan_session_mode_invalid")
 
-    sb.table("scan_sessions").update(
-        {"status": "complete", "resulting_upload_id": resulting_upload_id}
-    ).eq("id", session_id).execute()
+    session_update = {"resulting_upload_id": resulting_upload_id}
+    if mode == "master_key":
+        session_update["status"] = "complete"
+    else:
+        session_update["status"] = "active"
+    sb.table("scan_sessions").update(session_update).eq("id", session_id).execute()
 
     logger.info(
         "scan_upload_complete session_id=%s mode=%s resulting_upload_id=%s",
@@ -214,9 +284,6 @@ async def scan_upload(token: str, file: UploadFile = File(...)):
         mode,
         resulting_upload_id,
     )
-
-    if mode == "student" and resulting_upload_id:
-        await _run_ocr_and_grade(resulting_upload_id, owner_id, png_bytes)
 
     return {
         "ok": True,
