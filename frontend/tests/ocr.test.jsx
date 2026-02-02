@@ -5,6 +5,7 @@ vi.mock('../src/lib/supabaseClient.js', () => {
     supabase: {
       auth: {
         getUser: vi.fn(async () => ({ data: { user: { id: 'user-123' } }, error: null })),
+        getSession: vi.fn(async () => ({ data: { session: { access_token: 'test-token' } }, error: null })),
       },
     },
   }
