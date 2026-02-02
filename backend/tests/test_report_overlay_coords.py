@@ -47,8 +47,8 @@ def test_draw_marks_converts_px_to_pdf():
 
     # 100px -> 20.4pt (612/3000), 200px -> 792 - (200*792/4000) = 752.4
     assert any(_close(x, 20.4) and _close(y, 752.4) and text == "hi" for x, y, text in canvas.draw_calls)
-    # 300px -> 61.2pt, y=(400+60) -> 792 - (460*792/4000)=701.88, w=10.2, h=11.88
+    # 300px -> 61.2pt, y=(400+60) -> 792 - (460*792/4000)=700.92, w=10.2, h=11.88
     assert any(
-        _close(x, 61.2) and _close(y, 701.88) and _close(w, 10.2) and _close(h, 11.88)
+        _close(x, 61.2) and _close(y, 700.92) and _close(w, 10.2) and _close(h, 11.88)
         for x, y, w, h in canvas.rect_calls
     )

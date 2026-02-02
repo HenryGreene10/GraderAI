@@ -270,7 +270,13 @@ async def run_grade_pipeline(
             grade_result.submission_id = row["id"]
 
             pdf_source_path = row.get("normalized_pdf_path") or storage_path
-            pdf_source_bytes = download_submission_bytes(pdf_source_path)
+            pdf_source_key = strip_bucket_prefix(pdf_source_path, SUBMISSIONS_BUCKET)
+            sb = get_supabase()
+            if sb is None:
+                raise RuntimeError("Supabase client unavailable")
+            pdf_source_bytes = sb.storage.from_(SUBMISSIONS_BUCKET).download(pdf_source_key)
+            if not pdf_source_bytes:
+                raise RuntimeError(f"Submission not found: {pdf_source_path}")
             pdf_mime = "application/pdf" if row.get("normalized_pdf_path") else row.get("mime_type")
             page_sizes = get_page_sizes(pdf_source_bytes, pdf_mime)
 
