@@ -146,7 +146,8 @@ def _convert_rect(
     scale_x = page_w / norm_w
     scale_y = page_h / norm_h
     x_pt = x_px * scale_x
-    y_pt = page_h - ((y_px + h_px) * scale_y)
+    y_bottom_px = y_px + h_px
+    y_pt = page_h - (y_bottom_px * scale_y)
     return x_pt, y_pt, w_px * scale_x, h_px * scale_y
 
 
