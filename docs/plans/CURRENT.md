@@ -1,117 +1,200 @@
-# Current Plan (GraderAI MVP)
+# Current Plan (GraderAI) — Scan-Required, Batch Web Scanner
 
-## Current objective
-Automate the end-to-end workflow and review UX: upload → auto OCR → auto grade → auto marked PDF → view in-app → review/override.
+## Why this plan is changing
 
-## Supabase setup checklist
-- Status: DONE / verified for local dev.
-- Migration applied: `migrations/2025-01-21_init_schema.sql`.
-- Buckets created: `submissions`, `graded-pdfs`, `overlays`.
-- RLS policies verified:
-  - Tables: owner/teacher rows scoped by `auth.uid()`.
-  - Storage: enforce `auth.uid()` prefix in object paths and bucket name allowlists.
+• Misaligned marks and distorted PDFs come from inconsistent coordinate spaces,
+hidden resizes, and uncontrolled photo uploads.  
+• A scan-first (phone-as-scanner) flow lets us control capture, rectify once,
+and treat one canonical document artifact as truth.  
+• We are committing to **SCAN-FIRST + SCAN-REQUIRED** for production
+(no random photo or gallery uploads).
 
-## Local dev setup (short)
-- Backend env includes `SUPABASE_JWT_SECRET` (JWT auth).
-- Frontend uses `frontend/.env.local` with `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_API_BASE_URL`.
-- Do not commit `.env.local`.
+---
 
-## Backend env vars
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `SUPABASE_JWT_SECRET`
-- `SUBMISSIONS_BUCKET`
-- `GRADED_BUCKET`
-- `OVERLAYS_BUCKET`
-- `CORS_ALLOW_ORIGINS`
-- Optional OCR: `OCR_*`
+## Policy: Scan-Required
 
-## Tickets
+• All production capture must go through **QR → mobile scanner page**.  
+• The mobile page behaves like a **document scanner**, not a photo uploader.  
+• Teacher convenience is handled by:
+  – rapid capture loop (tap / auto-capture)  
+  – preview + retake gate  
+  – batch scanning per student (no per-page uploads)
 
-### Ticket 1 — Supabase foundation (DONE)
-Scope: schema, buckets, RLS, and verified backend read/write via service role.
-Acceptance checks
-- Migration applied and schema matches `migrations/2025-01-21_init_schema.sql`.
-- Buckets exist with expected names.
-- RLS policies enforce `auth.uid()` ownership and storage path prefix constraints.
-- Backend read/write succeeds to tables and buckets.
+---
 
-### Ticket 2 — Local dev wiring (DONE)
-Scope: local env wiring for frontend and backend auth.
-Acceptance checks
-- `frontend/.env.local` drives Supabase client via `import.meta.env`.
-- `VITE_API_BASE_URL` routes frontend to local backend.
-- App no longer shows "Missing Supabase env" when vars are present.
+## Canonical artifact (NEW invariant)
 
-### Ticket 3 — Uploads UI becomes source of truth (DONE)
-Scope: the uploads list is the canonical view for storage + DB state.
-Acceptance checks
-- Uploaded items appear in the UI list.
-- Preview works for each upload.
-- Delete removes the storage object and its DB row.
-Notes
-- Upload succeeds and preview shows the original file.
-- Delete is available.
-- Known non-blocking toast issue deferred.
+**Canonical grading input = one multi-page PDF per student submission.**
 
-### Ticket 4 — OCR pipeline (internal only) (DONE)
-Scope: auto-run OCR after upload for downstream grading only.
-Acceptance checks
-- Upload triggers OCR automatically.
-- OCR result is persisted and accessible to backend grading logic.
-- No frontend UI added for viewing OCR output.
-Evidence
-- Uploads row `d818c641-af5e-4dcf-8369-78b991b1823f` shows `ocr_status=done`, `ocr_text` populated, `ocr_error` null, `ocr_boxes` populated (Azure Read).
-Known OCR quirks
-- OCR may confuse commas/periods and spelling; grading must be tolerant and rely on rubric rules + context rather than exact string match.
+• Each PDF page originates from a rectified scan page.  
+• OCR, grading, overlays, and marked PDFs are **page-indexed** against this PDF.  
+• No downstream system consumes raw photos or unrectified images.
 
-### Ticket 5 — Grade + PDF (DONE)
-Scope: use OCR output to identify questions/answers and generate a marked PDF.
-Acceptance checks
-- Teacher sees the original uploaded file and the marked PDF.
-Note
-- Layout/region accuracy is approximate in MVP; refinement deferred.
+Internal details:
+• Rectified page images may exist transiently or as debug artifacts.  
+• Placement math always references:
+  – page index  
+  – page width/height derived from the rectified scan  
 
-### Ticket 6A — Review state (DONE)
-Scope: teacher can mark graded uploads as Reviewed/Overridden with a note; does NOT change grades or PDFs.
-Acceptance checks
-- State + note persist in DB and survive refresh.
-- Badge updates to Reviewed/Overridden in the uploads list.
-- Review controls only show for graded uploads.
+---
 
-### Ticket 6B — Real overrides (DESIGN LATER)
-Scope: “fix misgrade” without editable PDFs (MVP approach).
-Acceptance checks (TBD — design later)
-- Teacher can set final score and/or per-question correctness + note.
-- UI displays overridden score/state clearly.
-- Optional later: regenerate PDF with a small “override stamp” box (no full PDF editing).
+## Scan session implementation (table-based)
 
-### Ticket 7 — Frontend polish + automated workflow (NEXT)
-Scope
-1) Workflow automation (Option A)
-   - Auto-run grade + marked PDF generation after OCR completes.
-   - Remove or hide per-row “Generate marked PDF” button (deprecated).
-   - Row states reflect progress: Uploading → OCR… → Grading… → PDF ready (or Error).
-   - Disable actions during processing; show loading indicators.
-2) In-app document viewer (same window)
-   - Replace “Open marked PDF” new tab behavior with an in-app viewer (modal/drawer).
-   - Viewer supports Original + Marked PDF (tabs/toggle).
-   - Download controls inside viewer; optional “Open in new tab” link is secondary.
-3) Actions cleanup (reduce button clutter)
-   - One primary per-row action: “View”.
-   - Secondary actions in overflow menu (⋯): Review/Override (6A), Download original, Download marked PDF, Delete (confirm).
-   - Delete is destructive and always confirmed.
-4) UX quality / consistency
-   - Fix console warnings / encoding issues.
-   - Improve empty states (no assignments / no uploads).
-   - Consistent toast messages for success/failure.
-   - Better responsive spacing for action area.
-5) Safety / correctness guards
-   - If PDF not ready, hide/disable view-marked and review actions.
-   - Show clear error status + “Retry” action for failed OCR/grade/PDF (retry can be stubbed initially).
-Acceptance checks
-- Uploading a file automatically results in a marked PDF without any manual “Generate” action.
-- Marked PDF can be viewed in-app without opening a new browser tab/window.
-- Row actions are simplified (View + overflow); no more 5-button row clusters.
-- Status/progress chips update correctly and persist after refresh.
-- No obvious console warnings; key flows show clear success/error messaging.
+• Add minimal Supabase table `scan_sessions`:
+  - id (uuid)  
+  - token (random)  
+  - owner_id  
+  - assignment_id  
+  - status  
+  - created_at  
+  - expires_at  
+
+• TTL: `expires_at ≤ 15 minutes`  
+• RLS:
+  - owner_id = auth.uid() can create/read sessions  
+  - token use validated server-side  
+• Scan session may produce **multiple student submissions**.
+
+---
+
+## Scan workflow (QR → batch → per student)
+
+### Mobile scanner behavior
+
+• Live camera with document frame overlay  
+• Capture → **rectify + preview** → Use / Retake  
+• Accepted pages accumulate in a **current student packet**  
+• Teacher taps **Finish student** to close the packet  
+• Packet is converted into **one multi-page PDF** and uploaded once  
+• Memory is cleared; scanning continues for next student  
+
+No individual photo uploads. No per-page upload rows.
+
+---
+
+## Storage & write targets
+
+### Student scan output
+
+• For each finished student packet:
+  - Create **one submission row**
+  - Store canonical PDF at:
+    `submissions/{owner}/{submission}.pdf`
+  - Store metadata:
+    – page_count
+    – per-page width/height (from rectified pages)
+
+### Artifacts generated
+
+• Canonical input:
+  - `submissions/{owner}/{submission}.pdf`
+
+• Derived:
+  - `graded-pdfs/{owner}/{submission}.pdf`
+  - `overlays/{owner}/{submission}.json` (page-indexed)
+
+---
+
+## Tickets (minimal-risk ordering)
+
+### Ticket 0 — Overlay styling scale (readability)
+_(unchanged, but must be completed first)_
+
+---
+
+### Ticket 1 — Batch Web Scanner (QR → Rectify → Student Packets)
+
+Scope  
+• Scan session creation + QR display on desktop  
+• Mobile scanner page `/scan/<token>`  
+• OpenCV.js rectification (client-side)  
+• Preview + retake gate  
+• Page tray per student  
+• “Finish student” → build multi-page PDF (client) → upload once  
+
+Acceptance checks  
+• Scan 5–10 pages rapidly into one student PDF  
+• No per-page uploads created  
+• Session continues cleanly to next student  
+
+Do NOT do  
+• No OCR / grading  
+• No legacy upload paths  
+
+---
+
+### Ticket 2 — Quality Gate + Scan Enforcement
+
+Scope  
+• Blur / edge / confidence checks  
+• Force retake if scan quality is insufficient  
+• Backend rejects non-scan uploads in production mode  
+
+Acceptance checks  
+• Bad scans cannot proceed  
+• Scan-required invariant enforced  
+
+---
+
+### Ticket 3 — Page-Aware OCR + Grading
+
+Scope  
+• Render PDF pages to images  
+• OCR per page  
+• Grading operates per page index  
+• Overlay JSON becomes `{ pages: [...] }`
+
+Acceptance checks  
+• OCR + overlays align page-by-page  
+• Known scans render correct marks  
+
+---
+
+### Ticket 4 — Lock PDF Sizing + Overlay Mapping (Hard Invariants)
+
+Scope  
+• PDF page size derived from rectified scan page size  
+• No rescaling after placement math  
+• Overlay mapping is page-indexed  
+
+---
+
+### Ticket 5 (Optional) — Deprecate Legacy Paths
+
+Unchanged: keep legacy paths for non-scan inputs, but bypass entirely for scan sessions.
+
+---
+
+## Guardrail: Prevent Legacy Path Leakage
+
+• Scan-first flow MUST NOT call legacy photo or normalization paths.  
+• If legacy code remains, it must be bypassed entirely for scan sessions.
+
+---
+
+## Local dev networking (phone scan, no LAN backend)
+
+• Start backend (loopback only):
+  uvicorn backend.app:app --host 127.0.0.1 --port 8000
+• Start Vite (LAN reachable):
+  npm --prefix frontend run dev -- --host 0.0.0.0 --port 5173
+• Set `VITE_PUBLIC_BASE_URL=http://<LAN_IP>:5173` in `frontend/.env.local`.
+• Phone opens `http://<LAN_IP>:5173/scan/<token>`.
+• Vite proxies `/api/*` to `http://127.0.0.1:8000`, so backend stays off-LAN.
+
+---
+
+## Debug protocol (page-aware)
+
+For any failing submission, record:
+
+• Page count  
+• For one sample page:
+  – rectified width/height (px)  
+  – PDF mediabox size (pt)  
+  – overlay assumed size  
+  – sx/sy mapping ratios  
+• Save artifacts:
+  – rectified page image  
+  – overlay JSON  
+  – marked multi-page PDF

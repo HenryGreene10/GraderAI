@@ -1,7 +1,7 @@
 // frontend/src/components/FileRow.jsx
 import React, { useEffect, useRef, useState } from "react";
 import { startOCR } from "../lib/ocr";
-import { API_BASE } from "../lib/apiBase";
+import { apiBase } from "../lib/apiBase";
 import { supabase } from "../lib/supabaseClient";
 
 async function getAuthHeaders() {
@@ -70,7 +70,7 @@ function FileRow({ file }) {
   // Update OCR status only (no text shown)
   const refreshOCR = async () => {
     const headers = await getAuthHeaders();
-    const r = await fetch(`${API_BASE}/api/ocr/status/${file.id}`, {
+    const r = await fetch(`${apiBase()}/api/ocr/status/${file.id}`, {
       method: "GET",
       headers,
     });
@@ -170,7 +170,7 @@ function FileRow({ file }) {
 
       const body = { per_question: { q5, q6a, q6b } };
       const headers = await getAuthHeaders();
-      const res = await fetch(`${API_BASE}/api/override`, {
+      const res = await fetch(`${apiBase()}/api/override`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...headers },
         body: JSON.stringify({ upload_id: String(file.id), overrides: body }),
@@ -190,7 +190,7 @@ function FileRow({ file }) {
   const createPdf = async () => {
     try {
       const headers = await getAuthHeaders();
-      const res = await fetch(`${API_BASE}/api/uploads/${file.id}/grade`, {
+      const res = await fetch(`${apiBase()}/api/uploads/${file.id}/grade`, {
         method: "POST",
         headers,
       });

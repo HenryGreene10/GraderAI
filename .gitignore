@@ -21,6 +21,7 @@ coverage/
 backend/.env
 frontend/.env
 frontend/.env.local
+frontend/.cert/
 
 # OS
 .DS_Store

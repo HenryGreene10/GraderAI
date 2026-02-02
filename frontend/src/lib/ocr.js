@@ -1,6 +1,6 @@
 // frontend/src/lib/ocr.js
 import { supabase } from "./supabaseClient";
-import { API_BASE } from "./apiBase";
+import { apiBase } from "./apiBase";
 
 /** Fetch current user's id (ownerId) */
 async function getOwnerId() {
@@ -27,7 +27,7 @@ export async function startOCR(uploadId, ownerIdParam) {
   const ownerId = ownerIdParam || (await getOwnerId());
   const authHeaders = await getAuthHeaders(ownerId);
 
-  const r = await fetch(`${API_BASE}/api/ocr/start`, {
+  const r = await fetch(`${apiBase()}/api/ocr/start`, {
     method: "POST",
     mode: "cors",
     headers: {
@@ -55,7 +55,7 @@ export async function getOCRStatus(uploadId) {
   const ownerId = await getOwnerId();
   const authHeaders = await getAuthHeaders(ownerId);
 
-  const r = await fetch(`${API_BASE}/api/ocr/status/${uploadId}`, {
+  const r = await fetch(`${apiBase()}/api/ocr/status/${uploadId}`, {
     method: "GET",
     mode: "cors",
     headers: authHeaders,
@@ -82,7 +82,7 @@ export function pollOCR(uploadId, onTick, intervalMs = 1500) {
       const authHeaders = await getAuthHeaders(ownerId);
       // simple polling loop
       while (!stopped) {
-        const r = await fetch(`${API_BASE}/api/ocr/status/${uploadId}`, {
+        const r = await fetch(`${apiBase()}/api/ocr/status/${uploadId}`, {
           headers: authHeaders,
           mode: "cors",
         });

@@ -13,7 +13,7 @@ def test_upload_override_persists(fake_supabase):
         "id": "u7",
         "owner_id": "owner-1",
         "storage_path": "submissions/owner-1/u7.pdf",
-        "status": "graded",
+        "status": "pdf_ready",
     }
 
     client = TestClient(app)

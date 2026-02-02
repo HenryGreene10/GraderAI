@@ -16,7 +16,7 @@ def test_delete_assignment_cascades(fake_supabase):
         "assignment_id": "a1",
         "storage_path": "submissions/owner-1/a1/u1.pdf",
         "graded_pdf_path": "owner-1/u1.pdf",
-        "overlay_path": "owner-1/u1.json",
+        "overlay_path": "overlays/owner-1/u1.json",
     }
     db["uploads"]["u2"] = {
         "id": "u2",

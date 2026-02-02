@@ -1,11 +1,12 @@
 import { supabase } from "./supabaseClient";
 
-export const API_BASE =
-  import.meta?.env?.VITE_API_BASE_URL ||
-  import.meta?.env?.VITE_BACKEND_BASE ||
-  import.meta?.env?.VITE_BACKEND_URL ||
-  import.meta?.env?.VITE_API_BASE ||
-  "http://localhost:8000";
+export function publicBase() {
+  return import.meta.env.VITE_PUBLIC_BASE_URL ?? window.location.origin;
+}
+
+export function apiBase() {
+  return window.location.origin;
+}
 
 export async function getAuthHeaders() {
   const { data } = await supabase.auth.getSession();
@@ -19,7 +20,7 @@ export async function getAuthHeaders() {
 export async function apiFetch(path, options = {}) {
   const headers = options.headers ? { ...options.headers } : {};
   const authHeaders = await getAuthHeaders();
-  return fetch(`${API_BASE}${path}`, {
+  return fetch(`${apiBase()}${path}`, {
     ...options,
     headers: { ...headers, ...authHeaders },
   });

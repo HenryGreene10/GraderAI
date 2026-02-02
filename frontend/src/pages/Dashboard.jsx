@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import {
@@ -11,6 +11,16 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Table,
   TableBody,
   TableCell,
@@ -22,9 +32,6 @@ import { useToast } from "@/hooks/use-toast";
 import { apiFetch } from "../lib/apiBase";
 import { supabase } from "../lib/supabaseClient";
 
-const ACCEPTED_MIME = ["image/png", "image/jpeg", "application/pdf"];
-const ACCEPTED_EXT = [".png", ".jpg", ".jpeg", ".pdf"];
-
 function formatDate(value) {
   if (!value) return "-";
   const date = new Date(value);
@@ -32,23 +39,17 @@ function formatDate(value) {
   return date.toLocaleDateString();
 }
 
-function formatSize(bytes) {
-  if (!bytes && bytes !== 0) return "";
-  const units = ["B", "KB", "MB", "GB"];
-  let size = bytes;
-  let idx = 0;
-  while (size >= 1024 && idx < units.length - 1) {
-    size /= 1024;
-    idx += 1;
+async function readErrorResponse(resp) {
+  const text = await resp.text().catch(() => "");
+  let message = text;
+  try {
+    const data = JSON.parse(text);
+    message = data?.detail || data?.message || text;
+  } catch {
+    // ignore JSON parse errors
   }
-  return `${size.toFixed(size < 10 ? 1 : 0)} ${units[idx]}`;
-}
-
-function isAllowedFile(file) {
-  if (!file) return false;
-  if (ACCEPTED_MIME.includes(file.type)) return true;
-  const name = String(file.name || "").toLowerCase();
-  return ACCEPTED_EXT.some((ext) => name.endsWith(ext));
+  if (!message) message = resp.statusText || "Request failed";
+  return { status: resp.status, message };
 }
 
 export default function Dashboard() {
@@ -61,11 +62,10 @@ export default function Dashboard() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [files, setFiles] = useState([]);
   const [submitting, setSubmitting] = useState(false);
-  const fileInputRef = useRef(null);
-
-  const fileCount = useMemo(() => files.length, [files]);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
@@ -77,7 +77,6 @@ export default function Dashboard() {
     if (!dialogOpen) {
       setTitle("");
       setDescription("");
-      setFiles([]);
       setSubmitting(false);
     }
   }, [dialogOpen]);
@@ -87,8 +86,14 @@ export default function Dashboard() {
     try {
       const resp = await apiFetch("/api/assignments");
       if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        throw new Error(text || `Failed: ${resp.status}`);
+        const { status, message } = await readErrorResponse(resp);
+        toast({
+          variant: "destructive",
+          title: "Failed to load assignments",
+          description: `Status ${status}: ${message}`,
+        });
+        setAssignments([]);
+        return;
       }
       const data = await resp.json();
       setAssignments(data.assignments || []);
@@ -96,7 +101,7 @@ export default function Dashboard() {
       toast({
         variant: "destructive",
         title: "Failed to load assignments",
-        description: err?.message || "Try again.",
+        description: `Status network_error: ${err?.message || "Try again."}`,
       });
       setAssignments([]);
     } finally {
@@ -108,48 +113,10 @@ export default function Dashboard() {
     loadAssignments();
   }, []);
 
-  const addFiles = (incoming) => {
-    const list = Array.from(incoming || []);
-    if (!list.length) return;
-    const rejected = list.filter((file) => !isAllowedFile(file));
-    if (rejected.length) {
-      toast({
-        variant: "destructive",
-        title: "Unsupported file type",
-        description: rejected.map((f) => f.name).join(", "),
-      });
-    }
-    const accepted = list.filter(isAllowedFile);
-    setFiles((prev) => {
-      const existing = new Set(prev.map((f) => `${f.name}-${f.size}`));
-      const merged = [...prev];
-      accepted.forEach((file) => {
-        const key = `${file.name}-${file.size}`;
-        if (!existing.has(key)) merged.push(file);
-      });
-      return merged;
-    });
-  };
-
-  const removeFileAt = (index) => {
-    setFiles((prev) => prev.filter((_, idx) => idx !== index));
-  };
-
-  const openPicker = () => {
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-      fileInputRef.current.click();
-    }
-  };
-
-  async function handleCreateAndUpload() {
+  async function handleCreateAssignment() {
     const trimmed = title.trim();
     if (!trimmed) {
       toast({ variant: "destructive", title: "Assignment name is required" });
-      return;
-    }
-    if (files.length === 0) {
-      toast({ variant: "destructive", title: "Add at least one file" });
       return;
     }
 
@@ -164,8 +131,13 @@ export default function Dashboard() {
         }),
       });
       if (!createResp.ok) {
-        const text = await createResp.text().catch(() => "");
-        throw new Error(text || `Create failed: ${createResp.status}`);
+        const { status, message } = await readErrorResponse(createResp);
+        toast({
+          variant: "destructive",
+          title: "Create failed",
+          description: `Status ${status}: ${message}`,
+        });
+        return;
       }
       const createData = await createResp.json();
       const assignmentId = createData.assignment?.id || createData.id;
@@ -173,30 +145,18 @@ export default function Dashboard() {
         throw new Error("Missing assignment id from server");
       }
 
-      const formData = new FormData();
-      files.forEach((file) => formData.append("files", file));
-
-      const uploadResp = await apiFetch(`/api/assignments/${assignmentId}/uploads`, {
-        method: "POST",
-        body: formData,
-      });
-      if (!uploadResp.ok) {
-        const text = await uploadResp.text().catch(() => "");
-        throw new Error(text || `Upload failed: ${uploadResp.status}`);
-      }
-
       toast({
         title: "Assignment created",
-        description: `Uploaded ${files.length} file${files.length > 1 ? "s" : ""}.`,
+        description: "Scan the master key to continue.",
       });
       setDialogOpen(false);
       await loadAssignments();
-      navigate(`/assignments?assignmentId=${assignmentId}`);
+      navigate(`/assignments?assignmentId=${assignmentId}&scan=master_key`);
     } catch (err) {
       toast({
         variant: "destructive",
-        title: "Create & upload failed",
-        description: err?.message || "Try again.",
+        title: "Create failed",
+        description: `Status network_error: ${err?.message || "Try again."}`,
       });
     } finally {
       setSubmitting(false);
@@ -207,6 +167,30 @@ export default function Dashboard() {
     await supabase.auth.signOut();
     window.location.href = "/auth";
   };
+
+  async function handleDeleteAssignment() {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
+    try {
+      const resp = await apiFetch(`/api/assignments/${deleteTarget.id}`, { method: "DELETE" });
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `Delete failed: ${resp.status}`);
+      }
+      setAssignments((prev) => prev.filter((row) => row.id !== deleteTarget.id));
+      toast({ title: "Assignment deleted" });
+      setDeleteOpen(false);
+      setDeleteTarget(null);
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Delete failed",
+        description: err?.message || "Try again.",
+      });
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   return (
     <div className="p-6 space-y-6">
@@ -235,7 +219,7 @@ export default function Dashboard() {
             <DialogHeader>
               <DialogTitle>Create assignment</DialogTitle>
               <DialogDescription>
-                Name the assignment, then upload student work in the same step.
+                Name the assignment, then scan the master key.
               </DialogDescription>
             </DialogHeader>
 
@@ -260,54 +244,6 @@ export default function Dashboard() {
                   onChange={(e) => setDescription(e.target.value)}
                 />
               </div>
-
-              {title.trim() ? (
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Upload files</label>
-                  <div className="flex items-center gap-3">
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      multiple
-                      accept={ACCEPTED_MIME.join(",")}
-                      className="hidden"
-                      onChange={(e) => addFiles(e.target.files)}
-                    />
-                    <Button variant="secondary" type="button" onClick={openPicker}>
-                      Add files
-                    </Button>
-                    <span className="text-xs text-muted-foreground">
-                      PNG, JPG, or PDF
-                    </span>
-                  </div>
-
-                  {fileCount > 0 && (
-                    <div className="max-h-48 overflow-auto rounded-md border border-border p-2">
-                      <div className="space-y-2">
-                        {files.map((file, idx) => (
-                          <div key={`${file.name}-${file.size}`} className="flex items-center justify-between gap-2 text-sm">
-                            <div className="truncate">
-                              {file.name} <span className="text-muted-foreground">({formatSize(file.size)})</span>
-                            </div>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              type="button"
-                              onClick={() => removeFileAt(idx)}
-                            >
-                              Remove
-                            </Button>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="rounded-md border border-dashed border-border p-4 text-sm text-muted-foreground">
-                  Enter a name to start selecting files.
-                </div>
-              )}
             </div>
 
             <DialogFooter className="gap-2 sm:gap-0">
@@ -321,10 +257,10 @@ export default function Dashboard() {
               </Button>
               <Button
                 type="button"
-                onClick={handleCreateAndUpload}
-                disabled={!title.trim() || files.length === 0 || submitting}
+                onClick={handleCreateAssignment}
+                disabled={!title.trim() || submitting}
               >
-                {submitting ? "Uploading..." : "Create & Upload"}
+                {submitting ? "Creating..." : "Create assignment"}
               </Button>
             </DialogFooter>
           </DialogContent>
@@ -345,7 +281,7 @@ export default function Dashboard() {
             {assignments.length === 0 && !loading && (
               <TableRow>
                 <TableCell colSpan={4} className="text-center text-muted-foreground">
-                  No assignments yet. Create one to start uploading.
+                  No assignments yet. Create one to start scanning.
                 </TableCell>
               </TableRow>
             )}
@@ -355,19 +291,50 @@ export default function Dashboard() {
                 <TableCell>{formatDate(assignment.created_at)}</TableCell>
                 <TableCell>{assignment.uploads_count ?? 0}</TableCell>
                 <TableCell className="text-right">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => navigate(`/assignments?assignmentId=${assignment.id}`)}
-                  >
-                    Open
-                  </Button>
+                  <div className="flex justify-end gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => navigate(`/assignments?assignmentId=${assignment.id}`)}
+                    >
+                      Open
+                    </Button>
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => {
+                        setDeleteTarget(assignment);
+                        setDeleteOpen(true);
+                      }}
+                    >
+                      Delete
+                    </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}
           </TableBody>
         </Table>
       </div>
+
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Delete assignment “{deleteTarget?.title || "Assignment"}”?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This will remove the assignment and its uploads. This cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDeleteAssignment} disabled={deleting}>
+              {deleting ? "Deleting..." : "Delete"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

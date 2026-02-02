@@ -1,4 +1,7 @@
 import datetime as dt
+import logging
+import os
+from io import BytesIO
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -22,8 +25,12 @@ from ..services.grader import (
     parse_questions,
 )
 from ..services.ocr import normalize_ocr_result
-from ..services.report import flatten_to_pdf
-from ..services.storage import download_submission_bytes, upload_bytes, upload_json
+from ..services.report import build_minimal_overlay, flatten_to_pdf
+from ..services.scan_pipeline import prepare_ocr_image
+from ..services.storage import download_submission_bytes, normalize_storage_path, upload_bytes, upload_json
+from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["grade"])
 
@@ -34,6 +41,14 @@ class StartGradeBody(BaseModel):
 
 def _utc_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _log_ocr_image_size(tag: str, image_bytes: bytes) -> None:
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            logger.info("%s OCR input size: %sx%s px", tag, img.width, img.height)
+    except Exception:
+        return
 
 
 def _needs_review(result: GradeResult, ocr_confidence: Optional[float], text: str) -> bool:
@@ -60,12 +75,62 @@ async def _ensure_ocr(row: dict) -> dict:
         raise HTTPException(status_code=400, detail="Missing storage_path")
 
     blob = download_submission_bytes(storage_path)
-    raw = await ocr_service.extract_text(image_bytes=blob)
+    scan_artifacts = None
+    scan_error = None
+    ocr_bytes = blob
+    try:
+        ocr_bytes, scan_artifacts = prepare_ocr_image(
+            blob,
+            row.get("mime_type"),
+            row.get("owner_id") or "unknown",
+            row["id"],
+        )
+    except Exception as exc:
+        scan_error = str(exc)
+        ocr_bytes = blob
+
+    provider = os.getenv("OCR_PROVIDER", "").strip().lower()
+    if provider == "azure":
+        if scan_artifacts:
+            ocr_bytes = scan_artifacts.normalized_image_bytes
+        else:
+            normalized_path = row.get("normalized_image_path")
+            if normalized_path:
+                try:
+                    ocr_bytes = download_submission_bytes(normalized_path)
+                except Exception:
+                    ocr_bytes = blob
+
+    _log_ocr_image_size("_ensure_ocr", ocr_bytes)
+    try:
+        raw = await ocr_service.extract_text(image_bytes=ocr_bytes)
+    except Exception as exc:
+        update_upload(
+            row["id"],
+            {
+                "ocr_status": "error",
+                "status": "error",
+                "ocr_error": str(exc),
+                "updated_at": _utc_iso(),
+            },
+        )
+        raise HTTPException(status_code=500, detail=f"OCR failed: {exc}")
     norm = normalize_ocr_result(raw)
     text = (norm.get("text") or "").strip()
     if not text:
+        update_upload(
+            row["id"],
+            {
+                "ocr_status": "error",
+                "status": "error",
+                "ocr_error": "OCR returned empty text",
+                "updated_at": _utc_iso(),
+            },
+        )
         raise HTTPException(status_code=422, detail="OCR returned empty text")
 
+    scan_failed = bool(scan_artifacts and not scan_artifacts.scan_ok) or bool(scan_error)
+    needs_review = bool(row.get("needs_review")) or scan_failed
     update_upload(
         row["id"],
         {
@@ -76,6 +141,13 @@ async def _ensure_ocr(row: dict) -> dict:
             "ocr_boxes": norm.get("boxes"),
             "ocr_confidence": norm.get("confidence"),
             "ocr_error": None,
+            "normalized_image_path": scan_artifacts.normalized_image_path if scan_artifacts else None,
+            "normalized_pdf_path": scan_artifacts.normalized_pdf_path if scan_artifacts else None,
+            "normalized_width_px": scan_artifacts.width_px if scan_artifacts else None,
+            "normalized_height_px": scan_artifacts.height_px if scan_artifacts else None,
+            "scan_status": "normalized" if (scan_artifacts and scan_artifacts.scan_ok) else ("fallback" if scan_failed else None),
+            "scan_error": (scan_artifacts.error if scan_artifacts else scan_error),
+            "needs_review": needs_review,
             "updated_at": _utc_iso(),
         },
     )
@@ -92,7 +164,10 @@ async def start_grade(
     row = get_upload(
         body.upload_id,
         caller_id,
-        columns="id,owner_id,storage_path,ocr_text,extracted_text,ocr_boxes,ocr_confidence",
+        columns=(
+            "id,owner_id,storage_path,ocr_text,extracted_text,ocr_boxes,"
+            "ocr_confidence,mime_type,needs_review,normalized_image_path"
+        ),
     )
 
     ocr_result = await _ensure_ocr(row)
@@ -106,6 +181,11 @@ async def start_grade(
     result.prompt_version = PROMPT_VERSION
 
     overlay: Overlay = build_overlay_for_result(result)
+    overlay_missing = False
+    if not overlay or not overlay.marks:
+        overlay_missing = True
+        logger.warning("overlay_missing upload_id=%s using minimal overlay", row["id"])
+        overlay = build_minimal_overlay(row["id"], result.total_score, result.total_max)
     summary = (
         f"Submission: {row['id']}\n"
         f"Total: {result.total_score}/{result.total_max}\n"
@@ -116,20 +196,34 @@ async def start_grade(
 
     owner_id = row.get("owner_id") or caller_id or "unknown"
     overlay_key = f"{owner_id}/{row['id']}.json"
+    overlay_path = normalize_storage_path(OVERLAYS_BUCKET, overlay_key)
     pdf_key = f"{owner_id}/{row['id']}.pdf"
 
+    overlay_upload_failed = False
     try:
         upload_json(OVERLAYS_BUCKET, overlay_key, overlay.model_dump())
-    except Exception:
-        # Best-effort overlay upload
-        pass
+    except Exception as exc:
+        overlay_upload_failed = True
+        logger.warning("overlay_upload_failed upload_id=%s error=%s", row["id"], exc)
 
     try:
         upload_bytes(GRADED_BUCKET, pdf_key, pdf_bytes, "application/pdf")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"PDF upload failed: {exc}")
 
-    needs_review = _needs_review(result, ocr_result.get("confidence"), text)
+    needs_review = (
+        _needs_review(result, ocr_result.get("confidence"), text)
+        or bool(row.get("needs_review"))
+        or overlay_upload_failed
+        or overlay_missing
+    )
+
+    logger.info(
+        "overlay_generated upload_id=%s overlay_path=%s marks=%s",
+        row["id"],
+        overlay_path,
+        len(overlay.marks),
+    )
 
     update_upload(
         row["id"],
@@ -137,7 +231,7 @@ async def start_grade(
             "status": "graded",
             "needs_review": needs_review,
             "graded_pdf_path": pdf_key,
-            "overlay_path": overlay_key,
+            "overlay_path": overlay_path,
             "overlay_json": overlay.model_dump(),
             "grade_json": result.model_dump(),
             "rubric_version": result.rubric_version,
@@ -151,6 +245,6 @@ async def start_grade(
         "upload_id": row["id"],
         "needs_review": needs_review,
         "graded_pdf_path": pdf_key,
-        "overlay_path": overlay_key,
+        "overlay_path": overlay_path,
         "grade": result.model_dump(),
     }
