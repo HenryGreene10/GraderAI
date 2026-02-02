@@ -185,11 +185,20 @@ def _draw_marks(
                 w_px, h_px = mark.coords[2:4]
                 x, y, w, h = x_px, y_px, w_px, h_px
                 if normalized_size_px and page_size_pt:
-                    x, y, w, h = _convert_rect(x_px, y_px, w_px, h_px, normalized_size_px, page_size_pt)
+                    norm_w, norm_h = normalized_size_px
+                    page_w, page_h = page_size_pt
+                    if norm_w > 0 and norm_h > 0:
+                        sx = page_w / norm_w
+                        sy = page_h / norm_h
+                        x = x_px * sx
+                        w = w_px * sx
+                        h = h_px * sy
+                        y = page_h - ((y_px + h_px) * sy)
                 c.setFillColorRGB(1, 1, 1)
                 c.rect(x, y, w, h, stroke=1, fill=1)
                 c.setFillColorRGB(0, 0, 0)
-                c.drawString(x + 6, y + max(6, (h - 12) / 2), mark.text or "")
+                text_y = y + max(6, (h - 12) / 2)
+                c.drawString(x + 6, text_y, mark.text or "")
             else:
                 x, y = (x_px, y_px)
                 if normalized_size_px and page_size_pt:
@@ -199,7 +208,15 @@ def _draw_marks(
             w_px, h_px = mark.coords[2:4]
             x, y, w, h = x_px, y_px, w_px, h_px
             if normalized_size_px and page_size_pt:
-                x, y, w, h = _convert_rect(x_px, y_px, w_px, h_px, normalized_size_px, page_size_pt)
+                norm_w, norm_h = normalized_size_px
+                page_w, page_h = page_size_pt
+                if norm_w > 0 and norm_h > 0:
+                    sx = page_w / norm_w
+                    sy = page_h / norm_h
+                    x = x_px * sx
+                    w = w_px * sx
+                    h = h_px * sy
+                    y = page_h - ((y_px + h_px) * sy)
             c.setFillColorRGB(1, 1, 0)
             c.rect(x, y, w, h, stroke=0, fill=1)
             c.setFillColorRGB(0, 0, 0)
