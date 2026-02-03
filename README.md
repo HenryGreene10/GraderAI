@@ -62,6 +62,9 @@ Optional for QR links:
 ```
 VITE_PUBLIC_BASE_URL=https://$LAN_IP:5173
 ```
+If unset, the scan/QR links fall back to `window.location.origin`. During `npm run dev`, the
+frontend auto-populates `VITE_PUBLIC_BASE_URL` with the current LAN IP when available so QR links
+match the Vite Network address.
 
 4) iPhone trust steps:
    - Find the mkcert CA with `mkcert -CAROOT`, copy `rootCA.pem` to the iPhone and install it.
@@ -79,6 +82,7 @@ Frontend:
 - `VITE_BACKEND_URL`
 - `VITE_SUPABASE_URL`
 - `VITE_SUPABASE_ANON_KEY`
+- `VITE_PUBLIC_BASE_URL` (optional; defaults to `window.location.origin`)
 
 ## Sample flow (developer)
 1) Create assignment.
