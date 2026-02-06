@@ -74,6 +74,20 @@ def _extract_signed_url(result: object) -> Optional[str]:
     return None
 
 
+def _regions_have_px_boxes(regions_payload: object) -> bool:
+    regions_map, _ = parse_regions_payload(regions_payload)
+    for entry in regions_map.values():
+        box = entry.get("answer_box") or {}
+        vals = [box.get("x"), box.get("y"), box.get("w"), box.get("h")]
+        try:
+            max_val = max(float(v) for v in vals if v is not None)
+        except ValueError:
+            continue
+        if max_val > 1.5:
+            return True
+    return False
+
+
 @router.get("/{upload_id}/preview")
 def preview_upload(
     upload_id: str,
@@ -253,12 +267,17 @@ async def run_grade_pipeline(
         template_storage_path = None
         template_version = None
         template_png = None
+        template_width_px = None
+        template_height_px = None
         if row.get("assignment_id"):
             try:
                 assignment = get_assignment(
                     row["assignment_id"],
                     user_id,
-                    columns="id,template_storage_path,template_regions_json,template_version",
+                    columns=(
+                        "id,template_storage_path,template_regions_json,template_version,"
+                        "template_width_px,template_height_px"
+                    ),
                 )
             except HTTPException:
                 assignment = None
@@ -266,6 +285,8 @@ async def run_grade_pipeline(
             template_regions = assignment.get("template_regions_json") or []
             template_storage_path = assignment.get("template_storage_path")
             template_version = assignment.get("template_version")
+            template_width_px = assignment.get("template_width_px")
+            template_height_px = assignment.get("template_height_px")
 
         regions_map, _ = parse_regions_payload(template_regions)
         regions_present = isinstance(template_regions, dict) and bool(regions_map)
@@ -546,7 +567,14 @@ async def run_grade_pipeline(
                 smoke_score_text = "Score: (unavailable) — NEEDS REVIEW"
 
         normalized_size_px = None
-        if not template_used and normalized_size[0] > 0 and normalized_size[1] > 0:
+        if (
+            template_regions
+            and _regions_have_px_boxes(template_regions)
+            and template_width_px
+            and template_height_px
+        ):
+            normalized_size_px = (float(template_width_px), float(template_height_px))
+        elif not template_used and normalized_size[0] > 0 and normalized_size[1] > 0:
             normalized_size_px = normalized_size
 
         pdf_bytes = render_marked_pdf(

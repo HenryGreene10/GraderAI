@@ -299,6 +299,19 @@ def render_marked_pdf(
             if page_index == 0:
                 page_width = float(page.mediabox.width)
                 page_height = float(page.mediabox.height)
+                sx = None
+                sy = None
+                if normalized_size_px:
+                    norm_w, norm_h = normalized_size_px
+                    sx = page_width / norm_w if norm_w else None
+                    sy = page_height / norm_h if norm_h else None
+                logger.info(
+                    "overlay_scale sx=%s sy=%s page_pt=%s norm_px=%s",
+                    sx,
+                    sy,
+                    (page_width, page_height),
+                    normalized_size_px,
+                )
                 extra_marks: List[OverlayMark] = []
                 if not missing and mark_count == 0:
                     extra_marks.append(
@@ -370,6 +383,19 @@ def render_marked_pdf(
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=(width, height))
     c.drawImage(img, 0, 0, width=width, height=height)
+    sx = None
+    sy = None
+    if normalized_size_px:
+        norm_w, norm_h = normalized_size_px
+        sx = width / norm_w if norm_w else None
+        sy = height / norm_h if norm_h else None
+    logger.info(
+        "overlay_scale sx=%s sy=%s page_pt=%s norm_px=%s",
+        sx,
+        sy,
+        (width, height),
+        normalized_size_px,
+    )
     if missing:
         _draw_missing_overlay_banner(c, width, height, banner_text)
     else:

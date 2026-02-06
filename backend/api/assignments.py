@@ -581,17 +581,25 @@ async def upload_template(
         }
     ).eq("id", assignment_id).execute()
 
+    logger.info(
+        "template_regions_saved assignment_id=%s regions=%s template_w=%s template_h=%s",
+        assignment_id,
+        len(template_regions.get("regions") or {}),
+        template_w,
+        template_h,
+    )
+    if not template_regions.get("regions"):
+        logger.warning("template_regions_empty assignment_id=%s", assignment_id)
+        try:
+            sb.table("assignments").update({"needs_review": True}).eq("id", assignment_id).execute()
+        except Exception as exc:
+            logger.warning("template_regions_empty_needs_review_failed assignment_id=%s error=%s", assignment_id, exc)
+
     had_template = bool(assignment.get("template_storage_path") and assignment.get("template_regions_json"))
     if had_template:
         sb.table("uploads").update({"needs_review": True}).eq("assignment_id", assignment_id).eq(
             "owner_id", user_id
         ).execute()
-
-    logger.info(
-        "template_regions_detected=%s qids=%s",
-        len(template_regions.get("regions") or {}),
-        list((template_regions.get("regions") or {}).keys()),
-    )
 
     return {
         "ok": True,
