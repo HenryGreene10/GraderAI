@@ -36,21 +36,25 @@ Persist OCR text for:
 • student submission  
 Expose OCR output via logs, admin UI, or a debug endpoint.
 
-### Ticket A3 — Structured Answer Key Extraction
+### Ticket A3 — Structured Answer Key Extraction (DONE)
 Use LLM only to extract answers into strict JSON:
 ```
 { "question_number": "expected_answer" }
 ```
 No grading in this step.
 
-### Ticket A4 — Structured Student Answer Extraction
+### Ticket A4 — Structured Student Answer Extraction (DONE)
 Extract student answers into the same JSON schema.  
 Ignore scratch work where possible.
 
-### Ticket A5 — Deterministic Scoring Engine
+### Ticket A5 — Deterministic Scoring + Master-Key Overlay Placement
 Compare key JSON vs student JSON in code.  
-Support numeric tolerance, formatting variants, and equivalents.  
-Produce per-question correctness + score.
+Place marks using master-key regions (no student OCR geometry).  
+
+Acceptance checks:
+• Given master key + student scan, system produces marked PDF with ✓/✗ in the correct question regions.  
+• If region for a QID can’t be found → mark needs_review and do NOT place a mark.  
+• Deterministic scoring for this worksheet type (quotient + remainder).
 
 ### Ticket A6 — Overlay + Marked PDF Validation
 Ensure overlays align correctly.  

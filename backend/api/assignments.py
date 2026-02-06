@@ -8,19 +8,21 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Literal, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 from ..auth import get_current_user_id
 from ..config import GRADED_BUCKET, OVERLAYS_BUCKET, SUBMISSIONS_BUCKET
 from ..services.db import get_assignment, require_supabase
-from ..services.storage import normalize_storage_path, strip_bucket_prefix, upload_bytes
+from ..services.storage import download_submission_bytes, normalize_storage_path, strip_bucket_prefix, upload_bytes
 from io import BytesIO
 
 from PIL import Image
 
 from ..services.scanner import MAX_DIM_PX, normalize_image_bytes
 from ..services import ocr as ocr_service
+from ..services.ocr import normalize_ocr_result
+from ..services.answer_extraction import extract_answers_from_ocr
 from ..services.template import (
     TemplateValidationError,
     detect_answer_boxes,
@@ -326,6 +328,87 @@ def list_assignment_uploads(
     return {"uploads": uploads}
 
 
+@router.get("/{assignment_id}/template-ocr")
+async def get_template_ocr(
+    assignment_id: str,
+    user_id: str = Depends(get_current_user_id),
+    include_raw: bool = Query(False),
+):
+    row = get_assignment(
+        assignment_id,
+        user_id,
+        columns="id,owner_id,template_storage_path,template_regions_json,template_uploaded_at",
+    )
+    regions = row.get("template_regions_json") or []
+    if not row.get("template_storage_path"):
+        raise HTTPException(status_code=404, detail="template_missing")
+    payload_regions = []
+    if isinstance(regions, list):
+        for region in regions:
+            if not isinstance(region, dict):
+                continue
+            payload_regions.append(
+                {
+                    "qid": region.get("qid"),
+                    "expected_answer_text": region.get("expected_answer_text"),
+                    "label_method": region.get("label_method"),
+                    "index": region.get("index"),
+                }
+            )
+    response = {
+        "template_uploaded_at": row.get("template_uploaded_at"),
+        "regions": payload_regions,
+        "regions_full": regions if isinstance(regions, list) else [],
+        "count": len(payload_regions),
+        "template_has_regions": bool(payload_regions),
+    }
+    if include_raw:
+        template_bytes = download_submission_bytes(row.get("template_storage_path"))
+        raw = ocr_service.extract_text(image_bytes=template_bytes)
+        if hasattr(raw, "__await__"):
+            raw = await raw
+        response["raw_ocr"] = normalize_ocr_result(raw)
+    return response
+
+
+@router.get("/{assignment_id}/answer-key")
+async def get_answer_key(
+    assignment_id: str,
+    user_id: str = Depends(get_current_user_id),
+    include_metadata: bool = Query(False),
+):
+    row = get_assignment(
+        assignment_id,
+        user_id,
+        columns="id,owner_id,template_storage_path,template_regions_json,template_uploaded_at",
+    )
+    if not row.get("template_storage_path"):
+        raise HTTPException(status_code=404, detail="template_missing")
+
+    template_bytes = download_submission_bytes(row.get("template_storage_path"))
+    raw = ocr_service.extract_text(image_bytes=template_bytes)
+    if hasattr(raw, "__await__"):
+        raw = await raw
+    norm = normalize_ocr_result(raw)
+    ocr_text = str(norm.get("text") or "").strip()
+    if not ocr_text:
+        raise HTTPException(status_code=400, detail="template_ocr_empty")
+
+    answers, prompt_version = await extract_answers_from_ocr(ocr_text, role="answer_key")
+    response = {
+        "answers": answers,
+        "prompt_version": prompt_version,
+    }
+    if include_metadata:
+        response["metadata"] = {
+            "ocr_text": ocr_text,
+            "raw_ocr": norm,
+            "regions_full": row.get("template_regions_json") or [],
+            "template_uploaded_at": row.get("template_uploaded_at"),
+        }
+    return response
+
+
 @router.delete("/{assignment_id}")
 def delete_assignment(
     assignment_id: str,
@@ -466,6 +549,7 @@ async def upload_template(
     template_regions = [
         {
             "qid": region.qid,
+            "page_index": 1,
             "region": {"x": region.region[0], "y": region.region[1], "w": region.region[2], "h": region.region[3]},
             "answer_box": {
                 "x": region.answer_box[0],

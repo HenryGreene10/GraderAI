@@ -13,7 +13,10 @@ from ..auth import get_current_user_id
 from ..config import GRADED_BUCKET, OVERLAYS_BUCKET, SUBMISSIONS_BUCKET
 from ..services.db import get_assignment, get_upload, update_upload
 from ..services import ocr as ocr_service
+from ..services.ocr import normalize_ocr_result
 from ..services.llm_grader import grade_with_llm
+from ..services.answer_extraction import extract_answers_from_ocr
+from ..services.scoring import score_answer_maps
 from ..services.marking import build_overlay_from_answers
 from ..models.schemas import Overlay, GradeResult
 from ..services.report import (
@@ -90,6 +93,63 @@ def preview_upload(
         raise HTTPException(status_code=500, detail="signed_url_missing")
 
     return {"url": url}
+
+
+@router.get("/{upload_id}/ocr")
+def get_upload_ocr(
+    upload_id: str,
+    user_id: str = Depends(get_current_user_id),
+    include_boxes: bool = Query(False),
+):
+    row = get_upload(
+        upload_id,
+        user_id,
+        columns="id,owner_id,ocr_status,ocr_error,ocr_text,ocr_confidence,ocr_boxes",
+    )
+    text = (row.get("ocr_text") or "").strip()
+    status = (row.get("ocr_status") or "").strip().lower()
+    payload = {
+        "ocr_status": status,
+        "ocr_error": row.get("ocr_error"),
+        "ocr_confidence": row.get("ocr_confidence"),
+        "text": text,
+        "text_len": len(text) if text else 0,
+    }
+    if include_boxes:
+        payload["ocr_boxes"] = row.get("ocr_boxes")
+    return payload
+
+
+@router.get("/{upload_id}/student-answers")
+async def get_student_answers(
+    upload_id: str,
+    user_id: str = Depends(get_current_user_id),
+    include_metadata: bool = Query(False),
+):
+    row = get_upload(
+        upload_id,
+        user_id,
+        columns="id,owner_id,ocr_status,ocr_error,ocr_text,ocr_boxes,ocr_confidence",
+    )
+    status = (row.get("ocr_status") or "").strip().lower()
+    if status != "done":
+        raise HTTPException(status_code=409, detail="ocr_not_done")
+    ocr_text = str(row.get("ocr_text") or "").strip()
+    if not ocr_text:
+        raise HTTPException(status_code=400, detail="ocr_text_missing")
+
+    answers, prompt_version = await extract_answers_from_ocr(ocr_text, role="student")
+    response = {
+        "answers": answers,
+        "prompt_version": prompt_version,
+    }
+    if include_metadata:
+        response["metadata"] = {
+            "ocr_text": ocr_text,
+            "ocr_boxes": row.get("ocr_boxes"),
+            "ocr_confidence": row.get("ocr_confidence"),
+        }
+    return response
 
 
 @router.delete("/{upload_id}")
@@ -209,7 +269,13 @@ async def run_grade_pipeline(
         debug_layout = None
         needs_review_from_overlay = False
         unplaced_items = []
+        marks_placed = None
+        marks_skipped_missing = None
         answers = []
+
+        answers_json = None
+        answer_rows = []
+        answer_prompt_version = None
 
         if template_available and row.get("normalized_image_path"):
             template_png = download_submission_bytes(template_storage_path)
@@ -256,9 +322,23 @@ async def run_grade_pipeline(
             overlay = template_output.overlay
             needs_review_from_overlay = template_output.needs_review
             answers = template_output.student_answers
+            answer_rows = template_output.answer_rows
             template_alignment = template_output.alignment
             debug_image_bytes = template_output.alignment.aligned_png
             template_ocr_rects = template_output.ocr_rects
+            unplaced_items = template_output.unplaced_items
+            marks_placed = template_output.marks_placed
+            marks_skipped_missing = template_output.marks_skipped_missing
+            if isinstance(template_output.student_answers, list):
+                key_map = {}
+                student_map = {}
+                for row_item in template_output.student_answers:
+                    qid = str(row_item.get("question_id") or "").strip()
+                    if not qid:
+                        continue
+                    key_map[qid] = str(row_item.get("expected_answer") or "").strip()
+                    student_map[qid] = str(row_item.get("student_answer") or "").strip()
+                answers_json = {"key": key_map, "student": student_map}
 
             pdf_source_bytes = image_bytes_to_pdf(template_output.alignment.aligned_png)
             pdf_mime = "application/pdf"
@@ -266,8 +346,29 @@ async def run_grade_pipeline(
         else:
             if template_available:
                 logger.warning("Template exists but normalized image missing for %s; falling back", row["id"])
-            grade_result, answers = await grade_with_llm(ocr_text)
-            grade_result.submission_id = row["id"]
+            if template_storage_path:
+                template_bytes = download_submission_bytes(template_storage_path)
+                raw = await ocr_service.extract_text(image_bytes=template_bytes)
+                norm = normalize_ocr_result(raw)
+                key_text = str(norm.get("text") or "").strip()
+                if not key_text:
+                    raise HTTPException(status_code=400, detail="template_ocr_empty")
+                key_answers, answer_prompt_version = await extract_answers_from_ocr(
+                    key_text,
+                    role="answer_key",
+                )
+                student_answers, _ = await extract_answers_from_ocr(
+                    ocr_text,
+                    role="student",
+                )
+                grade_result, answers, answer_rows = score_answer_maps(key_answers, student_answers)
+                grade_result.submission_id = row["id"]
+                answers_json = {"key": key_answers, "student": student_answers}
+            else:
+                grade_result, answers = await grade_with_llm(ocr_text)
+                grade_result.submission_id = row["id"]
+                answers_json = None
+                answer_rows = []
 
             pdf_source_path = row.get("normalized_pdf_path") or storage_path
             pdf_source_key = strip_bucket_prefix(pdf_source_path, SUBMISSIONS_BUCKET)
@@ -291,6 +392,28 @@ async def run_grade_pipeline(
                 normalized_size=normalized_size,
                 total_score=grade_result.total_score,
                 total_max=grade_result.total_max,
+            )
+
+        if answer_rows:
+            counts = {"correct": 0, "incorrect": 0, "needs_review": 0}
+            for row_item in answer_rows:
+                status = str(row_item.get("status") or "")
+                if status in counts:
+                    counts[status] += 1
+            logger.info(
+                "grading_counts upload_id=%s total=%s correct=%s incorrect=%s needs_review=%s",
+                row["id"],
+                sum(counts.values()),
+                counts["correct"],
+                counts["incorrect"],
+                counts["needs_review"],
+            )
+        if template_used and marks_placed is not None and marks_skipped_missing is not None:
+            logger.info(
+                "mark_placement upload_id=%s placed=%s skipped_missing=%s",
+                row["id"],
+                marks_placed,
+                marks_skipped_missing,
             )
 
         overlay, overlay_missing = _ensure_overlay(row["id"], grade_result, overlay)
@@ -460,6 +583,12 @@ async def run_grade_pipeline(
             "answers": answers_payload,
             "debug_layout_path": debug_layout_path,
         }
+        if answers_json:
+            grade_json["answers_json"] = answers_json
+        if answer_rows:
+            grade_json["answer_rows"] = answer_rows
+        if answer_prompt_version:
+            grade_json["answer_prompt_version"] = answer_prompt_version
         if template_used:
             grade_json["template_used"] = True
             grade_json["template_version_used"] = template_version
