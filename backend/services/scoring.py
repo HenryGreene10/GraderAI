@@ -16,6 +16,7 @@ def _normalize_remainder_text(text: str) -> str:
         return ""
     # Treat "RO" (letter O) as "R0" when it appears after R.
     raw = re.sub(r"(?i)r\s*o\b", "R0", raw)
+    raw = re.sub(r"(?i)\b(remainder|rem)\b", "R", raw)
     # Normalize punctuation to spaces so regex can match cleanly.
     raw = re.sub(r"[,:;()\[\]{}]", " ", raw)
     raw = " ".join(raw.split())
@@ -26,9 +27,20 @@ def parse_quotient_remainder(text: str) -> Optional[Tuple[int, int]]:
     normalized = _normalize_remainder_text(text)
     if not normalized:
         return None
+    # Reject ambiguous noise (e.g., slashes or letters) rather than guessing.
+    if re.search(r"[^0-9rR\s]", normalized):
+        return None
+    normalized = normalized.upper()
     match = re.search(r"(-?\d+)\s*r\s*(-?\d+)", normalized, flags=re.IGNORECASE)
     if not match:
-        return None
+        # Handle missing "R" when two numeric groups are present (e.g., "161 03" -> 161 R3).
+        fallback = re.match(r"^(-?\d+)\s+0*([0-9]{1,2})$", normalized)
+        if not fallback:
+            return None
+        try:
+            return int(fallback.group(1)), int(fallback.group(2))
+        except Exception:
+            return None
     try:
         return int(match.group(1)), int(match.group(2))
     except Exception:

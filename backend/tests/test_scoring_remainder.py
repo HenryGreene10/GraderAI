@@ -25,6 +25,17 @@ def test_remainder_unparseable_needs_review():
     assert low_conf is True
 
 
+def test_remainder_missing_r_fallback():
+    assert parse_quotient_remainder("161 03") == (161, 3)
+
+
+def test_remainder_ambiguous_characters_needs_review():
+    status, score, _rationale, low_conf = score_quotient_remainder("71 R7", r"7\\ R7")
+    assert status == "needs_review"
+    assert score == 0.0
+    assert low_conf is True
+
+
 def test_overlay_marks_use_answer_box_bbox():
     grade = GradeResult(
         submission_id="s1",

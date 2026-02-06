@@ -29,6 +29,7 @@ from ..services.template import (
     detect_question_regions,
     extract_template_regions,
 )
+from ..services.template_regions import build_template_regions_payload, parse_regions_payload
 from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
@@ -88,13 +89,12 @@ def _assignment_payload(row: dict, uploads_count: int = 0) -> dict:
 def _assignment_detail_payload(row: dict) -> dict:
     base = _assignment_payload(row, uploads_count=0)
     regions = row.get("template_regions_json") or []
-    detected_qids = []
-    if isinstance(regions, list):
-        detected_qids = [str(r.get("qid")) for r in regions if isinstance(r, dict) and r.get("qid")]
+    regions_map, _ = parse_regions_payload(regions)
+    detected_qids = list(regions_map.keys()) if regions_map else []
     base.update(
         {
             "template_storage_path": row.get("template_storage_path"),
-            "template_regions_count": len(regions) if isinstance(regions, list) else 0,
+            "template_regions_count": len(regions_map),
             "template_detected_qids": detected_qids,
             "template_width_px": row.get("template_width_px"),
             "template_height_px": row.get("template_height_px"),
@@ -339,26 +339,22 @@ async def get_template_ocr(
         user_id,
         columns="id,owner_id,template_storage_path,template_regions_json,template_uploaded_at",
     )
-    regions = row.get("template_regions_json") or []
+    regions_payload = row.get("template_regions_json") or []
+    regions_map, _ = parse_regions_payload(regions_payload)
     if not row.get("template_storage_path"):
         raise HTTPException(status_code=404, detail="template_missing")
     payload_regions = []
-    if isinstance(regions, list):
-        for region in regions:
-            if not isinstance(region, dict):
-                continue
-            payload_regions.append(
-                {
-                    "qid": region.get("qid"),
-                    "expected_answer_text": region.get("expected_answer_text"),
-                    "label_method": region.get("label_method"),
-                    "index": region.get("index"),
-                }
-            )
+    for qid, region in regions_map.items():
+        payload_regions.append(
+            {
+                "qid": qid,
+                "expected_answer_text": region.get("expected_answer_text"),
+            }
+        )
     response = {
         "template_uploaded_at": row.get("template_uploaded_at"),
         "regions": payload_regions,
-        "regions_full": regions if isinstance(regions, list) else [],
+        "regions_full": regions_payload,
         "count": len(payload_regions),
         "template_has_regions": bool(payload_regions),
     }
@@ -369,6 +365,25 @@ async def get_template_ocr(
             raw = await raw
         response["raw_ocr"] = normalize_ocr_result(raw)
     return response
+
+
+@router.get("/{assignment_id}/template-regions")
+def get_template_regions(
+    assignment_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    row = get_assignment(
+        assignment_id,
+        user_id,
+        columns="id,owner_id,template_regions_json,template_uploaded_at",
+    )
+    regions_payload = row.get("template_regions_json") or {}
+    regions_map, _ = parse_regions_payload(regions_payload)
+    return {
+        "template_uploaded_at": row.get("template_uploaded_at"),
+        "regions": regions_payload,
+        "count": len(regions_map),
+    }
 
 
 @router.get("/{assignment_id}/answer-key")
@@ -546,23 +561,7 @@ async def upload_template(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    template_regions = [
-        {
-            "qid": region.qid,
-            "page_index": 1,
-            "region": {"x": region.region[0], "y": region.region[1], "w": region.region[2], "h": region.region[3]},
-            "answer_box": {
-                "x": region.answer_box[0],
-                "y": region.answer_box[1],
-                "w": region.answer_box[2],
-                "h": region.answer_box[3],
-            },
-            "expected_answer_text": region.expected_answer_text,
-            "label_method": region.label_method,
-            "index": region.index,
-        }
-        for region in regions
-    ]
+    template_regions = build_template_regions_payload(regions, (template_w, template_h))
 
     template_version = int(assignment.get("template_version") or 0) + 1
     template_upload_id = str(uuid4())
@@ -588,6 +587,13 @@ async def upload_template(
             "owner_id", user_id
         ).execute()
 
+    logger.info(
+        "template_regions_saved assignment_id=%s count=%s sample=%s",
+        assignment_id,
+        len(template_regions.get("regions") or {}),
+        list((template_regions.get("regions") or {}).keys())[:3],
+    )
+
     return {
         "ok": True,
         "assignment_id": assignment_id,
@@ -596,8 +602,8 @@ async def upload_template(
         "template_upload_id": template_upload_id,
         "template_original_name": template_original_name,
         "template_uploaded_at": template_uploaded_at,
-        "boxes_detected": len(template_regions),
-        "qids": [r["qid"] for r in template_regions],
+        "boxes_detected": len(template_regions.get("regions") or {}),
+        "qids": list((template_regions.get("regions") or {}).keys()),
         "warnings": warnings,
     }
 
@@ -617,7 +623,8 @@ async def upload_assignment_files(
 
     template_regions = assignment.get("template_regions_json") or []
     template_storage_path = assignment.get("template_storage_path")
-    if not template_storage_path or not template_regions:
+    regions_map, _ = parse_regions_payload(template_regions)
+    if not template_storage_path or not regions_map:
         raise HTTPException(status_code=409, detail="Upload master key first.")
 
     if not files:

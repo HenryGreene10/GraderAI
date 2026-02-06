@@ -17,6 +17,12 @@ from ..services.ocr import normalize_ocr_result
 from ..services.llm_grader import grade_with_llm
 from ..services.answer_extraction import extract_answers_from_ocr
 from ..services.scoring import score_answer_maps
+from ..services.template_regions import (
+    build_overlay_from_regions,
+    expected_answers_from_regions,
+    extract_answers_from_regions,
+    parse_regions_payload,
+)
 from ..services.marking import build_overlay_from_answers
 from ..models.schemas import Overlay, GradeResult
 from ..services.report import (
@@ -261,8 +267,11 @@ async def run_grade_pipeline(
             template_storage_path = assignment.get("template_storage_path")
             template_version = assignment.get("template_version")
 
+        regions_map, _ = parse_regions_payload(template_regions)
+        regions_present = isinstance(template_regions, dict) and bool(regions_map)
         template_available = bool(template_regions and template_storage_path)
         template_used = False
+        template_alignment_used = False
         template_alignment = None
         debug_image_bytes = None
         template_ocr_rects = []
@@ -271,13 +280,58 @@ async def run_grade_pipeline(
         unplaced_items = []
         marks_placed = None
         marks_skipped_missing = None
+        marks_skipped_needs_review = None
         answers = []
 
         answers_json = None
         answer_rows = []
         answer_prompt_version = None
 
-        if template_available and row.get("normalized_image_path"):
+        if regions_present:
+            logger.info(
+                "regions_present upload_id=%s region_count=%s",
+                row["id"],
+                len(regions_map),
+            )
+            student_answers, missing_qids = extract_answers_from_regions(
+                ocr_boxes,
+                template_regions,
+                fallback_size=(
+                    float(row.get("normalized_width_px") or 0.0),
+                    float(row.get("normalized_height_px") or 0.0),
+                ),
+            )
+            key_answers = expected_answers_from_regions(regions_map)
+            grade_result, answers, answer_rows = score_answer_maps(key_answers, student_answers)
+            grade_result.submission_id = row["id"]
+            answers_json = {"key": key_answers, "student": student_answers}
+            if missing_qids:
+                needs_review_from_overlay = True
+            pdf_source_path = row.get("normalized_pdf_path") or storage_path
+            pdf_source_key = strip_bucket_prefix(pdf_source_path, SUBMISSIONS_BUCKET)
+            sb = get_supabase()
+            if sb is None:
+                raise RuntimeError("Supabase client unavailable")
+            pdf_source_bytes = sb.storage.from_(SUBMISSIONS_BUCKET).download(pdf_source_key)
+            if not pdf_source_bytes:
+                raise RuntimeError(f"Submission not found: {pdf_source_path}")
+            pdf_mime = "application/pdf" if row.get("normalized_pdf_path") else row.get("mime_type")
+            page_sizes = get_page_sizes(pdf_source_bytes, pdf_mime)
+            page_size = page_sizes[0] if page_sizes else (612.0, 792.0)
+            normalized_size = (
+                float(row.get("normalized_width_px") or 0.0),
+                float(row.get("normalized_height_px") or 0.0),
+            )
+            overlay, marks_placed, marks_skipped_missing, marks_skipped_needs_review, unplaced_items = build_overlay_from_regions(
+                grade_result,
+                template_regions,
+                normalized_size,
+                page_size,
+            )
+            if unplaced_items:
+                needs_review_from_overlay = True
+            template_used = True
+        elif template_available and row.get("normalized_image_path"):
             template_png = download_submission_bytes(template_storage_path)
             student_png = download_submission_bytes(row.get("normalized_image_path"))
             try:
@@ -329,6 +383,7 @@ async def run_grade_pipeline(
             unplaced_items = template_output.unplaced_items
             marks_placed = template_output.marks_placed
             marks_skipped_missing = template_output.marks_skipped_missing
+            template_alignment_used = True
             if isinstance(template_output.student_answers, list):
                 key_map = {}
                 student_map = {}
@@ -410,10 +465,11 @@ async def run_grade_pipeline(
             )
         if template_used and marks_placed is not None and marks_skipped_missing is not None:
             logger.info(
-                "mark_placement upload_id=%s placed=%s skipped_missing=%s",
+                "mark_placement upload_id=%s placed=%s skipped_missing=%s skipped_needs_review=%s",
                 row["id"],
                 marks_placed,
                 marks_skipped_missing,
+                marks_skipped_needs_review,
             )
 
         overlay, overlay_missing = _ensure_overlay(row["id"], grade_result, overlay)
@@ -424,7 +480,7 @@ async def run_grade_pipeline(
         page_width_pt, page_height_pt = page_sizes[0]
         page_width_in = page_width_pt / 72.0
         page_height_in = page_height_pt / 72.0
-        if template_used:
+        if template_alignment_used:
             normalized_size = (
                 float(page_width_pt / 72.0 * 300.0),
                 float(page_height_pt / 72.0 * 300.0),
@@ -552,9 +608,9 @@ async def run_grade_pipeline(
                         template_overlay,
                         "image/png",
                     )
-                if template_used and normalized_bytes and template_ocr_rects:
-                    ocr_overlay = draw_rects_overlay(normalized_bytes, template_ocr_rects)
-                    upload_debug_artifact(
+            if template_used and normalized_bytes and template_ocr_rects:
+                ocr_overlay = draw_rects_overlay(normalized_bytes, template_ocr_rects)
+                upload_debug_artifact(
                         owner_id,
                         row["id"],
                         "ocr_overlay.png",

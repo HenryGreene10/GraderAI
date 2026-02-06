@@ -47,9 +47,11 @@ No grading in this step.
 Extract student answers into the same JSON schema.  
 Ignore scratch work where possible.
 
-### Ticket A5 — Deterministic Scoring + Master-Key Overlay Placement
-Compare key JSON vs student JSON in code.  
-Place marks using master-key regions (no student OCR geometry).  
+### Ticket A5a — Template Region Extraction + Persistence
+Persist master-key regions; blocker today: `template_regions_json` is null.
+
+### Ticket A5b — Region-Based Extraction + Deterministic Scoring + ✓/✗ Placement
+Use stored regions to extract student answers and place marks.  
 
 Acceptance checks:
 • Given master key + student scan, system produces marked PDF with ✓/✗ in the correct question regions.  
