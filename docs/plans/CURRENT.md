@@ -47,16 +47,16 @@ No grading in this step.
 Extract student answers into the same JSON schema.  
 Ignore scratch work where possible.
 
-### Ticket A5a — Template Region Extraction + Persistence
-Persist master-key regions; blocker today: `template_regions_json` is null.
+### Ticket A5a — Persist Template Regions on Master-Key Upload (REQUIRED)
+Ensure `template_regions_json` is written (non-null) when master key is uploaded.
 
-### Ticket A5b — Region-Based Extraction + Deterministic Scoring + ✓/✗ Placement
-Use stored regions to extract student answers and place marks.  
+### Ticket A5b — Place ✓/✗ Marks Using Persisted Regions (REQUIRED)
+Use stored regions to place checks/Xs deterministically.
 
-Acceptance checks:
-• Given master key + student scan, system produces marked PDF with ✓/✗ in the correct question regions.  
-• If region for a QID can’t be found → mark needs_review and do NOT place a mark.  
-• Deterministic scoring for this worksheet type (quotient + remainder).
+Manual acceptance:
+• Upload master key (scan mode=master_key) → log `template_regions_saved ... regions=9 ...` and `template_regions_json` non-null.  
+• Upload student sheet + grade → marked PDF shows ✓/✗ inside question regions.  
+• If master key missing/regions null → grading fails fast with “template regions missing”.
 
 ### Ticket A6 — Overlay + Marked PDF Validation
 Ensure overlays align correctly.  
