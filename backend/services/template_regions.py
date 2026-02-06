@@ -18,10 +18,15 @@ def build_template_regions_payload(
         "regions": {},
     }
     regions_map: Dict[str, Any] = {}
+    entries: List[Tuple[float, float, float, float, object]] = []
     for region in regions:
-        qid = str(getattr(region, "qid", "") or "").strip()
-        if not qid:
+        answer_box = getattr(region, "answer_box", None)
+        if not answer_box:
             continue
+        x, y, w, h = answer_box
+        entries.append((float(y), float(x), float(w), float(h), region))
+    entries.sort(key=lambda item: (item[0], item[1]))
+    for idx, (_y, _x, _w, _h, region) in enumerate(entries[:9], start=1):
         answer_box = getattr(region, "answer_box", None)
         if not answer_box:
             continue
@@ -36,7 +41,7 @@ def build_template_regions_payload(
         expected = getattr(region, "expected_answer_text", None)
         if expected is not None:
             entry["expected_answer_text"] = expected
-        regions_map[qid] = entry
+        regions_map[f"Q{idx}"] = entry
     payload["regions"] = regions_map
     return payload
 

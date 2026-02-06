@@ -288,6 +288,8 @@ async def run_grade_pipeline(
         answer_prompt_version = None
 
         if regions_present:
+            expected_qids = [f"Q{i}" for i in range(1, 10)]
+            ignored_extra = len([qid for qid in regions_map.keys() if qid not in expected_qids])
             logger.info(
                 "regions_present upload_id=%s region_count=%s",
                 row["id"],
@@ -301,11 +303,26 @@ async def run_grade_pipeline(
                     float(row.get("normalized_height_px") or 0.0),
                 ),
             )
-            key_answers = expected_answers_from_regions(regions_map)
-            grade_result, answers, answer_rows = score_answer_maps(key_answers, student_answers)
+            key_answers: dict[str, str] = {}
+            filtered_students: dict[str, str] = {}
+            for qid in expected_qids:
+                entry = regions_map.get(qid) or {}
+                key_answers[qid] = str(entry.get("expected_answer_text") or "").strip()
+                filtered_students[qid] = str(student_answers.get(qid) or "").strip()
+            missing = sorted(
+                {qid for qid in expected_qids if qid not in regions_map or qid in missing_qids}
+            )
+            logger.info(
+                "grading_qids=%s expected_qids=%s ignored_extra=%s missing=%s",
+                expected_qids,
+                expected_qids,
+                ignored_extra,
+                missing,
+            )
+            grade_result, answers, answer_rows = score_answer_maps(key_answers, filtered_students)
             grade_result.submission_id = row["id"]
-            answers_json = {"key": key_answers, "student": student_answers}
-            if missing_qids:
+            answers_json = {"key": key_answers, "student": filtered_students}
+            if missing:
                 needs_review_from_overlay = True
             pdf_source_path = row.get("normalized_pdf_path") or storage_path
             pdf_source_key = strip_bucket_prefix(pdf_source_path, SUBMISSIONS_BUCKET)
@@ -331,6 +348,13 @@ async def run_grade_pipeline(
             if unplaced_items:
                 needs_review_from_overlay = True
             template_used = True
+            if marks_placed is not None:
+                logger.info(
+                    "marks_placed=%s skipped_missing_region=%s skipped_needs_review=%s",
+                    marks_placed,
+                    marks_skipped_missing,
+                    marks_skipped_needs_review,
+                )
         elif template_available and row.get("normalized_image_path"):
             template_png = download_submission_bytes(template_storage_path)
             student_png = download_submission_bytes(row.get("normalized_image_path"))

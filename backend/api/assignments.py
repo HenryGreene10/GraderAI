@@ -588,10 +588,9 @@ async def upload_template(
         ).execute()
 
     logger.info(
-        "template_regions_saved assignment_id=%s count=%s sample=%s",
-        assignment_id,
+        "template_regions_detected=%s qids=%s",
         len(template_regions.get("regions") or {}),
-        list((template_regions.get("regions") or {}).keys())[:3],
+        list((template_regions.get("regions") or {}).keys()),
     )
 
     return {
