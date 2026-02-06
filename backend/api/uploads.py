@@ -608,9 +608,9 @@ async def run_grade_pipeline(
                         template_overlay,
                         "image/png",
                     )
-            if template_used and normalized_bytes and template_ocr_rects:
-                ocr_overlay = draw_rects_overlay(normalized_bytes, template_ocr_rects)
-                upload_debug_artifact(
+                if template_used and normalized_bytes and template_ocr_rects:
+                    ocr_overlay = draw_rects_overlay(normalized_bytes, template_ocr_rects)
+                    upload_debug_artifact(
                         owner_id,
                         row["id"],
                         "ocr_overlay.png",
