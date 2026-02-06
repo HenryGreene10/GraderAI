@@ -33,15 +33,12 @@ def test_extract_answers_from_regions_with_normalized_boxes():
     regions_payload = {
         "version": 1,
         "page_index": 0,
-        "size_px": [1000, 1000],
-        "regions": {
-            "Q1": {
-                "answer_box": {"x": 0.1, "y": 0.09, "w": 0.2, "h": 0.06},
-            },
-            "Q2": {
-                "answer_box": {"x": 0.6, "y": 0.6, "w": 0.2, "h": 0.06},
-            },
-        },
+        "template_width_px": 1000,
+        "template_height_px": 1000,
+        "regions": [
+            {"qid": "Q1", "bbox_px": [100, 90, 200, 60]},
+            {"qid": "Q2", "bbox_px": [600, 600, 200, 60]},
+        ],
     }
 
     answers, missing = extract_answers_from_regions(ocr_boxes, regions_payload)

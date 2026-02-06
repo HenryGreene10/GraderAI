@@ -584,7 +584,7 @@ async def upload_template(
     logger.info(
         "template_regions_saved assignment_id=%s regions=%s template_w=%s template_h=%s",
         assignment_id,
-        len(template_regions.get("regions") or {}),
+        len(template_regions.get("regions") or []),
         template_w,
         template_h,
     )
@@ -609,8 +609,8 @@ async def upload_template(
         "template_upload_id": template_upload_id,
         "template_original_name": template_original_name,
         "template_uploaded_at": template_uploaded_at,
-        "boxes_detected": len(template_regions.get("regions") or {}),
-        "qids": list((template_regions.get("regions") or {}).keys()),
+        "boxes_detected": len(template_regions.get("regions") or []),
+        "qids": [r.get("qid") for r in (template_regions.get("regions") or []) if isinstance(r, dict)],
         "warnings": warnings,
     }
 

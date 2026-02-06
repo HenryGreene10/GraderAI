@@ -77,8 +77,12 @@ def _extract_signed_url(result: object) -> Optional[str]:
 def _regions_have_px_boxes(regions_payload: object) -> bool:
     regions_map, _ = parse_regions_payload(regions_payload)
     for entry in regions_map.values():
-        box = entry.get("answer_box") or {}
-        vals = [box.get("x"), box.get("y"), box.get("w"), box.get("h")]
+        bbox = entry.get("bbox_px")
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            vals = [bbox[0], bbox[1], bbox[2], bbox[3]]
+        else:
+            box = entry.get("answer_box") or {}
+            vals = [box.get("x"), box.get("y"), box.get("w"), box.get("h")]
         try:
             max_val = max(float(v) for v in vals if v is not None)
         except ValueError:
@@ -289,7 +293,7 @@ async def run_grade_pipeline(
             template_height_px = assignment.get("template_height_px")
 
         regions_map, _ = parse_regions_payload(template_regions)
-        regions_present = isinstance(template_regions, dict) and bool(regions_map)
+        regions_present = bool(regions_map)
         template_available = bool(template_regions and template_storage_path)
         template_used = False
         template_alignment_used = False
@@ -308,14 +312,27 @@ async def run_grade_pipeline(
         answer_rows = []
         answer_prompt_version = None
 
+        if assignment:
+            logger.info(
+                "grading_with_template assignment_id=%s has_regions=%s qids=%s",
+                row.get("assignment_id"),
+                regions_present,
+                list(regions_map.keys()),
+            )
+            if not regions_present:
+                update_upload(
+                    row["id"],
+                    {
+                        "status": "error",
+                        "needs_review": True,
+                        "ocr_error": "template_regions_missing",
+                        "updated_at": _utc_iso(),
+                    },
+                )
+                raise HTTPException(status_code=409, detail="template_regions_missing")
+
         if regions_present:
             expected_qids = [f"Q{i}" for i in range(1, 10)]
-            ignored_extra = len([qid for qid in regions_map.keys() if qid not in expected_qids])
-            logger.info(
-                "regions_present upload_id=%s region_count=%s",
-                row["id"],
-                len(regions_map),
-            )
             student_answers, missing_qids = extract_answers_from_regions(
                 ocr_boxes,
                 template_regions,
@@ -332,13 +349,6 @@ async def run_grade_pipeline(
                 filtered_students[qid] = str(student_answers.get(qid) or "").strip()
             missing = sorted(
                 {qid for qid in expected_qids if qid not in regions_map or qid in missing_qids}
-            )
-            logger.info(
-                "grading_qids=%s expected_qids=%s ignored_extra=%s missing=%s",
-                expected_qids,
-                expected_qids,
-                ignored_extra,
-                missing,
             )
             grade_result, answers, answer_rows = score_answer_maps(key_answers, filtered_students)
             grade_result.submission_id = row["id"]
@@ -369,13 +379,6 @@ async def run_grade_pipeline(
             if unplaced_items:
                 needs_review_from_overlay = True
             template_used = True
-            if marks_placed is not None:
-                logger.info(
-                    "marks_placed=%s skipped_missing_region=%s skipped_needs_review=%s",
-                    marks_placed,
-                    marks_skipped_missing,
-                    marks_skipped_needs_review,
-                )
         elif template_available and row.get("normalized_image_path"):
             template_png = download_submission_bytes(template_storage_path)
             student_png = download_submission_bytes(row.get("normalized_image_path"))
@@ -492,29 +495,6 @@ async def run_grade_pipeline(
                 normalized_size=normalized_size,
                 total_score=grade_result.total_score,
                 total_max=grade_result.total_max,
-            )
-
-        if answer_rows:
-            counts = {"correct": 0, "incorrect": 0, "needs_review": 0}
-            for row_item in answer_rows:
-                status = str(row_item.get("status") or "")
-                if status in counts:
-                    counts[status] += 1
-            logger.info(
-                "grading_counts upload_id=%s total=%s correct=%s incorrect=%s needs_review=%s",
-                row["id"],
-                sum(counts.values()),
-                counts["correct"],
-                counts["incorrect"],
-                counts["needs_review"],
-            )
-        if template_used and marks_placed is not None and marks_skipped_missing is not None:
-            logger.info(
-                "mark_placement upload_id=%s placed=%s skipped_missing=%s skipped_needs_review=%s",
-                row["id"],
-                marks_placed,
-                marks_skipped_missing,
-                marks_skipped_needs_review,
             )
 
         overlay, overlay_missing = _ensure_overlay(row["id"], grade_result, overlay)

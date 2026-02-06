@@ -14,10 +14,10 @@ def build_template_regions_payload(
     payload: Dict[str, Any] = {
         "version": 1,
         "page_index": 0,
-        "size_px": [float(width), float(height)],
-        "regions": {},
+        "template_width_px": float(width),
+        "template_height_px": float(height),
+        "regions": [],
     }
-    regions_map: Dict[str, Any] = {}
     entries: List[Tuple[float, float, float, float, object]] = []
     for region in regions:
         answer_box = getattr(region, "answer_box", None)
@@ -31,26 +31,39 @@ def build_template_regions_payload(
         if not answer_box:
             continue
         x, y, w, h = answer_box
-        box = {
-            "x": float(x) / float(width) if width else 0.0,
-            "y": float(y) / float(height) if height else 0.0,
-            "w": float(w) / float(width) if width else 0.0,
-            "h": float(h) / float(height) if height else 0.0,
+        entry: Dict[str, Any] = {
+            "qid": f"Q{idx}",
+            "bbox_px": [float(x), float(y), float(w), float(h)],
+            "source": "answer_box",
         }
-        entry: Dict[str, Any] = {"answer_box": box}
         expected = getattr(region, "expected_answer_text", None)
         if expected is not None:
             entry["expected_answer_text"] = expected
-        regions_map[f"Q{idx}"] = entry
-    payload["regions"] = regions_map
+        payload["regions"].append(entry)
     return payload
 
 
 def parse_regions_payload(payload: object) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    if isinstance(payload, dict) and isinstance(payload.get("regions"), list):
+        meta = {
+            "version": payload.get("version"),
+            "page_index": int(payload.get("page_index") or 0),
+            "template_width_px": payload.get("template_width_px"),
+            "template_height_px": payload.get("template_height_px"),
+        }
+        regions_map: Dict[str, Dict[str, Any]] = {}
+        for idx, region in enumerate(payload.get("regions") or [], start=1):
+            if not isinstance(region, dict):
+                continue
+            qid = str(region.get("qid") or f"Q{idx}")
+            regions_map[qid] = region
+        return regions_map, meta
     if isinstance(payload, dict) and isinstance(payload.get("regions"), dict):
         meta = {
             "version": payload.get("version"),
             "page_index": int(payload.get("page_index") or 0),
+            "template_width_px": payload.get("template_width_px"),
+            "template_height_px": payload.get("template_height_px"),
             "size_px": payload.get("size_px"),
         }
         return payload.get("regions") or {}, meta
@@ -66,8 +79,8 @@ def parse_regions_payload(payload: object) -> Tuple[Dict[str, Dict[str, Any]], D
             if region.get("expected_answer_text") is not None:
                 entry["expected_answer_text"] = region.get("expected_answer_text")
             regions_map[qid] = entry
-        return regions_map, {"version": 0, "page_index": 0, "size_px": None}
-    return {}, {"version": None, "page_index": 0, "size_px": None}
+        return regions_map, {"version": 0, "page_index": 0, "template_width_px": None, "template_height_px": None}
+    return {}, {"version": None, "page_index": 0, "template_width_px": None, "template_height_px": None}
 
 
 def expected_answers_from_regions(regions_map: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
@@ -91,18 +104,13 @@ def extract_answers_from_regions(
     answers: Dict[str, str] = {}
     missing: List[str] = []
     for qid, entry in regions_map.items():
-        answer_box = entry.get("answer_box") or {}
-        if not isinstance(answer_box, dict):
-            missing.append(qid)
-            answers[qid] = ""
-            continue
         page_index = int(entry.get("page_index") or meta.get("page_index") or 0)
         size = page_sizes.get(page_index) or _size_from_meta(meta) or fallback_size
         if not size:
             missing.append(qid)
             answers[qid] = ""
             continue
-        rect = _answer_box_to_px(answer_box, size)
+        rect = _entry_bbox_to_px(entry, size, meta)
         if not rect:
             missing.append(qid)
             answers[qid] = ""
@@ -166,8 +174,7 @@ def build_overlay_from_regions(
             unplaced.append(item.question_id)
             skipped_missing += 1
             continue
-        answer_box = region.get("answer_box") or {}
-        rect = _answer_box_to_px(answer_box, (norm_w, norm_h))
+        rect = _entry_bbox_to_px(region, (norm_w, norm_h), meta)
         if not rect:
             unplaced.append(item.question_id)
             skipped_missing += 1
@@ -186,6 +193,13 @@ def build_overlay_from_regions(
 
 
 def _size_from_meta(meta: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    width = meta.get("template_width_px")
+    height = meta.get("template_height_px")
+    if width and height:
+        try:
+            return float(width), float(height)
+        except Exception:
+            return None
     size = meta.get("size_px")
     if isinstance(size, (list, tuple)) and len(size) >= 2:
         try:
@@ -195,12 +209,27 @@ def _size_from_meta(meta: Dict[str, Any]) -> Optional[Tuple[float, float]]:
     return None
 
 
-def _answer_box_to_px(answer_box: Dict[str, Any], size: Tuple[float, float]) -> Optional[Tuple[float, float, float, float]]:
+def _entry_bbox_to_px(
+    entry: Dict[str, Any],
+    size: Tuple[float, float],
+    meta: Dict[str, Any],
+) -> Optional[Tuple[float, float, float, float]]:
+    bbox = entry.get("bbox_px")
+    if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        x, y, w, h = bbox[0], bbox[1], bbox[2], bbox[3]
+    else:
+        answer_box = entry.get("answer_box") or {}
+        if not isinstance(answer_box, dict):
+            return None
+        x = answer_box.get("x")
+        y = answer_box.get("y")
+        w = answer_box.get("w")
+        h = answer_box.get("h")
     try:
-        x = float(answer_box.get("x") or 0.0)
-        y = float(answer_box.get("y") or 0.0)
-        w = float(answer_box.get("w") or 0.0)
-        h = float(answer_box.get("h") or 0.0)
+        x = float(x or 0.0)
+        y = float(y or 0.0)
+        w = float(w or 0.0)
+        h = float(h or 0.0)
     except Exception:
         return None
     if w <= 0 or h <= 0:
