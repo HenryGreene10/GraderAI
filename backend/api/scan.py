@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -12,12 +13,11 @@ from pypdf import PdfReader
 
 from ..config import SUBMISSIONS_BUCKET
 from ..services import ocr as ocr_service
-from ..services.db import require_supabase, update_upload
-from ..services.ocr import normalize_ocr_result
+from ..services.db import require_supabase
 from ..services.storage import upload_bytes
 from ..services.template import TemplateValidationError, extract_template_regions
 from ..services.template_regions import build_template_regions_payload
-from .uploads import run_grade_pipeline
+from ..services.template_manifest import with_approved_manifest
 
 router = APIRouter(prefix="/api/scan", tags=["scan"])
 logger = logging.getLogger(__name__)
@@ -64,44 +64,12 @@ def _load_session(token: str) -> dict:
     return row
 
 
-async def _run_ocr_and_grade(upload_id: str, owner_id: str, image_bytes: bytes) -> None:
+async def _run_ocr_and_grade(upload_id: str, owner_id: str) -> None:
     logger.info("scan_ocr_start upload_id=%s", upload_id)
     try:
-        raw = await ocr_service.extract_text(image_bytes=image_bytes)
-        norm = normalize_ocr_result(raw)
-        text = (norm.get("text") or "").strip()
-        if not text:
-            raise ValueError("OCR returned empty text")
-    except Exception as exc:
-        error = str(exc) or "OCR failed"
-        logger.warning("scan_ocr_failed upload_id=%s error=%s", upload_id, error)
-        update_upload(
-            upload_id,
-            {
-                "ocr_status": "error",
-                "status": "error",
-                "ocr_error": error,
-                "needs_review": True,
-                "updated_at": _utc_iso(),
-            },
-        )
-        return
+        from .ocr import run_ocr_for_upload
 
-    update_upload(
-        upload_id,
-        {
-            "ocr_status": "done",
-            "status": "ocr_done",
-            "ocr_text": text,
-            "extracted_text": text,
-            "ocr_boxes": norm.get("boxes"),
-            "ocr_confidence": norm.get("confidence"),
-            "ocr_error": None,
-            "updated_at": _utc_iso(),
-        },
-    )
-    try:
-        await run_grade_pipeline(upload_id, owner_id)
+        await run_ocr_for_upload(upload_id, owner_id, pipeline_source="scan.auto")
     except HTTPException as exc:
         logger.warning("scan_grade_failed upload_id=%s error=%s", upload_id, exc.detail)
     except Exception as exc:
@@ -241,8 +209,8 @@ async def scan_upload(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
-        template_regions = build_template_regions_payload(regions, (int(width), int(height)))
-        if not template_regions.get("regions"):
+        base_regions = build_template_regions_payload(regions, (int(width), int(height)))
+        if not base_regions.get("regions"):
             raise HTTPException(status_code=400, detail="template_regions_empty")
 
         existing = (
@@ -259,6 +227,13 @@ async def scan_upload(
             template_version = 1
         template_uploaded_at = _utc_iso()
         template_original_name = file.filename or None
+        template_regions = with_approved_manifest(
+            base_regions,
+            template_version=template_version,
+            template_width_px=int(width),
+            template_height_px=int(height),
+            approved_at=template_uploaded_at,
+        )
 
         sb.table("assignments").update(
             {
@@ -302,8 +277,8 @@ async def scan_upload(
                 "original_name": "scan.pdf",
                 "mime_type": "application/pdf",
                 "size_bytes": len(blob),
-                "status": "scanned",
-                "ocr_status": None,
+                "status": "uploading",
+                "ocr_status": "pending",
                 "page_count": page_count,
                 "page_sizes_json": parsed_sizes or None,
                 "created_at": now,
@@ -311,6 +286,7 @@ async def scan_upload(
             }
         ).execute()
         resulting_upload_id = upload_id
+        asyncio.create_task(_run_ocr_and_grade(upload_id, owner_id))
     else:
         raise HTTPException(status_code=400, detail="scan_session_mode_invalid")
 

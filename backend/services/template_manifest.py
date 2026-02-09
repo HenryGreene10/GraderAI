@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -182,3 +182,78 @@ def manifest_from_template_regions(
         question_count=len(questions),
         questions=questions,
     )
+
+
+def manifest_to_template_regions_payload(manifest: TemplateManifestV1) -> Dict[str, Any]:
+    regions: List[Dict[str, Any]] = []
+    for q in manifest.questions:
+        entry: Dict[str, Any] = {
+            "qid": q.question_id,
+            "page_index": q.page_index,
+            "bbox_px": list(q.answer_box_px),
+            "source": q.source or "template_manifest",
+            "expected_answer_text": q.expected_answer_text or "",
+        }
+        if q.region_box_px is not None:
+            entry["region_box_px"] = list(q.region_box_px)
+        regions.append(entry)
+    return {
+        "version": 1,
+        "page_index": 0,
+        "template_width_px": float(manifest.template_width_px),
+        "template_height_px": float(manifest.template_height_px),
+        "regions": regions,
+        "manifest": manifest.model_dump(),
+        "manifest_schema_version": manifest.schema_version,
+    }
+
+
+def with_approved_manifest(
+    template_regions_payload: object,
+    *,
+    template_version: int,
+    template_width_px: object,
+    template_height_px: object,
+    approved_at: str,
+) -> Dict[str, Any]:
+    manifest = manifest_from_template_regions(
+        template_regions_payload,
+        template_version=template_version,
+        template_width_px=template_width_px,
+        template_height_px=template_height_px,
+    )
+    base_payload = manifest_to_template_regions_payload(manifest)
+    base_payload["manifest_approved_at"] = approved_at
+    base_payload["manifest_locked"] = True
+    return base_payload
+
+
+def load_template_manifest(
+    template_regions_payload: object,
+    *,
+    template_version: int,
+    template_width_px: object,
+    template_height_px: object,
+    require_approved: bool = False,
+) -> Tuple[TemplateManifestV1, bool]:
+    payload = template_regions_payload if isinstance(template_regions_payload, dict) else {}
+    raw_manifest = payload.get("manifest") if isinstance(payload, dict) else None
+    if isinstance(raw_manifest, dict):
+        manifest = validate_template_manifest(raw_manifest)
+        if require_approved:
+            if not payload.get("manifest_locked"):
+                raise ValueError("template_manifest_not_locked")
+            if not payload.get("manifest_approved_at"):
+                raise ValueError("template_manifest_not_approved")
+        return manifest, True
+
+    if require_approved:
+        raise ValueError("template_manifest_unapproved")
+
+    manifest = manifest_from_template_regions(
+        template_regions_payload,
+        template_version=template_version,
+        template_width_px=template_width_px,
+        template_height_px=template_height_px,
+    )
+    return manifest, False

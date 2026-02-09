@@ -18,24 +18,40 @@ def build_template_regions_payload(
         "template_height_px": float(height),
         "regions": [],
     }
-    entries: List[Tuple[float, float, float, float, object]] = []
-    for region in regions:
+    entries: List[Tuple[int, float, float, object]] = []
+    for idx, region in enumerate(regions, start=1):
+        answer_box = getattr(region, "answer_box", None)
+        if not answer_box:
+            continue
+        x, y, _w, _h = answer_box
+        region_index = getattr(region, "index", idx)
+        try:
+            region_index = int(region_index)
+        except Exception:
+            region_index = idx
+        entries.append((region_index, float(y), float(x), region))
+    entries.sort(key=lambda item: (item[0], item[1], item[2]))
+    for idx, (_region_index, _y, _x, region) in enumerate(entries, start=1):
         answer_box = getattr(region, "answer_box", None)
         if not answer_box:
             continue
         x, y, w, h = answer_box
-        entries.append((float(y), float(x), float(w), float(h), region))
-    entries.sort(key=lambda item: (item[0], item[1]))
-    for idx, (_y, _x, _w, _h, region) in enumerate(entries[:9], start=1):
-        answer_box = getattr(region, "answer_box", None)
-        if not answer_box:
-            continue
-        x, y, w, h = answer_box
+        qid = str(getattr(region, "qid", "") or f"Q{idx}")
+        page_index = int(getattr(region, "page_index", 0) or 0)
         entry: Dict[str, Any] = {
-            "qid": f"Q{idx}",
+            "qid": qid,
+            "page_index": page_index,
             "bbox_px": [float(x), float(y), float(w), float(h)],
-            "source": "answer_box",
+            "source": str(getattr(region, "label_method", "") or "answer_box"),
         }
+        region_box = getattr(region, "region", None)
+        if isinstance(region_box, (list, tuple)) and len(region_box) >= 4:
+            entry["region_box_px"] = [
+                float(region_box[0]),
+                float(region_box[1]),
+                float(region_box[2]),
+                float(region_box[3]),
+            ]
         expected = getattr(region, "expected_answer_text", None)
         if expected is not None:
             entry["expected_answer_text"] = expected
@@ -137,6 +153,8 @@ def build_overlay_from_regions(
     regions_payload: object,
     normalized_size_px: Tuple[float, float],
     page_size_pt: Tuple[float, float],
+    *,
+    page_sizes_pt: Optional[List[Tuple[float, float]]] = None,
 ) -> Tuple[Overlay, int, int, int, List[str]]:
     regions_map, meta = parse_regions_payload(regions_payload)
     norm_w, norm_h = normalized_size_px
@@ -151,45 +169,81 @@ def build_overlay_from_regions(
     placed = 0
     skipped_missing = 0
     skipped_needs_review = 0
+    marks_by_page: Dict[int, List[OverlayMark]] = {}
+    fallback_count_by_page: Dict[int, int] = {}
+
+    def _page_size_for_index(page_index: int) -> Tuple[float, float]:
+        if page_sizes_pt and 0 <= page_index < len(page_sizes_pt):
+            w, h = page_sizes_pt[page_index]
+            if w > 0 and h > 0:
+                return (w, h)
+        return page_size_pt
+
+    def _fallback_mark(item_id: str, item_symbol: str, page_no: int) -> None:
+        idx = fallback_count_by_page.get(page_no, 0)
+        page_w, page_h = _page_size_for_index(page_no - 1)
+        y = max(24.0, page_h - 56.0 - idx * 18.0)
+        mark = OverlayMark(tool="note", coords=[24.0, y], text=f"{item_id}: {item_symbol} (fallback)")
+        fallback_count_by_page[page_no] = idx + 1
+        if page_no == 1:
+            marks.append(mark)
+        marks_by_page.setdefault(page_no, []).append(mark)
 
     score_w = 140.0
     score_h = 26.0
     score_margin = 24.0
     score_x = page_size_pt[0] - score_w - score_margin
     score_y = page_size_pt[1] - score_h - score_margin
-    marks.append(
-        OverlayMark(
-            tool="bubble",
-            coords=[score_x, score_y, score_w, score_h],
-            text=f"Score: {grade_result.total_score:.0f}/{grade_result.total_max:.0f}",
-        )
+    score_mark = OverlayMark(
+        tool="bubble",
+        coords=[score_x, score_y, score_w, score_h],
+        text=f"Score: {grade_result.total_score:.0f}/{grade_result.total_max:.0f}",
     )
+    marks.append(score_mark)
+    marks_by_page.setdefault(1, []).append(score_mark)
 
     for item in grade_result.items:
-        if item.low_confidence:
-            skipped_needs_review += 1
-            continue
         region = regions_map.get(item.question_id)
+        symbol = "REVIEW" if item.low_confidence else ("✓" if item.score >= item.max_score else "✗")
         if not region:
             unplaced.append(item.question_id)
             skipped_missing += 1
+            _fallback_mark(item.question_id, symbol, 1)
             continue
+        page_index = int(region.get("page_index") or meta.get("page_index") or 0)
+        page_no = page_index + 1
+        page_size_for_mark = _page_size_for_index(page_index)
         rect = _entry_bbox_to_px(region, (norm_w, norm_h), meta)
         if not rect:
             unplaced.append(item.question_id)
             skipped_missing += 1
+            _fallback_mark(item.question_id, symbol, page_no)
             continue
         x0, y0, x1, y1 = rect
         w = x1 - x0
         h = y1 - y0
         anchor_x_px = x0 + w - 18.0
         anchor_y_px = y0 + 6.0
-        x_pt, y_pt = px_to_pdf(anchor_x_px, anchor_y_px, (norm_w, norm_h), page_size_pt)
-        tool = "check" if item.score >= item.max_score else "cross"
-        marks.append(OverlayMark(tool=tool, coords=[x_pt, y_pt], text=None))
+        x_pt, y_pt = px_to_pdf(anchor_x_px, anchor_y_px, (norm_w, norm_h), page_size_for_mark)
+        if item.low_confidence:
+            skipped_needs_review += 1
+            mark = OverlayMark(tool="note", coords=[x_pt, y_pt], text="REVIEW")
+        else:
+            tool = "check" if item.score >= item.max_score else "cross"
+            mark = OverlayMark(tool=tool, coords=[x_pt, y_pt], text=None)
+        if page_no == 1:
+            marks.append(mark)
+        marks_by_page.setdefault(page_no, []).append(mark)
         placed += 1
 
-    return Overlay(page=1, marks=marks), placed, skipped_missing, skipped_needs_review, unplaced
+    meta_out: Dict[str, Any] = {"coords_space": "pt"}
+    if any(page_no != 1 for page_no in marks_by_page.keys()):
+        meta_out["marks_by_page"] = {
+            str(page_no): [m.model_dump() for m in page_marks]
+            for page_no, page_marks in marks_by_page.items()
+        }
+
+    return Overlay(page=1, marks=marks, meta=meta_out), placed, skipped_missing, skipped_needs_review, unplaced
 
 
 def _size_from_meta(meta: Dict[str, Any]) -> Optional[Tuple[float, float]]:

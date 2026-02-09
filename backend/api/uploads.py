@@ -2,6 +2,7 @@ import datetime as dt
 import logging
 import os
 from io import BytesIO
+import re
 from typing import Optional, Literal, Tuple
 
 from PIL import Image
@@ -19,10 +20,10 @@ from ..services.answer_extraction import extract_answers_from_ocr
 from ..services.scoring import score_answer_maps
 from ..services.template_regions import (
     build_overlay_from_regions,
-    expected_answers_from_regions,
     extract_answers_from_regions,
     parse_regions_payload,
 )
+from ..services.template_manifest import load_template_manifest, manifest_to_template_regions_payload
 from ..services.marking import build_overlay_from_answers
 from ..models.schemas import Overlay, GradeResult
 from ..services.report import (
@@ -33,7 +34,7 @@ from ..services.report import (
     render_marked_pdf,
 )
 from ..services.scanner import image_bytes_to_pdf
-from ..services.template_grader import TemplateAlignmentError, grade_with_template
+from ..services.template_align import align_student_to_template
 from ..services.storage import (
     download_submission_bytes,
     normalize_storage_path,
@@ -90,6 +91,209 @@ def _regions_have_px_boxes(regions_payload: object) -> bool:
         if max_val > 1.5:
             return True
     return False
+
+
+def _qid_sort_key(qid: str) -> tuple[int, str]:
+    digits = "".join(ch for ch in str(qid) if ch.isdigit())
+    if digits:
+        return int(digits), str(qid)
+    return 10_000, str(qid)
+
+
+def _filter_to_expected_qids(expected_qids: list[str], values: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for qid in expected_qids:
+        out[qid] = str(values.get(qid) or "").strip()
+    return out
+
+
+def _template_mark_integrity_reasons(
+    *,
+    expected_count: int,
+    marks_placed: int | None,
+    marks_skipped_missing: int | None,
+    unplaced_items: list[str],
+) -> list[str]:
+    reasons: list[str] = []
+    question_marks_count = int(marks_placed or 0) + int(marks_skipped_missing or 0)
+    if question_marks_count != int(expected_count):
+        reasons.append(f"manifest_mark_count_mismatch:{question_marks_count}!={int(expected_count)}")
+    missing_count = int(marks_skipped_missing or 0)
+    if missing_count > 0:
+        reasons.append(f"manifest_missing_marks:{missing_count}")
+    if unplaced_items:
+        reasons.append(f"manifest_unplaced_items:{len(unplaced_items)}")
+    return reasons
+
+
+def _template_size_px(
+    template_width_px: object,
+    template_height_px: object,
+    regions_meta: dict,
+) -> Optional[Tuple[float, float]]:
+    try:
+        w = float(template_width_px or 0.0)
+        h = float(template_height_px or 0.0)
+        if w > 0 and h > 0:
+            return (w, h)
+    except Exception:
+        pass
+    try:
+        w = float(regions_meta.get("template_width_px") or 0.0)
+        h = float(regions_meta.get("template_height_px") or 0.0)
+        if w > 0 and h > 0:
+            return (w, h)
+    except Exception:
+        pass
+    return None
+
+
+def _scale_bbox(bbox: object, sx: float, sy: float) -> object:
+    if not isinstance(bbox, list):
+        return bbox
+    scaled: list[float] = []
+    for i, val in enumerate(bbox):
+        try:
+            v = float(val)
+        except Exception:
+            scaled.append(val)
+            continue
+        scaled.append(v * (sx if i % 2 == 0 else sy))
+    return scaled
+
+
+def _scale_ocr_boxes_to_size(
+    ocr_boxes: object,
+    target_size: Tuple[float, float],
+) -> tuple[object, bool]:
+    if not isinstance(ocr_boxes, dict):
+        return ocr_boxes, False
+    analyze = ocr_boxes.get("analyzeResult")
+    if not isinstance(analyze, dict):
+        return ocr_boxes, False
+    read_results = analyze.get("readResults")
+    if not isinstance(read_results, list):
+        return ocr_boxes, False
+
+    target_w, target_h = target_size
+    scaled_any = False
+    out: dict = {
+        **ocr_boxes,
+        "analyzeResult": {
+            **analyze,
+            "readResults": [],
+        },
+    }
+    out_read_results = out["analyzeResult"]["readResults"]
+    for page in read_results:
+        if not isinstance(page, dict):
+            out_read_results.append(page)
+            continue
+        try:
+            src_w = float(page.get("width") or 0.0)
+            src_h = float(page.get("height") or 0.0)
+        except Exception:
+            src_w = 0.0
+            src_h = 0.0
+        if src_w <= 0 or src_h <= 0:
+            out_read_results.append(page)
+            continue
+        sx = target_w / src_w
+        sy = target_h / src_h
+        scaled_page = {**page, "width": target_w, "height": target_h}
+        scaled_lines = []
+        for line in page.get("lines") or []:
+            if not isinstance(line, dict):
+                scaled_lines.append(line)
+                continue
+            scaled_line = {**line}
+            scaled_line["boundingBox"] = _scale_bbox(line.get("boundingBox"), sx, sy)
+            scaled_words = []
+            for word in line.get("words") or []:
+                if not isinstance(word, dict):
+                    scaled_words.append(word)
+                    continue
+                scaled_word = {**word}
+                scaled_word["boundingBox"] = _scale_bbox(word.get("boundingBox"), sx, sy)
+                scaled_words.append(scaled_word)
+            scaled_line["words"] = scaled_words
+            scaled_lines.append(scaled_line)
+        scaled_page["lines"] = scaled_lines
+        out_read_results.append(scaled_page)
+        scaled_any = True
+    return out, scaled_any
+
+
+def _scale_png_to_size(png_bytes: bytes, target_size: Tuple[float, float]) -> bytes:
+    tw = max(1, int(round(float(target_size[0]))))
+    th = max(1, int(round(float(target_size[1]))))
+    with Image.open(BytesIO(png_bytes)) as img:
+        resized = img.convert("RGB").resize((tw, th), Image.BICUBIC)
+    out = BytesIO()
+    resized.save(out, format="PNG")
+    return out.getvalue()
+
+
+def _entry_bbox_px(entry: dict, size: Tuple[float, float]) -> Optional[Tuple[float, float, float, float]]:
+    bbox = entry.get("bbox_px")
+    if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        x, y, w, h = bbox[0], bbox[1], bbox[2], bbox[3]
+    else:
+        answer_box = entry.get("answer_box") or {}
+        if not isinstance(answer_box, dict):
+            return None
+        x = answer_box.get("x")
+        y = answer_box.get("y")
+        w = answer_box.get("w")
+        h = answer_box.get("h")
+    try:
+        x = float(x or 0.0)
+        y = float(y or 0.0)
+        w = float(w or 0.0)
+        h = float(h or 0.0)
+    except Exception:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    if max(x, y, w, h) <= 1.5:
+        sx, sy = size
+        return x * sx, y * sy, (x + w) * sx, (y + h) * sy
+    return x, y, x + w, y + h
+
+
+def _save_qid_crops_debug(
+    owner_id: str,
+    upload_id: str,
+    frame_png: bytes,
+    regions_map: dict[str, dict],
+    qids: list[str],
+) -> None:
+    with Image.open(BytesIO(frame_png)) as img:
+        frame = img.convert("RGB")
+        fw, fh = float(frame.width), float(frame.height)
+        for qid in qids:
+            entry = regions_map.get(qid) or {}
+            rect = _entry_bbox_px(entry, (fw, fh))
+            if not rect:
+                continue
+            x0, y0, x1, y1 = rect
+            x0 = max(0, min(frame.width, int(round(x0))))
+            y0 = max(0, min(frame.height, int(round(y0))))
+            x1 = max(0, min(frame.width, int(round(x1))))
+            y1 = max(0, min(frame.height, int(round(y1))))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            crop = frame.crop((x0, y0, x1, y1))
+            buf = BytesIO()
+            crop.save(buf, format="PNG")
+            safe_qid = re.sub(r"[^A-Za-z0-9_-]+", "_", str(qid))
+            upload_debug_artifact(
+                owner_id,
+                upload_id,
+                f"qid_{safe_qid}_crop.png",
+                buf.getvalue(),
+                "image/png",
+            )
 
 
 @router.get("/{upload_id}/preview")
@@ -230,6 +434,7 @@ async def run_grade_pipeline(
     *,
     force: bool = False,
     debug: bool = False,
+    source: str = "uploads.grade_pipeline",
 ) -> dict:
     row = get_upload(
         upload_id,
@@ -273,6 +478,9 @@ async def run_grade_pipeline(
         template_png = None
         template_width_px = None
         template_height_px = None
+        template_manifest = None
+        template_manifest_embedded = False
+        template_degraded_reasons: list[str] = []
         if row.get("assignment_id"):
             try:
                 assignment = get_assignment(
@@ -291,8 +499,29 @@ async def run_grade_pipeline(
             template_version = assignment.get("template_version")
             template_width_px = assignment.get("template_width_px")
             template_height_px = assignment.get("template_height_px")
+            if template_storage_path:
+                try:
+                    template_manifest, template_manifest_embedded = load_template_manifest(
+                        template_regions,
+                        template_version=int(template_version or 1),
+                        template_width_px=template_width_px,
+                        template_height_px=template_height_px,
+                        require_approved=True,
+                    )
+                    template_regions = manifest_to_template_regions_payload(template_manifest)
+                except Exception as exc:
+                    update_upload(
+                        row["id"],
+                        {
+                            "status": "error",
+                            "needs_review": True,
+                            "ocr_error": f"template_manifest_unapproved: {exc}",
+                            "updated_at": _utc_iso(),
+                        },
+                    )
+                    raise HTTPException(status_code=409, detail=f"template_manifest_unapproved: {exc}")
 
-        regions_map, _ = parse_regions_payload(template_regions)
+        regions_map, regions_meta = parse_regions_payload(template_regions)
         regions_present = bool(regions_map)
         template_available = bool(template_regions and template_storage_path)
         template_used = False
@@ -307,10 +536,16 @@ async def run_grade_pipeline(
         marks_skipped_missing = None
         marks_skipped_needs_review = None
         answers = []
+        region_frame_source = None
+        region_frame_error = None
 
         answers_json = None
         answer_rows = []
         answer_prompt_version = None
+        effective_normalized_size = (
+            float(row.get("normalized_width_px") or 0.0),
+            float(row.get("normalized_height_px") or 0.0),
+        )
 
         if assignment:
             logger.info(
@@ -332,120 +567,168 @@ async def run_grade_pipeline(
                 raise HTTPException(status_code=409, detail="template_regions_missing")
 
         if regions_present:
-            expected_qids = [f"Q{i}" for i in range(1, 10)]
+            template_used = True
+            if template_manifest:
+                expected_qids = [q.question_id for q in template_manifest.questions]
+            else:
+                expected_qids = sorted((str(qid) for qid in regions_map.keys()), key=_qid_sort_key)
+            allow_unaligned_fallback = os.getenv("ALLOW_UNALIGNED_REGION_FALLBACK") == "1"
+            template_size = _template_size_px(template_width_px, template_height_px, regions_meta)
+
+            student_png = None
+            if row.get("normalized_image_path"):
+                try:
+                    student_png = download_submission_bytes(row.get("normalized_image_path"))
+                except Exception as exc:
+                    region_frame_error = f"student_image_load_failed: {exc}"
+
+            if template_storage_path:
+                try:
+                    template_png = download_submission_bytes(template_storage_path)
+                except Exception as exc:
+                    region_frame_error = f"template_image_load_failed: {exc}"
+            else:
+                region_frame_error = "template_storage_path_missing"
+
+            frame_ocr_boxes = None
+            frame_png_bytes = None
+
+            if template_png and student_png:
+                template_alignment = align_student_to_template(student_png, template_png)
+                if template_alignment.ok:
+                    frame_png_bytes = template_alignment.aligned_png
+                    debug_image_bytes = frame_png_bytes
+                    raw = await ocr_service.extract_text(image_bytes=frame_png_bytes)
+                    norm = normalize_ocr_result(raw)
+                    frame_ocr_boxes = norm.get("boxes") or {}
+                    region_frame_source = "aligned_image_ocr"
+                    template_alignment_used = True
+                    template_ocr_rects = []
+                else:
+                    region_frame_error = template_alignment.error or "alignment_failed"
+                    needs_review_from_overlay = True
+
+            if frame_ocr_boxes is None and student_png and template_size:
+                try:
+                    frame_png_bytes = _scale_png_to_size(student_png, template_size)
+                    debug_image_bytes = frame_png_bytes
+                    raw = await ocr_service.extract_text(image_bytes=frame_png_bytes)
+                    norm = normalize_ocr_result(raw)
+                    frame_ocr_boxes = norm.get("boxes") or {}
+                    region_frame_source = "scaled_image_ocr"
+                    needs_review_from_overlay = True
+                except Exception as exc:
+                    region_frame_error = f"scaled_image_ocr_failed: {exc}"
+
+            if frame_ocr_boxes is None and template_size:
+                scaled_boxes, scaled_ok = _scale_ocr_boxes_to_size(ocr_boxes, template_size)
+                if scaled_ok:
+                    frame_ocr_boxes = scaled_boxes
+                    region_frame_source = "scaled_ocr_boxes"
+                    needs_review_from_overlay = True
+
+            if frame_ocr_boxes is None:
+                if allow_unaligned_fallback:
+                    frame_ocr_boxes = ocr_boxes
+                    region_frame_source = "explicit_unaligned_fallback"
+                    needs_review_from_overlay = True
+                    logger.warning(
+                        "template_regions_unaligned_fallback upload_id=%s enabled_by_env=1",
+                        row["id"],
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "template_frame_unavailable: aligned/scaled frame required; "
+                            "set ALLOW_UNALIGNED_REGION_FALLBACK=1 to force fallback"
+                        ),
+                    )
+
             student_answers, missing_qids = extract_answers_from_regions(
-                ocr_boxes,
+                frame_ocr_boxes,
                 template_regions,
-                fallback_size=(
-                    float(row.get("normalized_width_px") or 0.0),
-                    float(row.get("normalized_height_px") or 0.0),
-                ),
+                fallback_size=template_size,
             )
-            key_answers: dict[str, str] = {}
-            filtered_students: dict[str, str] = {}
-            for qid in expected_qids:
-                entry = regions_map.get(qid) or {}
-                key_answers[qid] = str(entry.get("expected_answer_text") or "").strip()
-                filtered_students[qid] = str(student_answers.get(qid) or "").strip()
-            missing = sorted(
-                {qid for qid in expected_qids if qid not in regions_map or qid in missing_qids}
-            )
+            key_answers: dict[str, str]
+            if template_manifest:
+                key_answers = {
+                    q.question_id: str(q.expected_answer_text or "").strip()
+                    for q in template_manifest.questions
+                }
+            else:
+                key_answers = {}
+                for qid in expected_qids:
+                    entry = regions_map.get(qid) or {}
+                    key_answers[qid] = str(entry.get("expected_answer_text") or "").strip()
+            filtered_students = _filter_to_expected_qids(expected_qids, student_answers)
+            missing = sorted({qid for qid in expected_qids if qid in missing_qids}, key=_qid_sort_key)
             grade_result, answers, answer_rows = score_answer_maps(key_answers, filtered_students)
             grade_result.submission_id = row["id"]
             answers_json = {"key": key_answers, "student": filtered_students}
             if missing:
                 needs_review_from_overlay = True
-            pdf_source_path = row.get("normalized_pdf_path") or storage_path
-            pdf_source_key = strip_bucket_prefix(pdf_source_path, SUBMISSIONS_BUCKET)
-            sb = get_supabase()
-            if sb is None:
-                raise RuntimeError("Supabase client unavailable")
-            pdf_source_bytes = sb.storage.from_(SUBMISSIONS_BUCKET).download(pdf_source_key)
-            if not pdf_source_bytes:
-                raise RuntimeError(f"Submission not found: {pdf_source_path}")
-            pdf_mime = "application/pdf" if row.get("normalized_pdf_path") else row.get("mime_type")
+                template_degraded_reasons.append("missing_region_answers")
+
+            if debug_enabled(debug) and frame_png_bytes:
+                owner_id = row.get("owner_id") or user_id or "unknown"
+                try:
+                    _save_qid_crops_debug(
+                        owner_id,
+                        row["id"],
+                        frame_png_bytes,
+                        regions_map,
+                        expected_qids,
+                    )
+                except Exception:
+                    logger.exception("Failed to save qid crop debug artifacts for %s", row["id"])
+
+            if frame_png_bytes is not None:
+                pdf_source_bytes = image_bytes_to_pdf(frame_png_bytes)
+                pdf_mime = "application/pdf"
+            else:
+                pdf_source_path = row.get("normalized_pdf_path") or storage_path
+                pdf_source_key = strip_bucket_prefix(pdf_source_path, SUBMISSIONS_BUCKET)
+                sb = get_supabase()
+                if sb is None:
+                    raise RuntimeError("Supabase client unavailable")
+                pdf_source_bytes = sb.storage.from_(SUBMISSIONS_BUCKET).download(pdf_source_key)
+                if not pdf_source_bytes:
+                    raise RuntimeError(f"Submission not found: {pdf_source_path}")
+                pdf_mime = "application/pdf" if row.get("normalized_pdf_path") else row.get("mime_type")
             page_sizes = get_page_sizes(pdf_source_bytes, pdf_mime)
             page_size = page_sizes[0] if page_sizes else (612.0, 792.0)
-            normalized_size = (
-                float(row.get("normalized_width_px") or 0.0),
-                float(row.get("normalized_height_px") or 0.0),
-            )
+            normalized_size = effective_normalized_size
+            if frame_png_bytes is not None:
+                try:
+                    with Image.open(BytesIO(frame_png_bytes)) as img:
+                        normalized_size = (float(img.width), float(img.height))
+                except Exception:
+                    if template_size:
+                        normalized_size = (float(template_size[0]), float(template_size[1]))
+            elif template_size:
+                normalized_size = (float(template_size[0]), float(template_size[1]))
+            effective_normalized_size = normalized_size
             overlay, marks_placed, marks_skipped_missing, marks_skipped_needs_review, unplaced_items = build_overlay_from_regions(
                 grade_result,
                 template_regions,
                 normalized_size,
                 page_size,
+                page_sizes_pt=page_sizes,
             )
-            if unplaced_items:
+            if template_manifest:
+                expected_count = int(template_manifest.question_count or len(expected_qids))
+                integrity_reasons = _template_mark_integrity_reasons(
+                    expected_count=expected_count,
+                    marks_placed=marks_placed,
+                    marks_skipped_missing=marks_skipped_missing,
+                    unplaced_items=unplaced_items,
+                )
+                if integrity_reasons:
+                    needs_review_from_overlay = True
+                    template_degraded_reasons.extend(integrity_reasons)
+            elif unplaced_items:
                 needs_review_from_overlay = True
-            template_used = True
-        elif template_available and row.get("normalized_image_path"):
-            template_png = download_submission_bytes(template_storage_path)
-            student_png = download_submission_bytes(row.get("normalized_image_path"))
-            try:
-                template_output = await grade_with_template(
-                    student_png,
-                    template_png,
-                    template_regions,
-                    ocr_service.extract_text,
-                )
-            except TemplateAlignmentError as exc:
-                owner_id = row.get("owner_id") or user_id or "unknown"
-                overlay_key = f"{owner_id}/{row['id']}.json"
-                overlay_path = normalize_storage_path(OVERLAYS_BUCKET, overlay_key)
-                overlay_payload = build_minimal_overlay(row["id"], 0.0, 0.0).model_dump()
-                try:
-                    upload_json(OVERLAYS_BUCKET, overlay_key, overlay_payload)
-                except Exception as upload_exc:
-                    logger.warning(
-                        "overlay_upload_failed upload_id=%s error=%s",
-                        row["id"],
-                        upload_exc,
-                    )
-                update_upload(
-                    row["id"],
-                    {
-                        "status": "error",
-                        "needs_review": True,
-                        "ocr_error": f"template_alignment_failed: {exc}",
-                        "grade_json": {
-                            "template_used": False,
-                            "template_error": f"Template alignment failed: {exc}",
-                        },
-                        "overlay_path": overlay_path,
-                        "overlay_json": overlay_payload,
-                        "updated_at": _utc_iso(),
-                    },
-                )
-                raise HTTPException(status_code=422, detail=f"Template alignment failed: {exc}")
-            template_used = True
-            grade_result = template_output.grade_result
-            grade_result.submission_id = row["id"]
-            overlay = template_output.overlay
-            needs_review_from_overlay = template_output.needs_review
-            answers = template_output.student_answers
-            answer_rows = template_output.answer_rows
-            template_alignment = template_output.alignment
-            debug_image_bytes = template_output.alignment.aligned_png
-            template_ocr_rects = template_output.ocr_rects
-            unplaced_items = template_output.unplaced_items
-            marks_placed = template_output.marks_placed
-            marks_skipped_missing = template_output.marks_skipped_missing
-            template_alignment_used = True
-            if isinstance(template_output.student_answers, list):
-                key_map = {}
-                student_map = {}
-                for row_item in template_output.student_answers:
-                    qid = str(row_item.get("question_id") or "").strip()
-                    if not qid:
-                        continue
-                    key_map[qid] = str(row_item.get("expected_answer") or "").strip()
-                    student_map[qid] = str(row_item.get("student_answer") or "").strip()
-                answers_json = {"key": key_map, "student": student_map}
-
-            pdf_source_bytes = image_bytes_to_pdf(template_output.alignment.aligned_png)
-            pdf_mime = "application/pdf"
-            page_sizes = get_page_sizes(pdf_source_bytes, pdf_mime)
         else:
             if template_available:
                 logger.warning("Template exists but normalized image missing for %s; falling back", row["id"])
@@ -488,6 +771,7 @@ async def run_grade_pipeline(
                 float(row.get("normalized_width_px") or 0.0),
                 float(row.get("normalized_height_px") or 0.0),
             )
+            effective_normalized_size = normalized_size
             overlay, needs_review_from_overlay, unplaced_items, debug_layout = build_overlay_from_answers(
                 answers,
                 ocr_boxes,
@@ -505,7 +789,8 @@ async def run_grade_pipeline(
         page_width_pt, page_height_pt = page_sizes[0]
         page_width_in = page_width_pt / 72.0
         page_height_in = page_height_pt / 72.0
-        if template_alignment_used:
+        normalized_size = effective_normalized_size
+        if normalized_size[0] <= 0 or normalized_size[1] <= 0:
             normalized_size = (
                 float(page_width_pt / 72.0 * 300.0),
                 float(page_height_pt / 72.0 * 300.0),
@@ -516,11 +801,6 @@ async def run_grade_pipeline(
                         normalized_size = (float(img.width), float(img.height))
                 except Exception:
                     pass
-        else:
-            normalized_size = (
-                float(row.get("normalized_width_px") or 0.0),
-                float(row.get("normalized_height_px") or 0.0),
-            )
         if debug_enabled(debug):
             norm_w, norm_h = normalized_size
             sx = page_width_pt / norm_w if norm_w else None
@@ -547,7 +827,9 @@ async def run_grade_pipeline(
                 smoke_score_text = "Score: (unavailable) — NEEDS REVIEW"
 
         normalized_size_px = None
-        if (
+        if template_used and normalized_size[0] > 0 and normalized_size[1] > 0:
+            normalized_size_px = normalized_size
+        elif (
             template_regions
             and _regions_have_px_boxes(template_regions)
             and template_width_px
@@ -670,6 +952,10 @@ async def run_grade_pipeline(
             **grade_result.model_dump(),
             "answers": answers_payload,
             "debug_layout_path": debug_layout_path,
+            "pipeline": {
+                "source": source,
+                "template_used": bool(template_used),
+            },
         }
         if answers_json:
             grade_json["answers_json"] = answers_json
@@ -680,6 +966,17 @@ async def run_grade_pipeline(
         if template_used:
             grade_json["template_used"] = True
             grade_json["template_version_used"] = template_version
+            if template_manifest:
+                grade_json["template_manifest_schema"] = template_manifest.schema_version
+                grade_json["template_manifest_question_count"] = template_manifest.question_count
+                grade_json["template_manifest_embedded"] = bool(template_manifest_embedded)
+            if template_degraded_reasons:
+                grade_json["template_degraded"] = True
+                grade_json["template_degraded_reasons"] = sorted(set(template_degraded_reasons))
+            if region_frame_source:
+                grade_json["template_region_frame"] = region_frame_source
+            if region_frame_error:
+                grade_json["template_region_frame_error"] = region_frame_error
             if template_alignment:
                 grade_json["alignment"] = {
                     "ok": template_alignment.ok,
@@ -708,6 +1005,7 @@ async def run_grade_pipeline(
             "upload_id": row["id"],
             "needs_review": needs_review,
             "graded_pdf_path": pdf_key,
+            "pipeline_source": source,
         }
     except HTTPException:
         raise
@@ -723,12 +1021,59 @@ async def run_grade_pipeline(
         raise HTTPException(status_code=500, detail=f"grade_failed: {exc}")
 
 
+async def run_unified_submission_pipeline(
+    upload_id: str,
+    user_id: str,
+    *,
+    force: bool = False,
+    debug: bool = False,
+    source: str = "uploads.unified",
+) -> dict:
+    ran_ocr_stage = False
+    row = get_upload(
+        upload_id,
+        user_id,
+        columns="id,owner_id,status,ocr_status,ocr_error,graded_pdf_path,needs_review,grade_json,overlay_path",
+    )
+    ocr_status = str(row.get("ocr_status") or "").strip().lower()
+    if ocr_status != "done":
+        from .ocr import run_ocr_for_upload
+
+        await run_ocr_for_upload(row["id"], user_id, debug=debug, pipeline_source=f"{source}:ocr")
+        ran_ocr_stage = True
+        row = get_upload(
+            upload_id,
+            user_id,
+            columns="id,status,ocr_status,ocr_error,graded_pdf_path,needs_review,grade_json,overlay_path",
+        )
+        if str(row.get("status") or "").strip().lower() == "error" and not row.get("graded_pdf_path"):
+            detail = row.get("ocr_error") or "pipeline_failed"
+            raise HTTPException(status_code=500, detail=str(detail))
+        if row.get("graded_pdf_path") and (ran_ocr_stage or not force):
+            return {
+                "ok": True,
+                "upload_id": row["id"],
+                "needs_review": bool(row.get("needs_review")),
+                "graded_pdf_path": row.get("graded_pdf_path"),
+                "already": True,
+                "pipeline_source": source,
+            }
+
+    return await run_grade_pipeline(
+        upload_id,
+        user_id,
+        force=force,
+        debug=debug,
+        source=f"{source}:grade",
+    )
+
+
 @router.post("/{upload_id}/grade")
 async def grade_upload(
     upload_id: str,
     user_id: str = Depends(get_current_user_id),
 ):
-    return await run_grade_pipeline(upload_id, user_id)
+    return await run_unified_submission_pipeline(upload_id, user_id, source="uploads.grade")
 
 
 @router.post("/{upload_id}/retry")
@@ -737,18 +1082,13 @@ async def retry_upload(
     user_id: str = Depends(get_current_user_id),
     debug: bool = Query(False),
 ):
-    row = get_upload(
+    return await run_unified_submission_pipeline(
         upload_id,
         user_id,
-        columns="id,owner_id,ocr_status,graded_pdf_path",
+        force=True,
+        debug=debug,
+        source="uploads.retry",
     )
-    if row.get("graded_pdf_path"):
-        return {"ok": True, "upload_id": row["id"], "graded_pdf_path": row.get("graded_pdf_path"), "already": True}
-    if (row.get("ocr_status") or "").strip().lower() != "done":
-        from .ocr import run_ocr_for_upload
-
-        return await run_ocr_for_upload(row["id"], user_id, debug=debug)
-    return await run_grade_pipeline(row["id"], user_id, force=True, debug=debug)
 
 
 @router.post("/{upload_id}/override")
