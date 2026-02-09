@@ -23,6 +23,14 @@ graded PDF.
 • Make accuracy measurable and debuggable  
 • Validate output on a small golden set
 
+## Canonical Pipeline Rule (Required)
+There is exactly one normalized grading pipeline.
+
+• All entry points (DEV upload, Scan Students, legacy `/api/grade`, manual re-run) must route into the same OCR → template grading → overlay pipeline.  
+• DEV mode can only change file acquisition, never grading path selection.  
+• Template-backed assignments must use template grading once master key regions exist (no silent LLM/single-pass fallback).  
+• Grading path metadata must be inspectable per submission (`grade_json.pipeline` + template frame source fields).
+
 ## Tickets
 
 ### Ticket A1 — DEV-only Desktop Upload Path (DONE)
@@ -47,21 +55,106 @@ No grading in this step.
 Extract student answers into the same JSON schema.  
 Ignore scratch work where possible.
 
-### Ticket A5a — Persist Template Regions on Master-Key Upload (REQUIRED)
-Ensure `template_regions_json` is written (non-null) when master key is uploaded.
+### Ticket A5 — Template Regions + Mark Placement Recovery (PATCH PLAN v2) (IN PROGRESS)
+Goal: fix incorrect question counts, weak region answer reads, and missing/misaligned ✓/✗ marks.
 
-### Ticket A5b — Place ✓/✗ Marks Using Persisted Regions (REQUIRED)
-Use stored regions to place checks/Xs deterministically.
+Execution rule:
+• Implement exactly one patch step at a time.  
+• After each step, pause for manual test results before moving to the next step.
 
-Manual acceptance:
-• Upload master key (scan mode=master_key) → log `template_regions_saved ... regions=9 ...` and `template_regions_json` non-null.  
-• Upload student sheet + grade → marked PDF shows ✓/✗ inside question regions.  
-• If master key missing/regions null → grading fails fast with “template regions missing”.
+Patch sequence:
+1. Patch A5.1 — Remove hard caps and hardcoded `Q1..Q9` assumptions.
+   Acceptance:
+   • Region count in assignment metadata equals the true detected count (not capped at 9).  
+   • Grading iterates actual template qids only.
+2. Patch A5.2 — Enforce one coordinate contract end-to-end.
+   Acceptance:
+   • Overlay marks are rendered in the intended location on page 1.  
+   • No double conversion between px and PDF points.
+3. Patch A5.3 — Make template grading alignment-first.
+   Acceptance:
+   • For template-backed assignments, aligned page/frame is used before region extraction when available.  
+   • Fallback path is explicit and flagged.
+   • Debug artifacts include per-question crops from the exact aligned/scaled OCR frame (`debug/qid_Q3_crop.png`, etc.).
+4. Patch A5.4 — Place visible marks for low-confidence items.
+   Acceptance:
+   • Low-confidence questions still get a visible review marker/note, not silent omission.  
+   • `needs_review` stays true when confidence is low.
+5. Patch A5.5 — Support multi-page overlays.
+   Acceptance:
+   • Mark placement works on pages beyond page 1.  
+   • Overlay JSON and PDF flattening preserve page index.
+6. Patch A5.6 — Fix scan upload orchestration.
+   Acceptance:
+   • Student scan upload reliably triggers OCR + grading lifecycle (or explicit queued state).  
+   • No scan uploads remain stranded at `scanned` without grade progression.
+7. Patch A5.7 — Improve scoring tolerance/parsing.
+   Acceptance:
+   • Fewer false `needs_review` outcomes for legible quotient/remainder answers.  
+   • Incorrect vs needs-review distinction is consistent.
+8. Patch A5.8 — Add regression coverage for the above.
+   Acceptance:
+   • Automated tests cover: <9, =9, >9 questions, multi-page PDFs, low-confidence mark behavior, and coordinate mapping.
+9. Patch A5.9 — Standardize normalized sizing units.
+   Acceptance:
+   • `normalized_width_px` / `normalized_height_px` are stored as true pixel dimensions.  
+   • OCR geometries that arrive in non-pixel units (inch/cm/etc.) are converted to px before grading/overlay.  
+   • DEV upload and scan upload produce consistent overlay placement under the same coordinate contract.
 
-### Ticket A6 — Overlay + Marked PDF Validation
-Ensure overlays align correctly.  
+Execution status (current branch):
+• A5.1 implemented  
+• A5.2 implemented  
+• A5.3 implemented  
+• A5.4 implemented  
+• A5.5 implemented  
+• A5.6 implemented  
+• A5.7 implemented  
+• A5.8 implemented
+• A5.9 implemented (unit-safe normalized sizing)
+
+### Ticket A6 — Golden Set Validation (after A5.1–A5.8)
+Ensure overlays align correctly and grading is stable on known worksheets.  
 Produce printable, readable marked PDFs.  
-Validate on a small golden set (2–3 worksheets with known answers).
+Validate on a golden set (at least 3 worksheets, including multi-page).
+
+Current hardening focus:
+• A6.1 mark readability (larger/thicker visible ✓/✗)  
+• A6.2 overlay completeness (every graded item must emit a visible ✓/✗/REVIEW mark, with fallback notes when anchor placement fails)  
+• A6.3 straggler reduction (page-specific size mapping + aligned/scaled frame dimensions as overlay normalization source)
+
+### Ticket A7 — Master Key = Truth + One Pipeline Lockdown (PATCH PLAN v3) (NEXT)
+Goal: make question count and mark emission deterministic so template-backed grading cannot drift.
+
+Execution rule:
+• Implement exactly one step at a time, in order.  
+• After each step, pause for manual verification before moving to the next.
+
+Deliverables mapping:
+• D1 frozen manifest schema + versioning → Steps 1, 2, 7  
+• D2 unified ingestion entry points → Step 5  
+• D3 strict template grading contract (no non-template leakage) → Steps 3, 4  
+• D4 overlay integrity gates → Step 6  
+• D5 stale-output invalidation → Step 8  
+• D6 golden-set invariant tests → Step 9
+
+Ordered patch sequence:
+1. Define canonical template manifest contract (authoritative fields, required ids, page + box semantics). `[implemented]`
+2. Freeze manifest at template approval and persist immutable versioned payload (no downstream qid rewriting/reordering). `[pending]`
+3. Enforce strict template grading contract: grade only manifest qids, no heuristic question discovery in template mode. `[pending]`
+4. Enforce single anchor outcome per manifest question with explicit degraded-mode marker when placement fails. `[pending]`
+5. Unify master-key ingestion entry points (`/assignments/{id}/template` and scan master-key upload) onto the same normalization + extraction + approval pipeline. `[pending]`
+6. Add overlay integrity gates (one visible mark per graded item; no unknown qids; fail closed to review when violated). `[pending]`
+7. Add manifest/version stamping and runtime compatibility checks (`template_manifest_version`, `template_version_used`). `[pending]`
+8. Invalidate stale graded artifacts on template/version change (or force deterministic regrade before serving). `[pending]`
+9. Add golden-set invariant tests: exact question count, one-mark-per-question, no extras, bounded placement tolerance, deterministic path. `[pending]`
+10. Add operator-facing degraded-mode visibility and debug trace fields for frame source + fallback reason. `[pending]`
+
+Status snapshot for this track:
+• A6.1 implemented  
+• A6.2 implemented  
+• A6.3 implemented  
+• A7.1 implemented (contract module + validation tests)
+• A7.2–A7.10 pending
 
 ## Acceptance Criteria (Phase A)
 • Clean PDFs grade correctly (near-perfect scores).  
