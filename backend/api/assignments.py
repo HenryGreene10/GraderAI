@@ -8,25 +8,29 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Literal, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 from ..auth import get_current_user_id
 from ..config import GRADED_BUCKET, OVERLAYS_BUCKET, SUBMISSIONS_BUCKET
 from ..services.db import get_assignment, require_supabase
-from ..services.storage import normalize_storage_path, strip_bucket_prefix, upload_bytes
+from ..services.storage import download_submission_bytes, normalize_storage_path, strip_bucket_prefix, upload_bytes
 from io import BytesIO
 
 from PIL import Image
 
 from ..services.scanner import MAX_DIM_PX, normalize_image_bytes
 from ..services import ocr as ocr_service
+from ..services.ocr import normalize_ocr_result
+from ..services.answer_extraction import extract_answers_from_ocr
 from ..services.template import (
     TemplateValidationError,
     detect_answer_boxes,
     detect_question_regions,
     extract_template_regions,
 )
+from ..services.template_regions import build_template_regions_payload, parse_regions_payload
+from ..services.template_manifest import load_template_manifest, with_approved_manifest
 from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
@@ -85,14 +89,27 @@ def _assignment_payload(row: dict, uploads_count: int = 0) -> dict:
 
 def _assignment_detail_payload(row: dict) -> dict:
     base = _assignment_payload(row, uploads_count=0)
-    regions = row.get("template_regions_json") or []
+    regions = row.get("template_regions_json") or {}
     detected_qids = []
-    if isinstance(regions, list):
-        detected_qids = [str(r.get("qid")) for r in regions if isinstance(r, dict) and r.get("qid")]
+    regions_count = 0
+    try:
+        manifest, _embedded = load_template_manifest(
+            regions,
+            template_version=int(row.get("template_version") or 1),
+            template_width_px=row.get("template_width_px"),
+            template_height_px=row.get("template_height_px"),
+            require_approved=False,
+        )
+        detected_qids = [q.question_id for q in manifest.questions]
+        regions_count = int(manifest.question_count or len(detected_qids))
+    except Exception:
+        regions_map, _ = parse_regions_payload(regions)
+        detected_qids = list(regions_map.keys()) if regions_map else []
+        regions_count = len(detected_qids)
     base.update(
         {
             "template_storage_path": row.get("template_storage_path"),
-            "template_regions_count": len(regions) if isinstance(regions, list) else 0,
+            "template_regions_count": regions_count,
             "template_detected_qids": detected_qids,
             "template_width_px": row.get("template_width_px"),
             "template_height_px": row.get("template_height_px"),
@@ -326,6 +343,102 @@ def list_assignment_uploads(
     return {"uploads": uploads}
 
 
+@router.get("/{assignment_id}/template-ocr")
+async def get_template_ocr(
+    assignment_id: str,
+    user_id: str = Depends(get_current_user_id),
+    include_raw: bool = Query(False),
+):
+    row = get_assignment(
+        assignment_id,
+        user_id,
+        columns="id,owner_id,template_storage_path,template_regions_json,template_uploaded_at",
+    )
+    regions_payload = row.get("template_regions_json") or []
+    regions_map, _ = parse_regions_payload(regions_payload)
+    if not row.get("template_storage_path"):
+        raise HTTPException(status_code=404, detail="template_missing")
+    payload_regions = []
+    for qid, region in regions_map.items():
+        payload_regions.append(
+            {
+                "qid": qid,
+                "expected_answer_text": region.get("expected_answer_text"),
+            }
+        )
+    response = {
+        "template_uploaded_at": row.get("template_uploaded_at"),
+        "regions": payload_regions,
+        "regions_full": regions_payload,
+        "count": len(payload_regions),
+        "template_has_regions": bool(payload_regions),
+    }
+    if include_raw:
+        template_bytes = download_submission_bytes(row.get("template_storage_path"))
+        raw = ocr_service.extract_text(image_bytes=template_bytes)
+        if hasattr(raw, "__await__"):
+            raw = await raw
+        response["raw_ocr"] = normalize_ocr_result(raw)
+    return response
+
+
+@router.get("/{assignment_id}/template-regions")
+def get_template_regions(
+    assignment_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    row = get_assignment(
+        assignment_id,
+        user_id,
+        columns="id,owner_id,template_regions_json,template_uploaded_at",
+    )
+    regions_payload = row.get("template_regions_json") or {}
+    regions_map, _ = parse_regions_payload(regions_payload)
+    return {
+        "template_uploaded_at": row.get("template_uploaded_at"),
+        "regions": regions_payload,
+        "count": len(regions_map),
+    }
+
+
+@router.get("/{assignment_id}/answer-key")
+async def get_answer_key(
+    assignment_id: str,
+    user_id: str = Depends(get_current_user_id),
+    include_metadata: bool = Query(False),
+):
+    row = get_assignment(
+        assignment_id,
+        user_id,
+        columns="id,owner_id,template_storage_path,template_regions_json,template_uploaded_at",
+    )
+    if not row.get("template_storage_path"):
+        raise HTTPException(status_code=404, detail="template_missing")
+
+    template_bytes = download_submission_bytes(row.get("template_storage_path"))
+    raw = ocr_service.extract_text(image_bytes=template_bytes)
+    if hasattr(raw, "__await__"):
+        raw = await raw
+    norm = normalize_ocr_result(raw)
+    ocr_text = str(norm.get("text") or "").strip()
+    if not ocr_text:
+        raise HTTPException(status_code=400, detail="template_ocr_empty")
+
+    answers, prompt_version = await extract_answers_from_ocr(ocr_text, role="answer_key")
+    response = {
+        "answers": answers,
+        "prompt_version": prompt_version,
+    }
+    if include_metadata:
+        response["metadata"] = {
+            "ocr_text": ocr_text,
+            "raw_ocr": norm,
+            "regions_full": row.get("template_regions_json") or [],
+            "template_uploaded_at": row.get("template_uploaded_at"),
+        }
+    return response
+
+
 @router.delete("/{assignment_id}")
 def delete_assignment(
     assignment_id: str,
@@ -463,27 +576,18 @@ async def upload_template(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    template_regions = [
-        {
-            "qid": region.qid,
-            "region": {"x": region.region[0], "y": region.region[1], "w": region.region[2], "h": region.region[3]},
-            "answer_box": {
-                "x": region.answer_box[0],
-                "y": region.answer_box[1],
-                "w": region.answer_box[2],
-                "h": region.answer_box[3],
-            },
-            "expected_answer_text": region.expected_answer_text,
-            "label_method": region.label_method,
-            "index": region.index,
-        }
-        for region in regions
-    ]
-
     template_version = int(assignment.get("template_version") or 0) + 1
     template_upload_id = str(uuid4())
     template_uploaded_at = _utc_iso()
     template_original_name = file.filename
+    template_regions_raw = build_template_regions_payload(regions, (template_w, template_h))
+    template_regions = with_approved_manifest(
+        template_regions_raw,
+        template_version=template_version,
+        template_width_px=template_w,
+        template_height_px=template_h,
+        approved_at=template_uploaded_at,
+    )
     sb = require_supabase()
     sb.table("assignments").update(
         {
@@ -497,6 +601,20 @@ async def upload_template(
             "template_uploaded_at": template_uploaded_at,
         }
     ).eq("id", assignment_id).execute()
+
+    logger.info(
+        "template_regions_saved assignment_id=%s regions=%s template_w=%s template_h=%s",
+        assignment_id,
+        len(template_regions.get("regions") or []),
+        template_w,
+        template_h,
+    )
+    if not template_regions.get("regions"):
+        logger.warning("template_regions_empty assignment_id=%s", assignment_id)
+        try:
+            sb.table("assignments").update({"needs_review": True}).eq("id", assignment_id).execute()
+        except Exception as exc:
+            logger.warning("template_regions_empty_needs_review_failed assignment_id=%s error=%s", assignment_id, exc)
 
     had_template = bool(assignment.get("template_storage_path") and assignment.get("template_regions_json"))
     if had_template:
@@ -512,8 +630,8 @@ async def upload_template(
         "template_upload_id": template_upload_id,
         "template_original_name": template_original_name,
         "template_uploaded_at": template_uploaded_at,
-        "boxes_detected": len(template_regions),
-        "qids": [r["qid"] for r in template_regions],
+        "boxes_detected": len((template_regions.get("manifest") or {}).get("questions") or []),
+        "qids": [r.get("qid") for r in (template_regions.get("regions") or []) if isinstance(r, dict)],
         "warnings": warnings,
     }
 
@@ -533,7 +651,8 @@ async def upload_assignment_files(
 
     template_regions = assignment.get("template_regions_json") or []
     template_storage_path = assignment.get("template_storage_path")
-    if not template_storage_path or not template_regions:
+    regions_map, _ = parse_regions_payload(template_regions)
+    if not template_storage_path or not regions_map:
         raise HTTPException(status_code=409, detail="Upload master key first.")
 
     if not files:
@@ -606,7 +725,7 @@ async def upload_assignment_files(
 
 async def _run_ocr_in_background(upload_id: str, user_id: str) -> None:
     try:
-        await run_ocr_for_upload(upload_id, user_id)
+        await run_ocr_for_upload(upload_id, user_id, pipeline_source="assignments.auto")
     except HTTPException as exc:
         logger.warning("OCR failed for upload %s: %s", upload_id, exc.detail)
     except Exception:

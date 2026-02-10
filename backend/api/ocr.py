@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from ..auth import get_current_user_id
 from ..services import ocr
 from ..services.db import get_upload, update_upload
-from ..services.ocr import normalize_ocr_result
+from ..services.ocr import infer_primary_page_size_px, normalize_ocr_result
 from ..services.scan_pipeline import prepare_ocr_image
 from ..services.storage import download_submission_bytes
 from ..services.debug_artifacts import (
@@ -46,7 +46,13 @@ def _log_ocr_image_size(tag: str, image_bytes: bytes) -> None:
         return
 
 
-async def run_ocr_for_upload(upload_id: str, user_id: str, *, debug: bool = False) -> dict:
+async def run_ocr_for_upload(
+    upload_id: str,
+    user_id: str,
+    *,
+    debug: bool = False,
+    pipeline_source: str = "ocr.auto",
+) -> dict:
     row = get_upload(
         upload_id,
         user_id,
@@ -114,6 +120,7 @@ async def run_ocr_for_upload(upload_id: str, user_id: str, *, debug: bool = Fals
 
         scan_failed = bool(scan_artifacts and not scan_artifacts.scan_ok) or bool(scan_error)
         needs_review = bool(row.get("needs_review")) or scan_failed
+        frame_w, frame_h = infer_primary_page_size_px(norm.get("boxes"))
         payload = {
             "ocr_status": OCR_DONE,
             "status": "ocr_done",
@@ -123,6 +130,8 @@ async def run_ocr_for_upload(upload_id: str, user_id: str, *, debug: bool = Fals
             "ocr_confidence": norm.get("confidence"),
             "ocr_error": None,
             "updated_at": _utc_iso(),
+            "normalized_width_px": int(round(frame_w)) if frame_w > 0 else None,
+            "normalized_height_px": int(round(frame_h)) if frame_h > 0 else None,
         }
         if scan_artifacts:
             payload.update(
@@ -182,7 +191,7 @@ async def run_ocr_for_upload(upload_id: str, user_id: str, *, debug: bool = Fals
         try:
             from .uploads import run_grade_pipeline
 
-            await run_grade_pipeline(row["id"], user_id, debug=debug)
+            await run_grade_pipeline(row["id"], user_id, debug=debug, source=pipeline_source)
         except HTTPException as exc:
             logger.warning("Auto-grade failed for %s: %s", row["id"], exc.detail)
         except Exception:
@@ -215,7 +224,12 @@ async def start_ocr(
     user_id: str = Depends(get_current_user_id),
     debug: bool = Query(False),
 ):
-    return await run_ocr_for_upload(body.upload_id, user_id, debug=debug)
+    return await run_ocr_for_upload(
+        body.upload_id,
+        user_id,
+        debug=debug,
+        pipeline_source="ocr.start",
+    )
 
 
 @router.get("/status/{upload_id}")

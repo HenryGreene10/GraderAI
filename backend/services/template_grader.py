@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 import logging
-import re
 from typing import Any, Dict, List, Tuple
 
 from PIL import Image
@@ -12,11 +11,9 @@ from ..models.schemas import CriterionScore, GradeResult, Overlay, OverlayMark, 
 from .coords import px_to_pdf
 from .scanner import MIN_DIM_PX, MAX_DIM_PX, PDF_DPI
 from .template_align import AlignmentResult, align_student_to_template
+from .scoring import PROMPT_VERSION, RUBRIC_VERSION, score_quotient_remainder
 
 logger = logging.getLogger(__name__)
-
-TEMPLATE_RUBRIC_VERSION = "template-1"
-TEMPLATE_PROMPT_VERSION = "template-1"
 
 
 @dataclass
@@ -27,52 +24,14 @@ class TemplateGradeOutput:
     alignment: AlignmentResult
     student_answers: List[Dict[str, Any]]
     ocr_rects: List[Tuple[float, float, float, float]]
+    answer_rows: List[Dict[str, Any]]
+    marks_placed: int
+    marks_skipped_missing: int
+    unplaced_items: List[str]
 
 
 class TemplateAlignmentError(Exception):
     pass
-
-
-def _normalize_text(value: str) -> str:
-    raw = " ".join((value or "").split())
-    if not raw:
-        return ""
-    raw = re.sub(r"(?i)\b(r|rem|remainder)\s*([0-9]+)\b", r"R\2", raw)
-    raw = re.sub(r"(?i)(\d)\s*R\s*([0-9]+)", r"\1 R\2", raw)
-    return raw.lower()
-
-
-def _extract_number(value: str) -> float | None:
-    match = re.search(r"-?\d+(?:\.\d+)?", value or "")
-    if not match:
-        return None
-    try:
-        return float(match.group(0))
-    except Exception:
-        return None
-
-
-def _score_answer(expected: str, got: str) -> Tuple[float, str, bool]:
-    expected_norm = _normalize_text(expected)
-    got_norm = _normalize_text(got)
-    if not expected_norm:
-        return 0.0, "Missing expected answer", True
-    exp_num = _extract_number(expected_norm)
-    got_num = _extract_number(got_norm)
-    if exp_num is not None and got_num is not None:
-        tol = max(0.01, abs(exp_num) * 0.02)
-        if abs(exp_num - got_num) <= tol:
-            return 1.0, f"Numeric match within {tol:.2f}", False
-        return 0.0, f"Expected {exp_num} got {got_num}", False
-    if expected_norm == got_norm:
-        return 1.0, "Exact match", False
-    expected_tokens = set(expected_norm.split())
-    got_tokens = set(got_norm.split())
-    if expected_tokens and got_tokens:
-        overlap = len(expected_tokens & got_tokens)
-        if overlap >= max(1, len(expected_tokens) // 2):
-            return 1.0, f"Keyword overlap {overlap}", False
-    return 0.0, "Answer mismatch", False
 
 
 def _prepare_crop(image: Image.Image) -> Image.Image:
@@ -114,6 +73,7 @@ async def grade_with_template(
 
     items: List[QuestionGrade] = []
     answers: List[Dict[str, Any]] = []
+    answer_rows: List[Dict[str, Any]] = []
     needs_review = False
     ocr_rects: List[Tuple[float, float, float, float]] = []
 
@@ -134,8 +94,8 @@ async def grade_with_template(
         raw = await ocr_func(image_bytes=crop_png)
         student_text = str((raw or {}).get("text") or "").strip()
         ocr_rects.extend(_offset_rects(_extract_rects(raw), x0, y0))
-        score, rationale, low_conf = _score_answer(expected, student_text)
-        if low_conf or not student_text:
+        status, score, rationale, low_conf = score_quotient_remainder(expected, student_text)
+        if low_conf:
             needs_review = True
 
         items.append(
@@ -146,7 +106,7 @@ async def grade_with_template(
                 max_score=1.0,
                 criteria=[
                     CriterionScore(
-                        name="template",
+                        name="quotient-remainder",
                         score=score,
                         max_score=1.0,
                         rationale=rationale,
@@ -161,6 +121,17 @@ async def grade_with_template(
                 "question_id": qid,
                 "student_answer": student_text,
                 "expected_answer": expected,
+                "status": status,
+                "score": score,
+            }
+        )
+        answer_rows.append(
+            {
+                "question_id": qid,
+                "status": status,
+                "score": score,
+                "expected_raw": expected,
+                "observed_raw": student_text,
             }
         )
 
@@ -170,12 +141,20 @@ async def grade_with_template(
         total_score=total,
         total_max=float(len(items)),
         items=items,
-        rubric_version=TEMPLATE_RUBRIC_VERSION,
-        prompt_version=TEMPLATE_PROMPT_VERSION,
+        rubric_version=RUBRIC_VERSION,
+        prompt_version=PROMPT_VERSION,
         needs_review=needs_review,
     )
 
-    overlay = _build_template_overlay(template_regions, result, aligned_img.size)
+    overlay, marks_placed, marks_skipped_missing, unplaced = _build_template_overlay(
+        template_regions,
+        result,
+        aligned_img.size,
+    )
+    if unplaced:
+        needs_review = True
+        result.needs_review = True
+        result.unplaced_items = unplaced
     return TemplateGradeOutput(
         grade_result=result,
         overlay=overlay,
@@ -183,6 +162,10 @@ async def grade_with_template(
         alignment=alignment,
         student_answers=answers,
         ocr_rects=ocr_rects,
+        answer_rows=answer_rows,
+        marks_placed=marks_placed,
+        marks_skipped_missing=marks_skipped_missing,
+        unplaced_items=unplaced,
     )
 
 
@@ -190,31 +173,54 @@ def _build_template_overlay(
     template_regions: List[Dict[str, Any]],
     grade_result: GradeResult,
     template_size: Tuple[int, int],
-) -> Overlay:
+) -> Tuple[Overlay, int, int, List[str]]:
     norm_w, norm_h = float(template_size[0]), float(template_size[1])
     page_w_pt = norm_w / PDF_DPI * 72.0
     page_h_pt = norm_h / PDF_DPI * 72.0
     marks: List[OverlayMark] = []
+    unplaced: List[str] = []
+    placed = 0
+    skipped_missing = 0
+    marks_by_page: Dict[int, List[OverlayMark]] = {}
+    fallback_count_by_page: Dict[int, int] = {}
+
+    def _fallback_mark(item_id: str, item_symbol: str, page_no: int) -> None:
+        idx = fallback_count_by_page.get(page_no, 0)
+        y = max(24.0, page_h_pt - 56.0 - idx * 18.0)
+        mark = OverlayMark(tool="note", coords=[24.0, y], text=f"{item_id}: {item_symbol} (fallback)")
+        fallback_count_by_page[page_no] = idx + 1
+        if page_no == 1:
+            marks.append(mark)
+        marks_by_page.setdefault(page_no, []).append(mark)
 
     score_w = 140.0
     score_h = 26.0
     score_margin = 24.0
     score_x = page_w_pt - score_w - score_margin
     score_y = page_h_pt - score_h - score_margin
-    marks.append(
-        OverlayMark(
-            tool="bubble",
-            coords=[score_x, score_y, score_w, score_h],
-            text=f"Score: {grade_result.total_score:.0f}/{grade_result.total_max:.0f}",
-        )
+    score_mark = OverlayMark(
+        tool="bubble",
+        coords=[score_x, score_y, score_w, score_h],
+        text=f"Score: {grade_result.total_score:.0f}/{grade_result.total_max:.0f}",
     )
+    marks.append(score_mark)
+    marks_by_page.setdefault(1, []).append(score_mark)
 
     for item in grade_result.items:
         region = next((r for r in template_regions if str(r.get("qid")) == item.question_id), None)
+        symbol = "REVIEW" if item.low_confidence else ("✓" if item.score >= item.max_score else "✗")
         if not region:
+            unplaced.append(item.question_id)
+            skipped_missing += 1
+            _fallback_mark(item.question_id, symbol, 1)
             continue
+        page_index = int(region.get("page_index") or 0)
+        page_no = page_index + 1
         answer_box = region.get("answer_box") or {}
         if not answer_box:
+            unplaced.append(item.question_id)
+            skipped_missing += 1
+            _fallback_mark(item.question_id, symbol, page_no)
             continue
         x0 = float(answer_box.get("x") or 0.0)
         y0 = float(answer_box.get("y") or 0.0)
@@ -223,10 +229,23 @@ def _build_template_overlay(
         anchor_x_px = x0 + w - 18.0
         anchor_y_px = y0 + 6.0
         x_pt, y_pt = px_to_pdf(anchor_x_px, anchor_y_px, (norm_w, norm_h), (page_w_pt, page_h_pt))
-        tool = "check" if item.score >= item.max_score * 0.5 else "cross"
-        marks.append(OverlayMark(tool=tool, coords=[x_pt, y_pt], text=None))
+        if item.low_confidence:
+            mark = OverlayMark(tool="note", coords=[x_pt, y_pt], text="REVIEW")
+        else:
+            tool = "check" if item.score >= item.max_score else "cross"
+            mark = OverlayMark(tool=tool, coords=[x_pt, y_pt], text=None)
+        if page_no == 1:
+            marks.append(mark)
+        marks_by_page.setdefault(page_no, []).append(mark)
+        placed += 1
 
-    return Overlay(page=1, marks=marks)
+    meta: Dict[str, Any] = {"coords_space": "pt"}
+    if any(page_no != 1 for page_no in marks_by_page.keys()):
+        meta["marks_by_page"] = {
+            str(page_no): [m.model_dump() for m in page_marks]
+            for page_no, page_marks in marks_by_page.items()
+        }
+    return Overlay(page=1, marks=marks, meta=meta), placed, skipped_missing, unplaced
 
 
 def _extract_rects(raw: Any) -> List[Tuple[float, float, float, float]]:

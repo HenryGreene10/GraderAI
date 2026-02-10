@@ -45,6 +45,11 @@ const ACCEPTED_EXT = [".png", ".jpg", ".jpeg", ".pdf"];
 const TEMPLATE_MIME = ["image/png", "image/jpeg"];
 const TEMPLATE_EXT = [".png", ".jpg", ".jpeg"];
 const SCAN_REQUIRED = true;
+const PDF_JS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+const PDF_JS_WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+const PDF_LIB_URL = "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js";
+let pdfJsPromise;
+let pdfLibPromise;
 
 function isAllowedFile(file) {
   if (!file) return false;
@@ -58,6 +63,118 @@ function isAllowedTemplate(file) {
   if (TEMPLATE_MIME.includes(file.type)) return true;
   const name = String(file.name || "").toLowerCase();
   return TEMPLATE_EXT.some((ext) => name.endsWith(ext));
+}
+
+function isPdfFile(file) {
+  if (!file) return false;
+  const type = String(file.type || "").toLowerCase();
+  if (type.includes("pdf")) return true;
+  const name = String(file.name || "").toLowerCase();
+  return name.endsWith(".pdf");
+}
+
+function isImageFile(file) {
+  if (!file) return false;
+  const type = String(file.type || "").toLowerCase();
+  if (type.startsWith("image/")) return true;
+  const name = String(file.name || "").toLowerCase();
+  return TEMPLATE_EXT.some((ext) => name.endsWith(ext));
+}
+
+function loadPdfJs() {
+  if (typeof window === "undefined") return Promise.reject(new Error("window_unavailable"));
+  if (window.pdfjsLib?.getDocument) return Promise.resolve(window.pdfjsLib);
+  if (pdfJsPromise) return pdfJsPromise;
+  pdfJsPromise = new Promise((resolve, reject) => {
+    const existing = document.getElementById("pdfjs");
+    if (existing) {
+      const check = () => {
+        if (window.pdfjsLib?.getDocument) return resolve(window.pdfjsLib);
+        setTimeout(check, 50);
+        return null;
+      };
+      check();
+      return;
+    }
+    const script = document.createElement("script");
+    script.id = "pdfjs";
+    script.async = true;
+    script.src = PDF_JS_URL;
+    script.onload = () => {
+      if (window.pdfjsLib?.getDocument) {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDF_JS_WORKER_URL;
+        resolve(window.pdfjsLib);
+        return;
+      }
+      reject(new Error("pdfjs_load_error"));
+    };
+    script.onerror = () => reject(new Error("pdfjs_load_error"));
+    document.body.appendChild(script);
+  });
+  return pdfJsPromise;
+}
+
+function loadPdfLib() {
+  if (typeof window === "undefined") return Promise.reject(new Error("window_unavailable"));
+  if (window.PDFLib?.PDFDocument) return Promise.resolve(window.PDFLib);
+  if (pdfLibPromise) return pdfLibPromise;
+  pdfLibPromise = new Promise((resolve, reject) => {
+    const existing = document.getElementById("pdflibjs");
+    if (existing) {
+      const check = () => {
+        if (window.PDFLib?.PDFDocument) return resolve(window.PDFLib);
+        setTimeout(check, 50);
+        return null;
+      };
+      check();
+      return;
+    }
+    const script = document.createElement("script");
+    script.id = "pdflibjs";
+    script.async = true;
+    script.src = PDF_LIB_URL;
+    script.onload = () => {
+      if (window.PDFLib?.PDFDocument) {
+        resolve(window.PDFLib);
+        return;
+      }
+      reject(new Error("pdf_lib_failed_to_load"));
+    };
+    script.onerror = () => reject(new Error("pdf_lib_load_error"));
+    document.body.appendChild(script);
+  });
+  return pdfLibPromise;
+}
+
+async function pdfFirstPageToPngBlob(file) {
+  const pdfjs = await loadPdfJs();
+  const data = await file.arrayBuffer();
+  const doc = await pdfjs.getDocument({ data }).promise;
+  const page = await doc.getPage(1);
+  const viewport = page.getViewport({ scale: 2 });
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (!blob) throw new Error("pdf_render_failed");
+  return blob;
+}
+
+async function imageFileToPdfBlob(file) {
+  const { PDFDocument } = await loadPdfLib();
+  const pdfDoc = await PDFDocument.create();
+  const bytes = await file.arrayBuffer();
+  const name = String(file.name || "").toLowerCase();
+  const isPng = file.type === "image/png" || name.endsWith(".png");
+  const image = isPng
+    ? await pdfDoc.embedPng(bytes)
+    : await pdfDoc.embedJpg(bytes);
+  const page = pdfDoc.addPage([image.width, image.height]);
+  page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+  const pdfBytes = await pdfDoc.save();
+  return new Blob([pdfBytes], { type: "application/pdf" });
 }
 
 function statusLabel(status) {
@@ -171,6 +288,8 @@ export default function AssignmentsPage() {
   const [scanError, setScanError] = useState("");
   const [scanLoading, setScanLoading] = useState(false);
   const [scanCompleted, setScanCompleted] = useState(false);
+  const [devMasterUploading, setDevMasterUploading] = useState(false);
+  const [devStudentUploading, setDevStudentUploading] = useState(false);
 
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerTab, setViewerTab] = useState("original");
@@ -178,6 +297,11 @@ export default function AssignmentsPage() {
   const [viewerUrls, setViewerUrls] = useState({ original: "", marked: "" });
   const [viewerLoading, setViewerLoading] = useState(false);
   const [viewerError, setViewerError] = useState("");
+  const [ocrDebugOpen, setOcrDebugOpen] = useState(false);
+  const [ocrDebugTitle, setOcrDebugTitle] = useState("");
+  const [ocrDebugText, setOcrDebugText] = useState("");
+  const [ocrDebugLoading, setOcrDebugLoading] = useState(false);
+  const [ocrDebugError, setOcrDebugError] = useState("");
 
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -200,6 +324,7 @@ export default function AssignmentsPage() {
     || "";
   const masterKeyUploadedAt = assignment?.template_uploaded_at;
   const latestUpload = uploads[0];
+  const isDev = import.meta.env.DEV;
 
   useEffect(() => {
     if (!uploadOpen) {
@@ -324,6 +449,60 @@ export default function AssignmentsPage() {
     }
   }
 
+  async function createScanSession(mode) {
+    if (!assignmentId) throw new Error("Missing assignment");
+    const resp = await apiFetch(`/api/assignments/${assignmentId}/scan-sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    if (!resp.ok) {
+      const text = await readErrorMessage(resp);
+      throw new Error(text || `Failed: ${resp.status}`);
+    }
+    const data = await resp.json();
+    const token = data?.token;
+    if (!token) throw new Error("Missing scan token");
+    return { token, expires_at: data?.expires_at };
+  }
+
+  async function uploadScanFile(token, file) {
+    const form = new FormData();
+    form.append("file", file, file?.name || "scan.pdf");
+    const resp = await fetch(`${apiBase()}/api/scan/${token}/upload`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const detail = data?.detail || "Upload failed";
+      throw new Error(`Status ${resp.status}: ${detail}`);
+    }
+    return data;
+  }
+
+  async function normalizeDevMasterFile(file) {
+    if (!file) throw new Error("Missing file");
+    if (isPdfFile(file)) {
+      const pngBlob = await pdfFirstPageToPngBlob(file);
+      return new File([pngBlob], "master-key.png", { type: "image/png" });
+    }
+    if (isImageFile(file)) {
+      return file;
+    }
+    throw new Error("Master key must be a PDF or image");
+  }
+
+  async function normalizeDevStudentFile(file) {
+    if (!file) throw new Error("Missing file");
+    if (isPdfFile(file)) return file;
+    if (isImageFile(file)) {
+      const pdfBlob = await imageFileToPdfBlob(file);
+      return new File([pdfBlob], "scan.pdf", { type: "application/pdf" });
+    }
+    throw new Error("Student file must be a PDF or image");
+  }
+
   async function startScanSession(mode) {
     if (!assignmentId) return;
     setScanMode(mode);
@@ -338,21 +517,10 @@ export default function AssignmentsPage() {
     setScanCompleted(false);
     lastScanResultRef.current = null;
     try {
-      const resp = await apiFetch(`/api/assignments/${assignmentId}/scan-sessions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode }),
-      });
-      if (!resp.ok) {
-        const text = await readErrorMessage(resp);
-        throw new Error(text || `Failed: ${resp.status}`);
-      }
-      const data = await resp.json();
-      const token = data?.token;
-      if (!token) throw new Error("Missing scan token");
+      const { token, expires_at } = await createScanSession(mode);
       const link = `${publicBase()}/scan/${token}`;
       setScanLink(link);
-      setScanSession({ token, expires_at: data?.expires_at, mode });
+      setScanSession({ token, expires_at, mode });
       const qr = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(link)}`;
       setScanQrUrl(qr);
     } catch (err) {
@@ -378,6 +546,54 @@ export default function AssignmentsPage() {
       toast({ title: "Scan link copied" });
     } catch {
       toast({ variant: "destructive", title: "Copy failed" });
+    }
+  }
+
+  async function handleDevMasterKeyUpload(file, inputEl) {
+    if (!file || !assignmentId) return;
+    setDevMasterUploading(true);
+    try {
+      const { token } = await createScanSession("master_key");
+      const imageFile = await normalizeDevMasterFile(file);
+      await uploadScanFile(token, imageFile);
+      await loadAssignment();
+      toast({ title: "DEV: Master key uploaded" });
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "DEV upload failed",
+        description: err?.message || "Upload failed",
+      });
+    } finally {
+      if (inputEl) inputEl.value = "";
+      setDevMasterUploading(false);
+    }
+  }
+
+  async function handleDevStudentUploads(fileList, inputEl) {
+    if (!fileList || !assignmentId) return;
+    const filesToUpload = Array.from(fileList || []);
+    if (!filesToUpload.length) return;
+    setDevStudentUploading(true);
+    try {
+      for (const file of filesToUpload) {
+        const { token } = await createScanSession("student");
+        const pdfFile = await normalizeDevStudentFile(file);
+        await uploadScanFile(token, pdfFile);
+      }
+      await loadUploads({ silent: true });
+      toast({
+        title: `DEV: Uploaded ${filesToUpload.length} student file${filesToUpload.length > 1 ? "s" : ""}`,
+      });
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "DEV upload failed",
+        description: err?.message || "Upload failed",
+      });
+    } finally {
+      if (inputEl) inputEl.value = "";
+      setDevStudentUploading(false);
     }
   }
 
@@ -612,6 +828,77 @@ export default function AssignmentsPage() {
         delete next[upload.id];
         return next;
       });
+    }
+  }
+
+  async function handleRunGrade(upload) {
+    if (!upload?.id || retrying[upload.id]) return;
+    setRetrying((prev) => ({ ...prev, [upload.id]: true }));
+    try {
+      const resp = await apiFetch(`/api/uploads/${upload.id}/retry`, { method: "POST" });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data?.detail || `Failed: ${resp.status}`;
+        throw new Error(detail);
+      }
+      toast({ title: "Grading started" });
+      await loadUploads();
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Grading failed",
+        description: err?.message || "Try again.",
+      });
+    } finally {
+      setRetrying((prev) => {
+        const next = { ...prev };
+        delete next[upload.id];
+        return next;
+      });
+    }
+  }
+
+  async function openOcrDebugForUpload(upload) {
+    if (!upload?.id) return;
+    setOcrDebugOpen(true);
+    setOcrDebugTitle(`Answer JSON (DEV) — ${upload.original_name || upload.id}`);
+    setOcrDebugText("");
+    setOcrDebugError("");
+    setOcrDebugLoading(true);
+    try {
+      const resp = await apiFetch(`/api/uploads/${upload.id}/student-answers?include_metadata=true`);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data?.detail || `Failed: ${resp.status}`;
+        throw new Error(detail);
+      }
+      setOcrDebugText(JSON.stringify(data, null, 2));
+    } catch (err) {
+      setOcrDebugError(err?.message || "Failed to load OCR text");
+    } finally {
+      setOcrDebugLoading(false);
+    }
+  }
+
+  async function openOcrDebugForTemplate() {
+    if (!assignmentId) return;
+    setOcrDebugOpen(true);
+    setOcrDebugTitle("Answer JSON (DEV) — Master Key");
+    setOcrDebugText("");
+    setOcrDebugError("");
+    setOcrDebugLoading(true);
+    try {
+      const resp = await apiFetch(`/api/assignments/${assignmentId}/answer-key?include_metadata=true`);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data?.detail || `Failed: ${resp.status}`;
+        throw new Error(detail);
+      }
+      setOcrDebugText(JSON.stringify(data, null, 2));
+    } catch (err) {
+      setOcrDebugError(err?.message || "Failed to load OCR text");
+    } finally {
+      setOcrDebugLoading(false);
     }
   }
 
@@ -908,6 +1195,32 @@ export default function AssignmentsPage() {
             No Master Key yet. Scan one to enable deterministic grading.
           </div>
         )}
+        {isDev && (
+          <div className="rounded-md border border-dashed border-border p-3 space-y-2">
+            <div className="text-xs font-semibold text-muted-foreground">DEV ONLY</div>
+            <div className="text-xs text-muted-foreground">
+              Desktop upload (PDF or image). PDFs use the first page only.
+            </div>
+            <input
+              type="file"
+              accept="application/pdf,image/png,image/jpeg"
+              onChange={(e) => handleDevMasterKeyUpload(e.target.files?.[0], e.target)}
+              disabled={devMasterUploading}
+              className="text-sm"
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={openOcrDebugForTemplate}
+              disabled={!assignment?.template_storage_path}
+            >
+              View Key Answers (DEV)
+            </Button>
+            {devMasterUploading && (
+              <div className="text-xs text-muted-foreground">Uploading...</div>
+            )}
+          </div>
+        )}
       </section>
 
       <section className="space-y-3">
@@ -936,6 +1249,30 @@ export default function AssignmentsPage() {
         {!masterKeyReady && (
           <div className="text-sm text-muted-foreground">
             Student scans unlock after the master key has been saved.
+          </div>
+        )}
+        {isDev && (
+          <div className="rounded-md border border-dashed border-border p-3 space-y-2">
+            <div className="text-xs font-semibold text-muted-foreground">DEV ONLY</div>
+            <div className="text-xs text-muted-foreground">
+              Desktop upload (PDF or image). You can select multiple files.
+            </div>
+            <input
+              type="file"
+              accept="application/pdf,image/png,image/jpeg"
+              multiple
+              onChange={(e) => handleDevStudentUploads(e.target.files, e.target)}
+              disabled={!masterKeyReady || devStudentUploading}
+              className="text-sm"
+            />
+            {!masterKeyReady && (
+              <div className="text-xs text-muted-foreground">
+                Upload the master key first.
+              </div>
+            )}
+            {devStudentUploading && (
+              <div className="text-xs text-muted-foreground">Uploading...</div>
+            )}
           </div>
         )}
 
@@ -1017,10 +1354,26 @@ export default function AssignmentsPage() {
                             <DropdownMenuSeparator />
                           </>
                         )}
+                        {isDev && String(upload?.status || "").toLowerCase() === "scanned" && (
+                          <>
+                            <DropdownMenuItem onClick={() => handleRunGrade(upload)}>
+                              {retrying[upload.id] ? "Starting..." : "Run grading (DEV)"}
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                          </>
+                        )}
                         {upload.graded_pdf_path && (
                           <DropdownMenuItem onClick={() => openOverride(upload)}>
                             Review/Override
                           </DropdownMenuItem>
+                        )}
+                        {isDev && (
+                          <>
+                            <DropdownMenuItem onClick={() => openOcrDebugForUpload(upload)}>
+                              View Answers (DEV)
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                          </>
                         )}
                         <DropdownMenuItem onClick={() => handleDownloadOriginal(upload)}>
                           Download original
@@ -1146,6 +1499,33 @@ export default function AssignmentsPage() {
               </Button>
             </div>
             <Button variant="outline" onClick={() => setViewerOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={ocrDebugOpen} onOpenChange={setOcrDebugOpen}>
+        <DialogContent className="sm:max-w-[720px]">
+          <DialogHeader>
+            <DialogTitle>{ocrDebugTitle || "OCR Debug (DEV)"}</DialogTitle>
+            <DialogDescription>Answer JSON with optional OCR metadata.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            {ocrDebugLoading && (
+              <div className="text-sm text-muted-foreground">Loading OCR text...</div>
+            )}
+            {ocrDebugError && (
+              <div className="text-sm text-destructive">{ocrDebugError}</div>
+            )}
+            {!ocrDebugLoading && !ocrDebugError && (
+              <pre className="max-h-[400px] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted p-3 text-xs">
+                {ocrDebugText || "[no OCR text]"}
+              </pre>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOcrDebugOpen(false)}>
               Close
             </Button>
           </DialogFooter>

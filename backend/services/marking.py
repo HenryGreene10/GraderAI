@@ -246,5 +246,5 @@ def build_overlay_from_answers(
         warn_y = score_y - warn_h - 8.0 if score_y - warn_h - 8.0 > 0 else (page_size[1] - warn_h - 24.0)
         marks.append(OverlayMark(tool="bubble", coords=[warn_x, warn_y, warn_w, warn_h], text=warning))
 
-    overlay = Overlay(page=1, marks=marks)
+    overlay = Overlay(page=1, marks=marks, meta={"coords_space": "pt"})
     return overlay, needs_review, unplaced, DebugLayout(boxes_px=debug_boxes, anchors=debug_anchors)

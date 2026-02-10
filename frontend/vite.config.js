@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -12,6 +13,40 @@ const keyPath =
   process.env.VITE_HTTPS_KEY_FILE || path.join(defaultCertDir, "localhost-key.pem");
 const useHttps = String(process.env.VITE_DEV_HTTPS || "").toLowerCase() === "true"
   || process.env.VITE_DEV_HTTPS === "1";
+
+function isPrivateIpv4(address) {
+  if (address.startsWith("10.")) return true;
+  if (address.startsWith("192.168.")) return true;
+  const match = address.match(/^172\\.(\\d+)\\./);
+  if (!match) return false;
+  const segment = Number(match[1]);
+  return segment >= 16 && segment <= 31;
+}
+
+function resolveLanHost() {
+  const interfaces = os.networkInterfaces();
+  let fallback = "";
+  for (const entries of Object.values(interfaces)) {
+    for (const net of entries || []) {
+      const isIpv4 = net?.family === "IPv4" || net?.family === 4;
+      if (!net || !isIpv4 || net.internal) continue;
+      if (isPrivateIpv4(net.address)) return net.address;
+      if (!fallback) fallback = net.address;
+    }
+  }
+  return fallback;
+}
+
+function resolveDevPort(defaultPort) {
+  const portFlagIndex = process.argv.findIndex((arg) => arg === "--port" || arg === "-p");
+  if (portFlagIndex !== -1) {
+    const value = Number(process.argv[portFlagIndex + 1]);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  const envPort = Number(process.env.VITE_PORT || process.env.PORT);
+  if (Number.isFinite(envPort) && envPort > 0) return envPort;
+  return defaultPort;
+}
 
 function resolveHttpsConfig() {
   if (!useHttps) return false;
@@ -31,29 +66,41 @@ function resolveHttpsConfig() {
   };
 }
 
-const httpsConfig = resolveHttpsConfig();
+export default defineConfig(({ command }) => {
+  const httpsConfig = resolveHttpsConfig();
+  const devPort = resolveDevPort(5173);
+  const publicBaseEnv = String(process.env.VITE_PUBLIC_BASE_URL || "").trim();
 
-export default defineConfig({
-  plugins: [react()],
-  resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "src"),
-    },
-  },
-  server: {
-    host: "0.0.0.0",
-    port: 5173,
-    https: httpsConfig || false,
-    proxy: {
-      "/api": {
-        target: "http://127.0.0.1:8000",
-        changeOrigin: true,
-        secure: false,
+  if (command === "serve" && !publicBaseEnv) {
+    const lanHost = resolveLanHost();
+    if (lanHost) {
+      const protocol = httpsConfig ? "https" : "http";
+      process.env.VITE_PUBLIC_BASE_URL = `${protocol}://${lanHost}:${devPort}`;
+    }
+  }
+
+  return {
+    plugins: [react()],
+    resolve: {
+      alias: {
+        "@": path.resolve(__dirname, "src"),
       },
     },
-  },
-  test: {
-    environment: "jsdom",
-    setupFiles: ["./tests/setup.ts"],
-  },
+    server: {
+      host: "0.0.0.0",
+      port: devPort,
+      https: httpsConfig || false,
+      proxy: {
+        "/api": {
+          target: "http://127.0.0.1:8000",
+          changeOrigin: true,
+          secure: false,
+        },
+      },
+    },
+    test: {
+      environment: "jsdom",
+      setupFiles: ["./tests/setup.ts"],
+    },
+  };
 });

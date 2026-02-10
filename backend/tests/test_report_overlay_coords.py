@@ -6,6 +6,7 @@ class _CanvasSpy:
     def __init__(self):
         self.rect_calls = []
         self.draw_calls = []
+        self.line_calls = []
 
     def setFont(self, *_args, **_kwargs):
         return None
@@ -18,6 +19,12 @@ class _CanvasSpy:
 
     def setLineWidth(self, *_args, **_kwargs):
         return None
+
+    def setLineCap(self, *_args, **_kwargs):
+        return None
+
+    def line(self, x1, y1, x2, y2):
+        self.line_calls.append((x1, y1, x2, y2))
 
     def rect(self, x, y, w, h, **_kwargs):
         self.rect_calls.append((x, y, w, h))
@@ -52,3 +59,21 @@ def test_draw_marks_converts_px_to_pdf():
         _close(x, 61.2) and _close(y, 700.92) and _close(w, 10.2) and _close(h, 11.88)
         for x, y, w, h in canvas.rect_calls
     )
+
+
+def test_overlay_marks_by_page_prefers_meta_payload():
+    overlay = Overlay(
+        page=1,
+        marks=[OverlayMark(tool="note", coords=[1.0, 1.0], text="p1")],
+        meta={
+            "coords_space": "pt",
+            "marks_by_page": {
+                "1": [{"tool": "note", "coords": [10.0, 10.0], "text": "first"}],
+                "2": [{"tool": "note", "coords": [20.0, 20.0], "text": "second"}],
+            },
+        },
+    )
+    marks = report_mod._overlay_marks_by_page(overlay)
+    assert 1 in marks and 2 in marks
+    assert marks[1][0].text == "first"
+    assert marks[2][0].text == "second"

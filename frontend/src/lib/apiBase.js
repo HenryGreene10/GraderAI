@@ -1,7 +1,15 @@
 import { supabase } from "./supabaseClient";
 
+function normalizeBaseUrl(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  return trimmed.replace(/\/+$/, "");
+}
+
 export function publicBase() {
-  return import.meta.env.VITE_PUBLIC_BASE_URL ?? window.location.origin;
+  const envBase = normalizeBaseUrl(import.meta.env.VITE_PUBLIC_BASE_URL);
+  if (envBase) return envBase;
+  return window.location.origin;
 }
 
 export function apiBase() {
