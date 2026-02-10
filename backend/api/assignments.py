@@ -19,23 +19,17 @@ from io import BytesIO
 
 from PIL import Image
 
-from ..services.scanner import MAX_DIM_PX, normalize_image_bytes
 from ..services import ocr as ocr_service
 from ..services.ocr import normalize_ocr_result
 from ..services.answer_extraction import extract_answers_from_ocr
-from ..services.template import (
-    TemplateValidationError,
-    detect_answer_boxes,
-    detect_question_regions,
-    extract_template_regions,
-)
-from ..services.template_regions import build_template_regions_payload, parse_regions_payload
-from ..services.template_manifest import load_template_manifest, with_approved_manifest
+from ..services.master_key_pipeline import run_master_key_approval_pipeline
+from ..services.template import detect_answer_boxes, detect_question_regions
+from ..services.template_manifest import load_template_manifest
+from ..services.template_regions import parse_regions_payload
 from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
 
-TEMPLATE_MIN_LONG_EDGE = 1200
 logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - optional postgrest error typing
@@ -129,10 +123,6 @@ def _file_extension(filename: Optional[str], content_type: Optional[str]) -> str
     if content_type in ALLOWED_MIME:
         return ALLOWED_MIME[content_type]
     return ""
-
-
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _template_debug_enabled() -> bool:
@@ -502,11 +492,6 @@ async def upload_template(
     file: UploadFile = File(...),
     user_id: str = Depends(get_current_user_id),
 ):
-    assignment = get_assignment(
-        assignment_id,
-        user_id,
-        columns="id,owner_id,template_version,template_storage_path,template_regions_json",
-    )
     ext = _file_extension(file.filename, file.content_type)
     if ext not in {".png", ".jpg", ".jpeg"}:
         raise HTTPException(status_code=400, detail="template_image_only")
@@ -515,124 +500,39 @@ async def upload_template(
     if not payload:
         raise HTTPException(status_code=400, detail="template_empty")
 
-    scan = normalize_image_bytes(payload)
-    template_png = scan.normalized_png
-    template_w = scan.width_px
-    template_h = scan.height_px
-    max_dim = max(template_w, template_h)
-    if max_dim and max_dim < TEMPLATE_MIN_LONG_EDGE:
-        scale = min(float(TEMPLATE_MIN_LONG_EDGE) / float(max_dim), MAX_DIM_PX / float(max_dim))
-        new_w = max(1, int(round(template_w * scale)))
-        new_h = max(1, int(round(template_h * scale)))
-        image = Image.open(BytesIO(template_png)).convert("RGB")
-        image = image.resize((new_w, new_h), Image.BICUBIC)
-        buf = BytesIO()
-        image.save(buf, format="PNG")
-        template_png = buf.getvalue()
-        template_w, template_h = new_w, new_h
-    owner_id = assignment.get("owner_id") or user_id or "unknown"
-    template_key = f"{owner_id}/templates/{assignment_id}.png"
-    upload_bytes(SUBMISSIONS_BUCKET, template_key, template_png, "image/png")
-
-    if _template_debug_enabled():
-        try:
-            debug_regions = detect_question_regions(template_png)
-            debug_answers = detect_answer_boxes(template_png)
-            overlay_path = _save_template_debug_overlay(
-                template_png,
-                assignment_id,
-                debug_regions,
-                debug_answers,
-            )
-            logger.info(
-                "template_debug_overlay_saved assignment_id=%s path=%s regions=%s answers=%s",
-                assignment_id,
-                overlay_path,
-                len(debug_regions),
-                len(debug_answers),
-            )
-        except Exception as exc:
-            logger.warning("template_debug_overlay_failed assignment_id=%s error=%s", assignment_id, exc)
-
-    try:
-        regions, warnings = await extract_template_regions(
-            template_png,
-            ocr_service.extract_text,
-            image_size=(template_w, template_h),
+    def _debug_hook(template_png: bytes, aid: str) -> None:
+        if not _template_debug_enabled():
+            return
+        debug_regions = detect_question_regions(template_png)
+        debug_answers = detect_answer_boxes(template_png)
+        overlay_path = _save_template_debug_overlay(template_png, aid, debug_regions, debug_answers)
+        logger.info(
+            "template_debug_overlay_saved assignment_id=%s path=%s regions=%s answers=%s",
+            aid,
+            overlay_path,
+            len(debug_regions),
+            len(debug_answers),
         )
-    except TemplateValidationError as exc:
-        logger.warning(
-            "Template validation failed for assignment %s: size=%sx%s regions=%s region_index=%s region=%s answer_boxes_count=%s answer_boxes=%s",
-            assignment_id,
-            template_w,
-            template_h,
-            exc.debug.get("regions_count"),
-            exc.detail.get("region_index"),
-            exc.debug.get("region"),
-            exc.detail.get("answer_boxes_count"),
-            exc.debug.get("answer_boxes"),
-        )
-        raise HTTPException(status_code=400, detail=exc.detail)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
 
-    template_version = int(assignment.get("template_version") or 0) + 1
-    template_upload_id = str(uuid4())
-    template_uploaded_at = _utc_iso()
-    template_original_name = file.filename
-    template_regions_raw = build_template_regions_payload(regions, (template_w, template_h))
-    template_regions = with_approved_manifest(
-        template_regions_raw,
-        template_version=template_version,
-        template_width_px=template_w,
-        template_height_px=template_h,
-        approved_at=template_uploaded_at,
+    result = await run_master_key_approval_pipeline(
+        assignment_id=assignment_id,
+        user_id=user_id,
+        payload=payload,
+        template_original_name=file.filename,
+        debug_hook=_debug_hook,
     )
-    sb = require_supabase()
-    sb.table("assignments").update(
-        {
-            "template_storage_path": f"{SUBMISSIONS_BUCKET}/{template_key}",
-            "template_width_px": template_w,
-            "template_height_px": template_h,
-            "template_regions_json": template_regions,
-            "template_version": template_version,
-            "template_upload_id": template_upload_id,
-            "template_original_name": template_original_name,
-            "template_uploaded_at": template_uploaded_at,
-        }
-    ).eq("id", assignment_id).execute()
-
-    logger.info(
-        "template_regions_saved assignment_id=%s regions=%s template_w=%s template_h=%s",
-        assignment_id,
-        len(template_regions.get("regions") or []),
-        template_w,
-        template_h,
-    )
-    if not template_regions.get("regions"):
-        logger.warning("template_regions_empty assignment_id=%s", assignment_id)
-        try:
-            sb.table("assignments").update({"needs_review": True}).eq("id", assignment_id).execute()
-        except Exception as exc:
-            logger.warning("template_regions_empty_needs_review_failed assignment_id=%s error=%s", assignment_id, exc)
-
-    had_template = bool(assignment.get("template_storage_path") and assignment.get("template_regions_json"))
-    if had_template:
-        sb.table("uploads").update({"needs_review": True}).eq("assignment_id", assignment_id).eq(
-            "owner_id", user_id
-        ).execute()
 
     return {
         "ok": True,
-        "assignment_id": assignment_id,
-        "template_storage_path": f"{SUBMISSIONS_BUCKET}/{template_key}",
-        "template_version": template_version,
-        "template_upload_id": template_upload_id,
-        "template_original_name": template_original_name,
-        "template_uploaded_at": template_uploaded_at,
-        "boxes_detected": len((template_regions.get("manifest") or {}).get("questions") or []),
-        "qids": [r.get("qid") for r in (template_regions.get("regions") or []) if isinstance(r, dict)],
-        "warnings": warnings,
+        "assignment_id": result.assignment_id,
+        "template_storage_path": result.template_storage_path,
+        "template_version": result.template_version,
+        "template_upload_id": result.template_upload_id,
+        "template_original_name": result.template_original_name,
+        "template_uploaded_at": result.template_uploaded_at,
+        "boxes_detected": result.boxes_detected,
+        "qids": result.qids,
+        "warnings": result.warnings,
     }
 
 

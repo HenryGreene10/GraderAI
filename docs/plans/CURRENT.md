@@ -142,7 +142,7 @@ Ordered patch sequence:
 2. Freeze manifest at template approval and persist immutable versioned payload (no downstream qid rewriting/reordering). `[implemented]`
 3. Enforce strict template grading contract: grade only manifest qids, no heuristic question discovery in template mode. `[implemented]`
 4. Enforce single anchor outcome per manifest question with explicit degraded-mode marker when placement fails. `[implemented]`
-5. Unify master-key ingestion entry points (`/assignments/{id}/template` and scan master-key upload) onto the same normalization + extraction + approval pipeline. `[pending]`
+5. Unify master-key ingestion entry points (`/assignments/{id}/template` and scan master-key upload) onto the same normalization + extraction + approval pipeline. `[implemented]`
 6. Add overlay integrity gates (one visible mark per graded item; no unknown qids; fail closed to review when violated). `[pending]`
 7. Add manifest/version stamping and runtime compatibility checks (`template_manifest_version`, `template_version_used`). `[pending]`
 8. Invalidate stale graded artifacts on template/version change (or force deterministic regrade before serving). `[pending]`
@@ -157,7 +157,9 @@ Status snapshot for this track:
 • A7.2 implemented (approved manifest persisted + locked in template payload)
 • A7.3 implemented (template grading keyed strictly to manifest qids)
 • A7.4 implemented (manifest mark-count integrity degrades to review)
-• A7.5–A7.10 pending
+• A7.5 implemented (shared master-key approval pipeline used by assignment template upload + scan master-key upload)
+• A7.6–A7.10 pending
+• Execution pause: waiting for manual verification before starting A7.6
 
 ## Acceptance Criteria (Phase A)
 • Clean PDFs grade correctly (near-perfect scores).  

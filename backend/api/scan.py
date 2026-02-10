@@ -8,16 +8,12 @@ from io import BytesIO
 from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from PIL import Image, ImageOps
 from pypdf import PdfReader
 
 from ..config import SUBMISSIONS_BUCKET
-from ..services import ocr as ocr_service
 from ..services.db import require_supabase
+from ..services.master_key_pipeline import run_master_key_approval_pipeline
 from ..services.storage import upload_bytes
-from ..services.template import TemplateValidationError, extract_template_regions
-from ..services.template_regions import build_template_regions_payload
-from ..services.template_manifest import with_approved_manifest
 
 router = APIRouter(prefix="/api/scan", tags=["scan"])
 logger = logging.getLogger(__name__)
@@ -185,73 +181,11 @@ async def scan_upload(
     resulting_upload_id = None
 
     if mode == "master_key":
-        try:
-            with Image.open(BytesIO(blob)) as img:
-                img = ImageOps.exif_transpose(img).convert("RGB")
-                width, height = img.size
-                buf = BytesIO()
-                img.save(buf, format="PNG")
-                png_bytes = buf.getvalue()
-        except Exception as exc:
-            logger.warning("scan_image_decode_failed token=%s error=%s", token, exc)
-            raise HTTPException(status_code=400, detail="scan_image_invalid")
-        key = f"{owner_id}/templates/{assignment_id}.png"
-        upload_bytes(SUBMISSIONS_BUCKET, key, png_bytes, "image/png")
-        storage_path = f"{SUBMISSIONS_BUCKET}/{key}"
-        try:
-            regions, _warnings = await extract_template_regions(
-                png_bytes,
-                ocr_service.extract_text,
-                image_size=(int(width), int(height)),
-            )
-        except TemplateValidationError as exc:
-            raise HTTPException(status_code=400, detail=exc.detail)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
-
-        base_regions = build_template_regions_payload(regions, (int(width), int(height)))
-        if not base_regions.get("regions"):
-            raise HTTPException(status_code=400, detail="template_regions_empty")
-
-        existing = (
-            sb.table("assignments")
-            .select("template_version")
-            .eq("id", assignment_id)
-            .maybe_single()
-            .execute()
-        )
-        current_version = (existing.data or {}).get("template_version")
-        try:
-            template_version = int(current_version or 0) + 1
-        except Exception:
-            template_version = 1
-        template_uploaded_at = _utc_iso()
-        template_original_name = file.filename or None
-        template_regions = with_approved_manifest(
-            base_regions,
-            template_version=template_version,
-            template_width_px=int(width),
-            template_height_px=int(height),
-            approved_at=template_uploaded_at,
-        )
-
-        sb.table("assignments").update(
-            {
-                "template_storage_path": storage_path,
-                "template_width_px": int(width),
-                "template_height_px": int(height),
-                "template_regions_json": template_regions,
-                "template_version": template_version,
-                "template_uploaded_at": template_uploaded_at,
-                "template_original_name": template_original_name,
-            }
-        ).eq("id", assignment_id).execute()
-        logger.info(
-            "template_regions_saved assignment_id=%s regions=%s template_w=%s template_h=%s",
-            assignment_id,
-            len(template_regions.get("regions") or []),
-            width,
-            height,
+        result = await run_master_key_approval_pipeline(
+            assignment_id=assignment_id,
+            user_id=owner_id,
+            payload=blob,
+            template_original_name=file.filename or None,
         )
     elif mode == "student":
         parsed_sizes = _parse_page_sizes(page_sizes)
@@ -309,4 +243,6 @@ async def scan_upload(
         "mode": mode,
         "assignment_id": assignment_id,
         "resulting_upload_id": resulting_upload_id,
+        "template_version": result.template_version if mode == "master_key" else None,
+        "template_upload_id": result.template_upload_id if mode == "master_key" else None,
     }
