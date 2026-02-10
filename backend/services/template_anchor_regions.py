@@ -451,6 +451,8 @@ def _anchor_overlap(a: _Anchor, b: _Anchor, h_ref: float) -> bool:
 def _select_manifest_anchors(
     anchors: List[_Anchor],
     tokens: List[_Token],
+    *,
+    page_sizes: Optional[Dict[int, Tuple[float, float]]] = None,
 ) -> Tuple[Dict[int, _Anchor], List[Dict[str, object]], Dict[str, object]]:
     warnings: List[Dict[str, object]] = []
     trace: Dict[str, object] = {
@@ -468,6 +470,12 @@ def _select_manifest_anchors(
     explicit_numbers_seen = _extract_explicit_numbers_from_tokens(tokens)
     trace["explicit_numbers_seen"] = list(explicit_numbers_seen)
     median_h_by_page = _median_word_height_by_page(tokens)
+    token_max_by_page: Dict[int, Tuple[float, float]] = {}
+    for tok in tokens:
+        x1 = tok.x + tok.w
+        y1 = tok.y + tok.h
+        prev = token_max_by_page.get(tok.page_index) or (0.0, 0.0)
+        token_max_by_page[tok.page_index] = (max(prev[0], x1), max(prev[1], y1))
 
     explicit = [
         a
@@ -503,6 +511,59 @@ def _select_manifest_anchors(
 
         max_explicit = max(selected.keys()) if selected else 0
         trace["expected_max_explicit"] = max_explicit if max_explicit > 0 else None
+        row_pitch_by_page: Dict[int, float] = {}
+        by_page_num: Dict[int, List[Tuple[int, _Anchor]]] = {}
+        for num, anchor in selected.items():
+            by_page_num.setdefault(anchor.page_index, []).append((int(num), anchor))
+        for page_index, pairs in by_page_num.items():
+            pairs.sort(key=lambda item: item[0])
+            deltas: List[float] = []
+            for i in range(1, len(pairs)):
+                dy = pairs[i][1].y - pairs[i - 1][1].y
+                if dy > 0:
+                    deltas.append(float(dy))
+            if deltas:
+                deltas.sort()
+                mid = len(deltas) // 2
+                if len(deltas) % 2 == 1:
+                    row_pitch_by_page[page_index] = deltas[mid]
+                else:
+                    row_pitch_by_page[page_index] = (deltas[mid - 1] + deltas[mid]) / 2.0
+
+        def _expected_y_for_missing(page_index: int, missing_num: int) -> Optional[float]:
+            page_selected = [
+                (int(num), anchor)
+                for num, anchor in selected.items()
+                if anchor.page_index == page_index
+            ]
+            if not page_selected:
+                return None
+            page_selected.sort(key=lambda item: item[0])
+            prev = None
+            nxt = None
+            for num, anchor in page_selected:
+                if num < missing_num:
+                    prev = (num, anchor)
+                    continue
+                if num > missing_num and nxt is None:
+                    nxt = (num, anchor)
+            pitch = float(row_pitch_by_page.get(page_index) or 0.0)
+            if prev and nxt:
+                lo_num, lo_anchor = prev
+                hi_num, hi_anchor = nxt
+                span = max(1, hi_num - lo_num)
+                frac = float(missing_num - lo_num) / float(span)
+                return float(lo_anchor.y + frac * (hi_anchor.y - lo_anchor.y))
+            if prev and pitch > 0:
+                return float(prev[1].y + pitch * float(missing_num - prev[0]))
+            if nxt and pitch > 0:
+                return float(nxt[1].y - pitch * float(nxt[0] - missing_num))
+            if prev:
+                return float(prev[1].y)
+            if nxt:
+                return float(nxt[1].y)
+            return None
+
         for missing in range(1, max_explicit + 1):
             if missing in selected:
                 continue
@@ -512,7 +573,44 @@ def _select_manifest_anchors(
             candidates.sort(key=lambda a: (a.page_index, a.y, a.x))
             missing_attempts: List[Dict[str, object]] = []
             for cand in candidates:
+                page_w = 0.0
+                page_h = 0.0
+                if isinstance(page_sizes, dict):
+                    page_w, page_h = page_sizes.get(cand.page_index) or (0.0, 0.0)
+                token_w, token_h = token_max_by_page.get(cand.page_index) or (0.0, 0.0)
+                if page_w <= 0:
+                    page_w = token_w
+                if page_h <= 0:
+                    page_h = token_h
+                left_margin_limit = max(140.0, page_w * 0.30) if page_w > 0 else 140.0
+                if cand.x > left_margin_limit:
+                    decisions[id(cand)] = "REJECTED_IMPLICIT_OUTSIDE_LEFT_MARGIN"
+                    missing_attempts.append(
+                        {
+                            "anchor_key": _anchor_trace_key(cand),
+                            "reason": "REJECTED_IMPLICIT_OUTSIDE_LEFT_MARGIN",
+                        }
+                    )
+                    continue
+
                 h_ref = max(8.0, float(median_h_by_page.get(cand.page_index) or cand.h or 24.0))
+                expected_y = _expected_y_for_missing(cand.page_index, missing)
+                row_pitch = float(row_pitch_by_page.get(cand.page_index) or (3.2 * h_ref))
+                band_floor = 2.0 * h_ref
+                band_ceil = (0.12 * page_h) if page_h > 0 else (6.0 * h_ref)
+                band_target = 0.55 * row_pitch
+                band = max(band_floor, min(band_target, band_ceil))
+                if expected_y is not None:
+                    if abs(cand.center[1] - expected_y) > band:
+                        decisions[id(cand)] = "REJECTED_IMPLICIT_OUTSIDE_EXPECTED_BAND"
+                        missing_attempts.append(
+                            {
+                                "anchor_key": _anchor_trace_key(cand),
+                                "reason": "REJECTED_IMPLICIT_OUTSIDE_EXPECTED_BAND",
+                            }
+                        )
+                        continue
+
                 if any(_anchor_overlap(cand, taken, h_ref) for taken in selected.values()):
                     decisions[id(cand)] = "REJECTED_IMPLICIT_OVERLAP_WITH_SELECTED"
                     missing_attempts.append(
@@ -1039,7 +1137,11 @@ def build_anchor_template_regions(
     if not eligible_anchors:
         raise ValueError("template_anchor_hard_gate_empty")
 
-    selected_anchors, selection_warnings, selection_trace = _select_manifest_anchors(eligible_anchors, tokens)
+    selected_anchors, selection_warnings, selection_trace = _select_manifest_anchors(
+        eligible_anchors,
+        tokens,
+        page_sizes=page_sizes,
+    )
     warnings.extend(selection_warnings)
     if not selected_anchors:
         raise ValueError("template_anchor_selection_empty")

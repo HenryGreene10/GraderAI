@@ -256,3 +256,31 @@ def test_hard_gate_rejects_header_distractor_without_nearby_answer_pair():
         for item in rejected
         if isinstance(item, dict)
     )
+
+
+def test_targeted_recovery_prefers_expected_row_for_missing_q1():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1200,
+                    "height": 1600,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("1.", 88, 42, 30, 24), _word("99", 480, 44, 46, 30)]),
+                        _line([_word("1.", 90, 220, 30, 24), _word("12", 480, 222, 46, 30)]),
+                        _line([_word("Q2.", 92, 360, 70, 30), _word("14", 480, 362, 46, 30)]),
+                        _line([_word("Q3.", 92, 500, 70, 30), _word("16", 480, 502, 46, 30)]),
+                    ],
+                }
+            ]
+        }
+    }
+
+    regions, warnings, anchor_trace = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1200, 1600))
+    assert [r.qid for r in regions] == ["Q1", "Q2", "Q3"]
+    q1 = next((item for item in (anchor_trace.get("selected") or []) if item.get("question_id") == "Q1"), None)
+    assert q1 is not None
+    assert float((q1.get("bbox_px") or [0, 0, 0, 0])[1]) >= 180.0
