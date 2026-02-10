@@ -4,7 +4,7 @@ import datetime as dt
 import logging
 import os
 from io import BytesIO
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 from reportlab.lib.utils import ImageReader
 
@@ -23,6 +23,32 @@ from .marking import DebugLayout
 logger = logging.getLogger(__name__)
 
 MISSING_OVERLAY_BANNER = "NO OVERLAY GENERATED — NEEDS REVIEW"
+MARK_DRAW_SIZE_PT = float(os.getenv("OVERLAY_MARK_SIZE_PT", "22"))
+MARK_DRAW_STROKE_PT = float(os.getenv("OVERLAY_MARK_STROKE_PT", "2.2"))
+NOTE_FONT_SIZE_PT = float(os.getenv("OVERLAY_NOTE_FONT_PT", "13"))
+BUBBLE_FONT_SIZE_PT = float(os.getenv("OVERLAY_BUBBLE_FONT_PT", "13"))
+
+
+def _draw_vector_check(c: canvas.Canvas, x: float, y: float, size: float = MARK_DRAW_SIZE_PT) -> None:
+    c.setStrokeColorRGB(0.0, 0.55, 0.12)
+    c.setLineWidth(MARK_DRAW_STROKE_PT)
+    try:
+        c.setLineCap(1)
+    except Exception:
+        pass
+    c.line(x, y + size * 0.35, x + size * 0.28, y)
+    c.line(x + size * 0.28, y, x + size, y + size * 0.92)
+
+
+def _draw_vector_cross(c: canvas.Canvas, x: float, y: float, size: float = MARK_DRAW_SIZE_PT) -> None:
+    c.setStrokeColorRGB(0.8, 0.1, 0.1)
+    c.setLineWidth(MARK_DRAW_STROKE_PT)
+    try:
+        c.setLineCap(1)
+    except Exception:
+        pass
+    c.line(x, y, x + size * 0.92, y + size * 0.92)
+    c.line(x, y + size * 0.92, x + size * 0.92, y)
 
 
 def build_overlay_basic(result: GradeResult) -> Overlay:
@@ -33,7 +59,7 @@ def build_overlay_basic(result: GradeResult) -> Overlay:
         marks.append(OverlayMark(tool="bubble", coords=[40.0, y], text=f"{item.score:.0f}/{item.max_score:.0f}"))
         marks.append(OverlayMark(tool="note", coords=[90.0, y], text=f"Q{item.question_id}: {label} {item.rationale}"))
         y -= 28.0
-    return Overlay(page=1, marks=marks)
+    return Overlay(page=1, marks=marks, meta={"coords_space": "pt"})
 
 
 def _score_text(total_score: Optional[float], total_max: Optional[float]) -> str:
@@ -47,14 +73,16 @@ def build_minimal_overlay(
     total_score: Optional[float],
     total_max: Optional[float],
 ) -> Overlay:
+    meta = {
+        "upload_id": upload_id,
+        "generated_at": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "note": "minimal overlay v1",
+        "coords_space": "pt",
+    }
     return Overlay(
         page=1,
         marks=[OverlayMark(tool="note", coords=[36.0, 36.0], text=_score_text(total_score, total_max))],
-        meta={
-            "upload_id": upload_id,
-            "generated_at": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-            "note": "minimal overlay v1",
-        },
+        meta=meta,
     )
 
 
@@ -157,34 +185,38 @@ def _draw_marks(
     *,
     normalized_size_px: tuple[float, float] | None = None,
     page_size_pt: tuple[float, float] | None = None,
+    coords_space: str = "auto",
 ) -> None:
-    # Assume overlay mark coords are in normalized px when normalized_size_px is provided.
+    use_px_coords = bool(normalized_size_px and page_size_pt)
+    if coords_space == "pt":
+        use_px_coords = False
+    elif coords_space == "px":
+        use_px_coords = bool(normalized_size_px and page_size_pt)
+
     for mark in overlay.marks:
         x_px, y_px = mark.coords[:2]
         if mark.tool == "check":
             x, y = (x_px, y_px)
-            if normalized_size_px and page_size_pt:
+            if use_px_coords and normalized_size_px and page_size_pt:
                 x, y = _convert_point(x_px, y_px, normalized_size_px, page_size_pt)
-            c.setFont("Helvetica-Bold", 18)
-            c.drawString(x, y, "✓")
+            _draw_vector_check(c, x, y)
         elif mark.tool == "cross":
             x, y = (x_px, y_px)
-            if normalized_size_px and page_size_pt:
+            if use_px_coords and normalized_size_px and page_size_pt:
                 x, y = _convert_point(x_px, y_px, normalized_size_px, page_size_pt)
-            c.setFont("Helvetica-Bold", 18)
-            c.drawString(x, y, "✗")
+            _draw_vector_cross(c, x, y)
         elif mark.tool == "note":
             x, y = (x_px, y_px)
-            if normalized_size_px and page_size_pt:
+            if use_px_coords and normalized_size_px and page_size_pt:
                 x, y = _convert_point(x_px, y_px, normalized_size_px, page_size_pt)
-            c.setFont("Helvetica-Bold", 12)
+            c.setFont("Helvetica-Bold", NOTE_FONT_SIZE_PT)
             c.drawString(x, y, mark.text or "")
         elif mark.tool == "bubble":
-            c.setFont("Helvetica-Bold", 12)
+            c.setFont("Helvetica-Bold", BUBBLE_FONT_SIZE_PT)
             if len(mark.coords) >= 4:
                 w_px, h_px = mark.coords[2:4]
                 x, y, w, h = x_px, y_px, w_px, h_px
-                if normalized_size_px and page_size_pt:
+                if use_px_coords and normalized_size_px and page_size_pt:
                     norm_w, norm_h = normalized_size_px
                     page_w, page_h = page_size_pt
                     if norm_w > 0 and norm_h > 0:
@@ -195,19 +227,20 @@ def _draw_marks(
                         h = h_px * sy
                         y = page_h - ((y_px + h_px) * sy)
                 c.setFillColorRGB(1, 1, 1)
+                c.setLineWidth(1.4)
                 c.rect(x, y, w, h, stroke=1, fill=1)
                 c.setFillColorRGB(0, 0, 0)
-                text_y = y + max(6, (h - 12) / 2)
+                text_y = y + max(6, (h - BUBBLE_FONT_SIZE_PT) / 2)
                 c.drawString(x + 6, text_y, mark.text or "")
             else:
                 x, y = (x_px, y_px)
-                if normalized_size_px and page_size_pt:
+                if use_px_coords and normalized_size_px and page_size_pt:
                     x, y = _convert_point(x_px, y_px, normalized_size_px, page_size_pt)
                 c.drawString(x, y, mark.text or "")
         elif mark.tool == "highlight" and len(mark.coords) >= 4:
             w_px, h_px = mark.coords[2:4]
             x, y, w, h = x_px, y_px, w_px, h_px
-            if normalized_size_px and page_size_pt:
+            if use_px_coords and normalized_size_px and page_size_pt:
                 norm_w, norm_h = normalized_size_px
                 page_w, page_h = page_size_pt
                 if norm_w > 0 and norm_h > 0:
@@ -230,17 +263,66 @@ def _overlay_pdf_bytes(
     *,
     normalized_size_px: tuple[float, float] | None = None,
     page_size_pt: tuple[float, float] | None = None,
+    coords_space: str = "auto",
     debug: bool = False,
 ) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_width, page_height))
-    _draw_marks(c, overlay, normalized_size_px=normalized_size_px, page_size_pt=page_size_pt)
+    _draw_marks(
+        c,
+        overlay,
+        normalized_size_px=normalized_size_px,
+        page_size_pt=page_size_pt,
+        coords_space=coords_space,
+    )
     if extra_marks:
-        _draw_marks(c, Overlay(page=overlay.page, marks=extra_marks))
+        _draw_marks(c, Overlay(page=overlay.page, marks=extra_marks), coords_space="pt")
     if debug:
         _draw_debug_stamp(c, page_width, page_height)
     c.save()
     return buf.getvalue()
+
+
+def _overlay_coords_space(overlay: Optional[Overlay]) -> str:
+    if not overlay or not isinstance(overlay.meta, dict):
+        return "pt"
+    raw = str(overlay.meta.get("coords_space") or "pt").strip().lower()
+    return "px" if raw == "px" else "pt"
+
+
+def _coerce_mark(raw: Any) -> Optional[OverlayMark]:
+    if isinstance(raw, OverlayMark):
+        return raw
+    if isinstance(raw, dict):
+        try:
+            return OverlayMark(**raw)
+        except Exception:
+            return None
+    return None
+
+
+def _overlay_marks_by_page(overlay: Optional[Overlay]) -> Dict[int, List[OverlayMark]]:
+    if not overlay:
+        return {}
+    marks_by_page: Dict[int, List[OverlayMark]] = {1: list(overlay.marks or [])}
+    meta = overlay.meta if isinstance(overlay.meta, dict) else {}
+    raw = meta.get("marks_by_page")
+    if not isinstance(raw, dict):
+        return marks_by_page
+
+    parsed: Dict[int, List[OverlayMark]] = {}
+    for page_key, page_marks in raw.items():
+        try:
+            page_no = int(page_key)
+        except Exception:
+            continue
+        if page_no <= 0 or not isinstance(page_marks, list):
+            continue
+        coerced = [_coerce_mark(m) for m in page_marks]
+        parsed[page_no] = [m for m in coerced if m is not None]
+    if 1 not in parsed and overlay.marks:
+        parsed[1] = list(overlay.marks)
+    return parsed or marks_by_page
 
 
 def _draw_missing_overlay_banner(c: canvas.Canvas, page_width: float, page_height: float, text: str) -> None:
@@ -284,63 +366,78 @@ def render_marked_pdf(
     if missing:
         logger.warning("render_marked_pdf missing overlay; stamping banner=%s", banner_text)
 
-    marks = overlay.marks if overlay else []
-    mark_count = len(marks)
-    first = marks[0] if marks else None
+    marks_by_page = _overlay_marks_by_page(overlay)
+    mark_count = sum(len(v) for v in marks_by_page.values())
+    first_page_marks = marks_by_page.get(1) or []
+    first = first_page_marks[0] if first_page_marks else None
     first_info = f"{first.tool}:{(first.text or '')}" if first else "none"
     first_raw = first.coords if first else None
+    overlay_coords_space = _overlay_coords_space(overlay)
 
     if (mime_type or "").lower().endswith("pdf") or original_bytes.startswith(b"%PDF"):
         if PdfReader is None or PdfWriter is None:
             raise RuntimeError("pypdf is required for PDF overlays")
         reader = PdfReader(BytesIO(original_bytes))
         writer = PdfWriter()
+        first_page_size: Tuple[float, float] | None = None
         for page_index, page in enumerate(reader.pages):
+            page_width = float(page.mediabox.width)
+            page_height = float(page.mediabox.height)
+            page_no = page_index + 1
+            page_marks = marks_by_page.get(page_no) or []
             if page_index == 0:
-                page_width = float(page.mediabox.width)
-                page_height = float(page.mediabox.height)
-                sx = None
-                sy = None
-                if normalized_size_px:
-                    norm_w, norm_h = normalized_size_px
-                    sx = page_width / norm_w if norm_w else None
-                    sy = page_height / norm_h if norm_h else None
-                logger.info(
-                    "overlay_scale sx=%s sy=%s page_pt=%s norm_px=%s",
-                    sx,
-                    sy,
-                    (page_width, page_height),
-                    normalized_size_px,
+                first_page_size = (page_width, page_height)
+            sx = None
+            sy = None
+            if normalized_size_px:
+                norm_w, norm_h = normalized_size_px
+                sx = page_width / norm_w if norm_w else None
+                sy = page_height / norm_h if norm_h else None
+            logger.info(
+                "overlay_scale sx=%s sy=%s page_pt=%s norm_px=%s coords_space=%s page_no=%s marks=%s",
+                sx,
+                sy,
+                (page_width, page_height),
+                normalized_size_px,
+                overlay_coords_space,
+                page_no,
+                len(page_marks),
+            )
+            extra_marks: List[OverlayMark] = []
+            if page_index == 0 and not missing and mark_count == 0:
+                extra_marks.append(
+                    OverlayMark(
+                        tool="note",
+                        coords=[36.0, max(36.0, page_height - 48.0)],
+                        text="OVERLAY EMPTY — NEEDS REVIEW",
+                    )
                 )
-                extra_marks: List[OverlayMark] = []
-                if not missing and mark_count == 0:
-                    extra_marks.append(
-                        OverlayMark(
-                            tool="note",
-                            coords=[36.0, max(36.0, page_height - 48.0)],
-                            text="OVERLAY EMPTY — NEEDS REVIEW",
-                        )
+            if page_index == 0 and smoke_score_text:
+                extra_marks.append(
+                    OverlayMark(
+                        tool="bubble",
+                        coords=[36.0, max(36.0, page_height - 72.0), 260.0, 26.0],
+                        text=smoke_score_text,
                     )
-                if smoke_score_text:
-                    extra_marks.append(
-                        OverlayMark(
-                            tool="bubble",
-                            coords=[36.0, max(36.0, page_height - 72.0), 260.0, 26.0],
-                            text=smoke_score_text,
-                        )
-                    )
-                if missing:
+                )
+
+            if missing:
+                if page_index == 0:
                     overlay_bytes = _banner_overlay_pdf_bytes(page_width, page_height, banner_text)
-                else:
-                    overlay_bytes = _overlay_pdf_bytes(
-                        page_width,
-                        page_height,
-                        overlay,
-                        extra_marks=extra_marks,
-                        normalized_size_px=normalized_size_px,
-                        page_size_pt=(page_width, page_height),
-                        debug=debug_stamp,
-                    )
+                    overlay_reader = PdfReader(BytesIO(overlay_bytes))
+                    page.merge_page(overlay_reader.pages[0])
+            elif page_marks or extra_marks or debug_stamp:
+                page_overlay = Overlay(page=page_no, marks=page_marks, meta=overlay.meta if overlay else None)
+                overlay_bytes = _overlay_pdf_bytes(
+                    page_width,
+                    page_height,
+                    page_overlay,
+                    extra_marks=extra_marks,
+                    normalized_size_px=normalized_size_px,
+                    page_size_pt=(page_width, page_height),
+                    coords_space=overlay_coords_space,
+                    debug=debug_stamp,
+                )
                 overlay_reader = PdfReader(BytesIO(overlay_bytes))
                 page.merge_page(overlay_reader.pages[0])
             writer.add_page(page)
@@ -352,7 +449,7 @@ def render_marked_pdf(
             first_info,
         )
         first_converted = None
-        if first_raw and normalized_size_px:
+        if first_raw and normalized_size_px and overlay_coords_space == "px" and first_page_size:
             if len(first_raw) >= 4:
                 first_converted = _convert_rect(
                     first_raw[0],
@@ -360,18 +457,18 @@ def render_marked_pdf(
                     first_raw[2],
                     first_raw[3],
                     normalized_size_px,
-                    (page_width, page_height),
+                    first_page_size,
                 )
             else:
                 first_converted = _convert_point(
                     first_raw[0],
                     first_raw[1],
                     normalized_size_px,
-                    (page_width, page_height),
+                    first_page_size,
                 )
         logger.info(
             "render_marked_pdf_sizes page_size_pt=%s normalized_size_px=%s first_raw=%s first_converted=%s",
-            (page_width, page_height),
+            first_page_size,
             normalized_size_px,
             first_raw,
             first_converted,

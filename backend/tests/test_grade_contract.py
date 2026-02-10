@@ -19,14 +19,23 @@ def test_grade_returns_scores(fake_supabase, monkeypatch):
         "id": "u6",
         "owner_id": "owner-1",
         "storage_path": "submissions/owner-1/a.png",
-        "status": "pending",
+        "status": "pdf_ready",
+        "needs_review": False,
+        "graded_pdf_path": "owner-1/u6.pdf",
+        "overlay_path": "owner-1/u6.json",
+        "grade_json": {"total_score": 1.0, "items": []},
     }
-    fake_supabase.storage.objects[("submissions", "owner-1/a.png")] = b"fake"
 
-    async def fake_extract_text(*_args, **_kwargs):
-        return {"text": "2+2=4\nQ: add two numbers", "pages": None, "confidence": 0.9}
+    async def fake_unified(*_args, **_kwargs):
+        return {
+            "ok": True,
+            "upload_id": "u6",
+            "needs_review": False,
+            "graded_pdf_path": "owner-1/u6.pdf",
+            "pipeline_source": "test.unified",
+        }
 
-    monkeypatch.setattr("backend.api.grade.ocr_service.extract_text", fake_extract_text)
+    monkeypatch.setattr("backend.api.grade.run_unified_submission_pipeline", fake_unified)
 
     client = TestClient(app)
     r = client.post("/api/grade", json={"upload_id": "u6"}, headers=_auth_headers())

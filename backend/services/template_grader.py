@@ -181,32 +181,46 @@ def _build_template_overlay(
     unplaced: List[str] = []
     placed = 0
     skipped_missing = 0
+    marks_by_page: Dict[int, List[OverlayMark]] = {}
+    fallback_count_by_page: Dict[int, int] = {}
+
+    def _fallback_mark(item_id: str, item_symbol: str, page_no: int) -> None:
+        idx = fallback_count_by_page.get(page_no, 0)
+        y = max(24.0, page_h_pt - 56.0 - idx * 18.0)
+        mark = OverlayMark(tool="note", coords=[24.0, y], text=f"{item_id}: {item_symbol} (fallback)")
+        fallback_count_by_page[page_no] = idx + 1
+        if page_no == 1:
+            marks.append(mark)
+        marks_by_page.setdefault(page_no, []).append(mark)
 
     score_w = 140.0
     score_h = 26.0
     score_margin = 24.0
     score_x = page_w_pt - score_w - score_margin
     score_y = page_h_pt - score_h - score_margin
-    marks.append(
-        OverlayMark(
-            tool="bubble",
-            coords=[score_x, score_y, score_w, score_h],
-            text=f"Score: {grade_result.total_score:.0f}/{grade_result.total_max:.0f}",
-        )
+    score_mark = OverlayMark(
+        tool="bubble",
+        coords=[score_x, score_y, score_w, score_h],
+        text=f"Score: {grade_result.total_score:.0f}/{grade_result.total_max:.0f}",
     )
+    marks.append(score_mark)
+    marks_by_page.setdefault(1, []).append(score_mark)
 
     for item in grade_result.items:
-        if item.low_confidence:
-            continue
         region = next((r for r in template_regions if str(r.get("qid")) == item.question_id), None)
+        symbol = "REVIEW" if item.low_confidence else ("✓" if item.score >= item.max_score else "✗")
         if not region:
             unplaced.append(item.question_id)
             skipped_missing += 1
+            _fallback_mark(item.question_id, symbol, 1)
             continue
+        page_index = int(region.get("page_index") or 0)
+        page_no = page_index + 1
         answer_box = region.get("answer_box") or {}
         if not answer_box:
             unplaced.append(item.question_id)
             skipped_missing += 1
+            _fallback_mark(item.question_id, symbol, page_no)
             continue
         x0 = float(answer_box.get("x") or 0.0)
         y0 = float(answer_box.get("y") or 0.0)
@@ -215,11 +229,23 @@ def _build_template_overlay(
         anchor_x_px = x0 + w - 18.0
         anchor_y_px = y0 + 6.0
         x_pt, y_pt = px_to_pdf(anchor_x_px, anchor_y_px, (norm_w, norm_h), (page_w_pt, page_h_pt))
-        tool = "check" if item.score >= item.max_score else "cross"
-        marks.append(OverlayMark(tool=tool, coords=[x_pt, y_pt], text=None))
+        if item.low_confidence:
+            mark = OverlayMark(tool="note", coords=[x_pt, y_pt], text="REVIEW")
+        else:
+            tool = "check" if item.score >= item.max_score else "cross"
+            mark = OverlayMark(tool=tool, coords=[x_pt, y_pt], text=None)
+        if page_no == 1:
+            marks.append(mark)
+        marks_by_page.setdefault(page_no, []).append(mark)
         placed += 1
 
-    return Overlay(page=1, marks=marks), placed, skipped_missing, unplaced
+    meta: Dict[str, Any] = {"coords_space": "pt"}
+    if any(page_no != 1 for page_no in marks_by_page.keys()):
+        meta["marks_by_page"] = {
+            str(page_no): [m.model_dump() for m in page_marks]
+            for page_no, page_marks in marks_by_page.items()
+        }
+    return Overlay(page=1, marks=marks, meta=meta), placed, skipped_missing, unplaced
 
 
 def _extract_rects(raw: Any) -> List[Tuple[float, float, float, float]]:

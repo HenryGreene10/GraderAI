@@ -297,6 +297,11 @@ export default function AssignmentsPage() {
   const [viewerUrls, setViewerUrls] = useState({ original: "", marked: "" });
   const [viewerLoading, setViewerLoading] = useState(false);
   const [viewerError, setViewerError] = useState("");
+  const [ocrDebugOpen, setOcrDebugOpen] = useState(false);
+  const [ocrDebugTitle, setOcrDebugTitle] = useState("");
+  const [ocrDebugText, setOcrDebugText] = useState("");
+  const [ocrDebugLoading, setOcrDebugLoading] = useState(false);
+  const [ocrDebugError, setOcrDebugError] = useState("");
 
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -826,6 +831,77 @@ export default function AssignmentsPage() {
     }
   }
 
+  async function handleRunGrade(upload) {
+    if (!upload?.id || retrying[upload.id]) return;
+    setRetrying((prev) => ({ ...prev, [upload.id]: true }));
+    try {
+      const resp = await apiFetch(`/api/uploads/${upload.id}/retry`, { method: "POST" });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data?.detail || `Failed: ${resp.status}`;
+        throw new Error(detail);
+      }
+      toast({ title: "Grading started" });
+      await loadUploads();
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        title: "Grading failed",
+        description: err?.message || "Try again.",
+      });
+    } finally {
+      setRetrying((prev) => {
+        const next = { ...prev };
+        delete next[upload.id];
+        return next;
+      });
+    }
+  }
+
+  async function openOcrDebugForUpload(upload) {
+    if (!upload?.id) return;
+    setOcrDebugOpen(true);
+    setOcrDebugTitle(`Answer JSON (DEV) — ${upload.original_name || upload.id}`);
+    setOcrDebugText("");
+    setOcrDebugError("");
+    setOcrDebugLoading(true);
+    try {
+      const resp = await apiFetch(`/api/uploads/${upload.id}/student-answers?include_metadata=true`);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data?.detail || `Failed: ${resp.status}`;
+        throw new Error(detail);
+      }
+      setOcrDebugText(JSON.stringify(data, null, 2));
+    } catch (err) {
+      setOcrDebugError(err?.message || "Failed to load OCR text");
+    } finally {
+      setOcrDebugLoading(false);
+    }
+  }
+
+  async function openOcrDebugForTemplate() {
+    if (!assignmentId) return;
+    setOcrDebugOpen(true);
+    setOcrDebugTitle("Answer JSON (DEV) — Master Key");
+    setOcrDebugText("");
+    setOcrDebugError("");
+    setOcrDebugLoading(true);
+    try {
+      const resp = await apiFetch(`/api/assignments/${assignmentId}/answer-key?include_metadata=true`);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data?.detail || `Failed: ${resp.status}`;
+        throw new Error(detail);
+      }
+      setOcrDebugText(JSON.stringify(data, null, 2));
+    } catch (err) {
+      setOcrDebugError(err?.message || "Failed to load OCR text");
+    } finally {
+      setOcrDebugLoading(false);
+    }
+  }
+
   async function handleDeleteAssignment() {
     if (!assignmentId || deletingAssignment) return;
     setDeletingAssignment(true);
@@ -1132,6 +1208,14 @@ export default function AssignmentsPage() {
               disabled={devMasterUploading}
               className="text-sm"
             />
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={openOcrDebugForTemplate}
+              disabled={!assignment?.template_storage_path}
+            >
+              View Key Answers (DEV)
+            </Button>
             {devMasterUploading && (
               <div className="text-xs text-muted-foreground">Uploading...</div>
             )}
@@ -1270,10 +1354,26 @@ export default function AssignmentsPage() {
                             <DropdownMenuSeparator />
                           </>
                         )}
+                        {isDev && String(upload?.status || "").toLowerCase() === "scanned" && (
+                          <>
+                            <DropdownMenuItem onClick={() => handleRunGrade(upload)}>
+                              {retrying[upload.id] ? "Starting..." : "Run grading (DEV)"}
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                          </>
+                        )}
                         {upload.graded_pdf_path && (
                           <DropdownMenuItem onClick={() => openOverride(upload)}>
                             Review/Override
                           </DropdownMenuItem>
+                        )}
+                        {isDev && (
+                          <>
+                            <DropdownMenuItem onClick={() => openOcrDebugForUpload(upload)}>
+                              View Answers (DEV)
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                          </>
                         )}
                         <DropdownMenuItem onClick={() => handleDownloadOriginal(upload)}>
                           Download original
@@ -1399,6 +1499,33 @@ export default function AssignmentsPage() {
               </Button>
             </div>
             <Button variant="outline" onClick={() => setViewerOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={ocrDebugOpen} onOpenChange={setOcrDebugOpen}>
+        <DialogContent className="sm:max-w-[720px]">
+          <DialogHeader>
+            <DialogTitle>{ocrDebugTitle || "OCR Debug (DEV)"}</DialogTitle>
+            <DialogDescription>Answer JSON with optional OCR metadata.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            {ocrDebugLoading && (
+              <div className="text-sm text-muted-foreground">Loading OCR text...</div>
+            )}
+            {ocrDebugError && (
+              <div className="text-sm text-destructive">{ocrDebugError}</div>
+            )}
+            {!ocrDebugLoading && !ocrDebugError && (
+              <pre className="max-h-[400px] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted p-3 text-xs">
+                {ocrDebugText || "[no OCR text]"}
+              </pre>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOcrDebugOpen(false)}>
               Close
             </Button>
           </DialogFooter>

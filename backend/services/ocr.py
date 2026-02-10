@@ -13,6 +13,7 @@ OCR_MAX_BYTES = int(3.5 * 1024 * 1024)
 OCR_MAX_DIM_PX = 2500
 OCR_TARGET_LONG_SIDE = 2400
 OCR_JPEG_QUALITY = 80
+OCR_DEFAULT_DPI = float(os.getenv("OCR_NORMALIZE_DPI", "300"))
 
 
 class BaseOCRProvider:
@@ -193,6 +194,136 @@ def _normalize_azure_read(json_obj: Any) -> str:
     return ""
 
 
+def _as_float(value: object) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if out != out:  # NaN guard
+        return None
+    return out
+
+
+def _page_scale_to_px(page: dict, *, dpi: float) -> float:
+    unit = str(page.get("unit") or "").strip().lower()
+    if unit in {"pixel", "pixels", "px"}:
+        return 1.0
+    if unit in {"inch", "in", "inches"}:
+        return dpi
+    if unit in {"centimeter", "centimeters", "cm"}:
+        return dpi / 2.54
+    if unit in {"millimeter", "millimeters", "mm"}:
+        return dpi / 25.4
+    if unit in {"point", "points", "pt"}:
+        return dpi / 72.0
+
+    # Heuristic fallback for providers that omit unit metadata.
+    w = _as_float(page.get("width")) or 0.0
+    h = _as_float(page.get("height")) or 0.0
+    max_dim = max(w, h)
+    if max_dim <= 0:
+        return 1.0
+    if max_dim <= 17.5:
+        return dpi
+    if max_dim <= 70.0:
+        return dpi / 2.54
+    return 1.0
+
+
+def _scale_bbox_values(values: object, scale: float) -> object:
+    if not isinstance(values, list):
+        return values
+    out = []
+    for v in values:
+        fv = _as_float(v)
+        out.append(fv * scale if fv is not None else v)
+    return out
+
+
+def normalize_ocr_boxes_to_px(ocr_boxes: object, *, dpi: float = OCR_DEFAULT_DPI) -> object:
+    if not isinstance(ocr_boxes, dict):
+        return ocr_boxes
+    analyze = ocr_boxes.get("analyzeResult") or {}
+    if not isinstance(analyze, dict):
+        return ocr_boxes
+    read_results = analyze.get("readResults")
+    if not isinstance(read_results, list):
+        return ocr_boxes
+
+    out: dict = {
+        **ocr_boxes,
+        "analyzeResult": {
+            **analyze,
+            "readResults": [],
+        },
+    }
+    out_pages = out["analyzeResult"]["readResults"]
+    for page in read_results:
+        if not isinstance(page, dict):
+            out_pages.append(page)
+            continue
+        scale = _page_scale_to_px(page, dpi=dpi)
+        page_out = {**page, "unit": "pixel"}
+
+        w = _as_float(page.get("width"))
+        h = _as_float(page.get("height"))
+        if w is not None:
+            page_out["width"] = w * scale
+        if h is not None:
+            page_out["height"] = h * scale
+
+        lines_out = []
+        for line in page.get("lines") or []:
+            if not isinstance(line, dict):
+                lines_out.append(line)
+                continue
+            line_out = {**line}
+            line_out["boundingBox"] = _scale_bbox_values(line.get("boundingBox"), scale)
+            words_out = []
+            for word in line.get("words") or []:
+                if not isinstance(word, dict):
+                    words_out.append(word)
+                    continue
+                word_out = {**word}
+                word_out["boundingBox"] = _scale_bbox_values(word.get("boundingBox"), scale)
+                words_out.append(word_out)
+            line_out["words"] = words_out
+            lines_out.append(line_out)
+        page_out["lines"] = lines_out
+
+        marks_out = []
+        for mark in page.get("selectionMarks") or []:
+            if not isinstance(mark, dict):
+                marks_out.append(mark)
+                continue
+            mark_out = {**mark}
+            mark_out["boundingBox"] = _scale_bbox_values(mark.get("boundingBox"), scale)
+            marks_out.append(mark_out)
+        if marks_out:
+            page_out["selectionMarks"] = marks_out
+
+        out_pages.append(page_out)
+    return out
+
+
+def infer_primary_page_size_px(ocr_boxes: object, *, dpi: float = OCR_DEFAULT_DPI) -> tuple[float, float]:
+    boxes_px = normalize_ocr_boxes_to_px(ocr_boxes, dpi=dpi)
+    if not isinstance(boxes_px, dict):
+        return 0.0, 0.0
+    analyze = boxes_px.get("analyzeResult") or {}
+    if not isinstance(analyze, dict):
+        return 0.0, 0.0
+    read_results = analyze.get("readResults") or []
+    if not isinstance(read_results, list) or not read_results:
+        return 0.0, 0.0
+    page0 = read_results[0] if isinstance(read_results[0], dict) else {}
+    w = _as_float(page0.get("width")) or 0.0
+    h = _as_float(page0.get("height")) or 0.0
+    if w > 0 and h > 0:
+        return w, h
+    return 0.0, 0.0
+
+
 def _provider() -> BaseOCRProvider:
     # Mock override takes precedence
     if os.getenv("OCR_MOCK") == "1":
@@ -246,8 +377,9 @@ async def extract_text(image_bytes: Optional[bytes] = None, image_url: Optional[
 
 
 def normalize_ocr_result(raw: dict) -> dict:
+    boxes = (raw or {}).get("boxes") or (raw or {}).get("pages")
     return {
         "text": (raw or {}).get("text") or "",
-        "boxes": (raw or {}).get("boxes") or (raw or {}).get("pages"),
+        "boxes": normalize_ocr_boxes_to_px(boxes),
         "confidence": (raw or {}).get("confidence"),
     }

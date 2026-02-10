@@ -29,6 +29,17 @@ def test_remainder_missing_r_fallback():
     assert parse_quotient_remainder("161 03") == (161, 3)
 
 
+def test_remainder_slash_variant():
+    assert parse_quotient_remainder("161/03") == (161, 3)
+
+
+def test_remainder_ocr_digit_confusions():
+    status, score, _rationale, low_conf = score_quotient_remainder("161 R3", "16l R O3")
+    assert status == "correct"
+    assert score == 1.0
+    assert low_conf is False
+
+
 def test_remainder_ambiguous_characters_needs_review():
     status, score, _rationale, low_conf = score_quotient_remainder("71 R7", r"7\\ R7")
     assert status == "needs_review"
@@ -97,4 +108,37 @@ def test_overlay_skips_missing_region():
     assert placed == 0
     assert skipped_missing == 1
     assert unplaced == ["Q2"]
-    assert len(overlay.marks) == 1  # score bubble only
+    assert len(overlay.marks) >= 2  # score bubble + fallback mark
+    assert any(m.tool == "note" and "Q2:" in (m.text or "") for m in overlay.marks)
+
+
+def test_overlay_low_confidence_adds_review_note():
+    grade = GradeResult(
+        submission_id="s1",
+        total_score=0.0,
+        total_max=1.0,
+        rubric_version="test",
+        prompt_version="test",
+        items=[
+            QuestionGrade(
+                question_id="Q1",
+                qtype="short_answer",
+                score=0.0,
+                max_score=1.0,
+                criteria=[CriterionScore(name="test", score=0.0, max_score=1.0, rationale="")],
+                rationale="unclear OCR",
+                low_confidence=True,
+            )
+        ],
+    )
+    regions = [
+        {
+            "qid": "Q1",
+            "answer_box": {"x": 100.0, "y": 200.0, "w": 80.0, "h": 30.0},
+        }
+    ]
+    overlay, placed, skipped_missing, unplaced = _build_template_overlay(regions, grade, (1000, 1000))
+    assert placed == 1
+    assert skipped_missing == 0
+    assert unplaced == []
+    assert any(m.tool == "note" and m.text == "REVIEW" for m in overlay.marks)

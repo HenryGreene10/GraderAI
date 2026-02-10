@@ -14,11 +14,20 @@ def _normalize_remainder_text(text: str) -> str:
     raw = (text or "").strip()
     if not raw:
         return ""
+    # Normalize common OCR/operator variants first.
+    raw = raw.replace("÷", "/").replace("\\", "/")
+    raw = re.sub(r"(?i)\b(quotient)\b", " ", raw)
     # Treat "RO" (letter O) as "R0" when it appears after R.
     raw = re.sub(r"(?i)r\s*o\b", "R0", raw)
     raw = re.sub(r"(?i)\b(remainder|rem)\b", "R", raw)
-    # Normalize punctuation to spaces so regex can match cleanly.
-    raw = re.sub(r"[,:;()\[\]{}]", " ", raw)
+    # Repair common OCR digit confusions only in numeric contexts.
+    raw = re.sub(r"(?<=\d)[oO](?=\d|\b)", "0", raw)
+    raw = re.sub(r"(?<=\d)[lI|](?=\d|\b)", "1", raw)
+    raw = re.sub(r"(?i)(?<=r)\s*[oO]\b", "0", raw)
+    raw = re.sub(r"(?i)(?<=r)\s*[oO](?=\d)", "0", raw)
+    raw = re.sub(r"(?i)(?<=r)\s*[lI|](?=\d|\b)", "1", raw)
+    # Keep only symbols useful for quotient/remainder parsing.
+    raw = re.sub(r"[^0-9rR/\-\s]", " ", raw)
     raw = " ".join(raw.split())
     return raw
 
@@ -27,12 +36,15 @@ def parse_quotient_remainder(text: str) -> Optional[Tuple[int, int]]:
     normalized = _normalize_remainder_text(text)
     if not normalized:
         return None
-    # Reject ambiguous noise (e.g., slashes or letters) rather than guessing.
-    if re.search(r"[^0-9rR\s]", normalized):
-        return None
     normalized = normalized.upper()
     match = re.search(r"(-?\d+)\s*r\s*(-?\d+)", normalized, flags=re.IGNORECASE)
     if not match:
+        slash = re.match(r"^(-?\d+)\s*/\s*(-?\d+)$", normalized)
+        if slash:
+            try:
+                return int(slash.group(1)), int(slash.group(2))
+            except Exception:
+                return None
         # Handle missing "R" when two numeric groups are present (e.g., "161 03" -> 161 R3).
         fallback = re.match(r"^(-?\d+)\s+0*([0-9]{1,2})$", normalized)
         if not fallback:
