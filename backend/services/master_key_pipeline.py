@@ -17,7 +17,7 @@ from .ocr import normalize_ocr_result
 from .scanner import MAX_DIM_PX, normalize_image_bytes
 from .storage import upload_bytes
 from .template_anchor_regions import build_anchor_template_regions
-from .template_manifest import with_approved_manifest
+from .template_manifest import manifest_from_template_regions, manifest_to_template_regions_payload, with_approved_manifest
 from .template_regions import build_template_regions_payload
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,8 @@ class MasterKeyApprovalResult:
     boxes_detected: int
     qids: list[str]
     warnings: list[dict[str, object]]
+    approval_blocked: bool
+    approval_warning: str | None
 
 
 def _utc_iso() -> str:
@@ -105,20 +107,53 @@ async def run_master_key_approval_pipeline(
     template_upload_id = str(uuid4())
     template_uploaded_at = _utc_iso()
     template_regions_raw = build_template_regions_payload(regions, (template_w, template_h))
-    template_regions = with_approved_manifest(
-        template_regions_raw,
-        template_version=template_version,
-        template_width_px=template_w,
-        template_height_px=template_h,
-        approved_at=template_uploaded_at,
-    )
-
     warning_codes = {
         str(item.get("code"))
         for item in (warnings or [])
         if isinstance(item, dict) and item.get("code")
     }
+    blocking_codes = {
+        "ANCHOR_DUPLICATE_ANSWER_BOXES",
+        "ANCHOR_EXPLICIT_MISSING_FROM_MANIFEST",
+        "ANCHOR_COVERAGE_BELOW_THRESHOLD",
+    }
+    blocking_hits = sorted(code for code in warning_codes if code in blocking_codes)
+    approval_blocked = bool(blocking_hits)
+    if approval_blocked:
+        manifest = manifest_from_template_regions(
+            template_regions_raw,
+            template_version=template_version,
+            template_width_px=template_w,
+            template_height_px=template_h,
+        )
+        template_regions = manifest_to_template_regions_payload(manifest)
+        template_regions["manifest_approval_blocked"] = True
+        template_regions["manifest_approval_block_reasons"] = blocking_hits
+    else:
+        template_regions = with_approved_manifest(
+            template_regions_raw,
+            template_version=template_version,
+            template_width_px=template_w,
+            template_height_px=template_h,
+            approved_at=template_uploaded_at,
+        )
+
     anchor_ambiguity_high = "ANCHOR_AMBIGUITY_HIGH" in warning_codes
+    needs_review_for_template = anchor_ambiguity_high or approval_blocked
+    approval_warning = None
+    if approval_blocked:
+        approval_warning = (
+            "Master key needs review before approval: "
+            + ", ".join(blocking_hits)
+            + "."
+        )
+        warnings.append(
+            {
+                "code": "TEMPLATE_APPROVAL_BLOCKED",
+                "message": approval_warning,
+                "reasons": blocking_hits,
+            }
+        )
     sb = require_supabase()
     sb.table("assignments").update(
         {
@@ -130,11 +165,13 @@ async def run_master_key_approval_pipeline(
             "template_upload_id": template_upload_id,
             "template_original_name": template_original_name,
             "template_uploaded_at": template_uploaded_at,
+            "needs_review": needs_review_for_template,
         }
     ).eq("id", assignment_id).execute()
     if anchor_ambiguity_high:
-        sb.table("assignments").update({"needs_review": True}).eq("id", assignment_id).execute()
         logger.warning("template_anchor_ambiguity assignment_id=%s codes=%s", assignment_id, sorted(warning_codes))
+    if approval_blocked:
+        logger.warning("template_approval_blocked assignment_id=%s reasons=%s", assignment_id, blocking_hits)
 
     logger.info(
         "template_regions_saved assignment_id=%s regions=%s template_w=%s template_h=%s",
@@ -169,4 +206,6 @@ async def run_master_key_approval_pipeline(
         boxes_detected=boxes_detected,
         qids=qids,
         warnings=[w for w in (warnings or []) if isinstance(w, dict)],
+        approval_blocked=approval_blocked,
+        approval_warning=approval_warning,
     )

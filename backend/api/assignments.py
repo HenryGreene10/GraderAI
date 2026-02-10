@@ -533,6 +533,8 @@ async def upload_template(
         "boxes_detected": result.boxes_detected,
         "qids": result.qids,
         "warnings": result.warnings,
+        "approval_blocked": result.approval_blocked,
+        "approval_warning": result.approval_warning,
     }
 
 

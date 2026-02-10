@@ -68,6 +68,7 @@ _IMPLICIT_TOKEN_RE = re.compile(r"^[\(\[]?\s*([0-9]{1,2})\s*[\)\].,:;]?$")
 _ANSWER_REM_RE = re.compile(r"^\d+\s*[Rr]\s*\d+$")
 _ANSWER_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?(?:/\d+)?$")
 _ANSWER_ANY_DIGIT_RE = re.compile(r"\d")
+_EXPLICIT_COVERAGE_THRESHOLD = 0.95
 
 
 def _as_float(value: object) -> Optional[float]:
@@ -400,6 +401,117 @@ def _detect_anchors(tokens: List[_Token], page_sizes: Dict[int, Tuple[float, flo
     return _dedupe_anchor_candidates(candidates, median_h_by_page)
 
 
+def _extract_explicit_numbers_from_tokens(tokens: List[_Token]) -> List[int]:
+    nums: List[int] = []
+    by_page: Dict[int, List[_Token]] = {}
+    for tok in tokens:
+        text = tok.text.strip()
+        if not text:
+            continue
+        m_explicit = _EXPLICIT_TOKEN_RE.match(text)
+        if m_explicit:
+            nums.append(int(m_explicit.group(1)))
+        by_page.setdefault(tok.page_index, []).append(tok)
+
+    median_h_by_page = _median_word_height_by_page(tokens)
+    pair_anchors = _pair_q_tokens_with_number_tokens(tokens, median_h_by_page)
+    for anchor in pair_anchors:
+        if anchor.parsed_num is not None:
+            nums.append(int(anchor.parsed_num))
+    return sorted(set(nums))
+
+
+def _anchor_overlap(a: _Anchor, b: _Anchor, h_ref: float) -> bool:
+    if a.page_index != b.page_index:
+        return False
+    if _rect_iou(a.rect, b.rect) >= 0.2:
+        return True
+    return _distance_sq(a.center, b.center) <= (1.3 * h_ref) * (1.3 * h_ref)
+
+
+def _select_manifest_anchors(
+    anchors: List[_Anchor],
+    tokens: List[_Token],
+) -> Tuple[Dict[int, _Anchor], List[Dict[str, object]]]:
+    warnings: List[Dict[str, object]] = []
+    if not anchors:
+        return {}, warnings
+
+    explicit_numbers_seen = _extract_explicit_numbers_from_tokens(tokens)
+    median_h_by_page = _median_word_height_by_page(tokens)
+
+    explicit = [
+        a
+        for a in anchors
+        if a.parsed_num is not None and a.label_method in {"ocr_anchor_explicit", "ocr_anchor_pair"}
+    ]
+    implicit = [
+        a
+        for a in anchors
+        if a.parsed_num is not None and a.label_method == "ocr_anchor_implicit"
+    ]
+
+    selected: Dict[int, _Anchor] = {}
+    if explicit:
+        explicit.sort(key=lambda a: (a.page_index, a.y, a.x))
+        for anchor in explicit:
+            num = int(anchor.parsed_num or 0)
+            if num <= 0:
+                continue
+            prev = selected.get(num)
+            if prev is None or _is_better_anchor(anchor, prev):
+                selected[num] = anchor
+
+        max_explicit = max(selected.keys()) if selected else 0
+        for missing in range(1, max_explicit + 1):
+            if missing in selected:
+                continue
+            candidates = [
+                a for a in implicit if int(a.parsed_num or 0) == missing and a.confidence >= 2
+            ]
+            candidates.sort(key=lambda a: (a.page_index, a.y, a.x))
+            for cand in candidates:
+                h_ref = max(8.0, float(median_h_by_page.get(cand.page_index) or cand.h or 24.0))
+                if any(_anchor_overlap(cand, taken, h_ref) for taken in selected.values()):
+                    continue
+                selected[missing] = cand
+                break
+
+        if explicit_numbers_seen:
+            max_seen = max(explicit_numbers_seen)
+            covered = len([n for n in selected.keys() if 1 <= n <= max_seen])
+            coverage = float(covered) / float(max_seen) if max_seen > 0 else 0.0
+            missing_explicit = sorted(set(explicit_numbers_seen) - set(selected.keys()))
+            if missing_explicit:
+                warnings.append(
+                    {
+                        "code": "ANCHOR_EXPLICIT_MISSING_FROM_MANIFEST",
+                        "numbers": missing_explicit,
+                        "message": f"Explicit OCR anchors missing from manifest: {', '.join(f'Q{n}' for n in missing_explicit)}.",
+                    }
+                )
+            if coverage < _EXPLICIT_COVERAGE_THRESHOLD:
+                warnings.append(
+                    {
+                        "code": "ANCHOR_COVERAGE_BELOW_THRESHOLD",
+                        "coverage": round(coverage, 4),
+                        "threshold": _EXPLICIT_COVERAGE_THRESHOLD,
+                        "max_explicit": max_seen,
+                        "covered_count": covered,
+                        "message": (
+                            f"Explicit anchor coverage {covered}/{max_seen} is below threshold "
+                            f"{_EXPLICIT_COVERAGE_THRESHOLD:.2f}."
+                        ),
+                    }
+                )
+    else:
+        numbers = _assign_anchor_numbers(anchors)
+        for idx, anchor in enumerate(anchors):
+            selected[int(numbers[idx])] = anchor
+
+    return dict(sorted(selected.items())), warnings
+
+
 def _assign_anchor_numbers(anchors: List[_Anchor]) -> Dict[int, int]:
     count = len(anchors)
     anchors_by_order = list(enumerate(anchors))
@@ -484,6 +596,13 @@ def _score_answer_text(text: str) -> int:
     return 5
 
 
+def _token_key(token: _Token) -> str:
+    return (
+        f"{token.page_index}:{token.line_index}:{token.word_index}:"
+        f"{token.x:.3f}:{token.y:.3f}:{token.w:.3f}:{token.h:.3f}:{token.text}"
+    )
+
+
 def _pick_answer_box(
     *,
     anchor: _Anchor,
@@ -491,7 +610,9 @@ def _pick_answer_box(
     page_tokens: List[_Token],
     page_size: Tuple[float, float],
     region_box: Tuple[float, float, float, float],
-) -> Tuple[Tuple[float, float, float, float], str]:
+    reserved_token_keys: set[str],
+    reserved_answer_boxes: List[Tuple[int, Tuple[float, float, float, float]]],
+) -> Tuple[Tuple[float, float, float, float], str, List[str]]:
     page_w, page_h = page_size
     ax, ay, aw, ah = anchor.rect
     anchor_cx, anchor_cy = anchor.center
@@ -511,9 +632,12 @@ def _pick_answer_box(
         nearby.append(tok)
     nearby.sort(key=lambda t: (t.line_index, t.x, t.word_index))
 
-    candidates: List[Tuple[float, Tuple[float, float, float, float], str]] = []
+    candidates: List[Tuple[float, Tuple[float, float, float, float], str, List[str]]] = []
 
     for tok in nearby:
+        token_id = _token_key(tok)
+        if token_id in reserved_token_keys:
+            continue
         base = _score_answer_text(tok.text)
         if base <= 0:
             continue
@@ -522,7 +646,7 @@ def _pick_answer_box(
         score = float(base) - (dist / max(1.0, max(page_w, page_h))) * 28.0
         if cx > ax + aw * 0.3:
             score += 10.0
-        candidates.append((score, tok.rect, tok.text))
+        candidates.append((score, tok.rect, tok.text, [token_id]))
 
     by_line: Dict[int, List[_Token]] = {}
     for tok in nearby:
@@ -532,6 +656,10 @@ def _pick_answer_box(
         for i in range(len(line_tokens) - 1):
             t1 = line_tokens[i]
             t2 = line_tokens[i + 1]
+            t1_id = _token_key(t1)
+            t2_id = _token_key(t2)
+            if t1_id in reserved_token_keys or t2_id in reserved_token_keys:
+                continue
             merged = f"{t1.text} {t2.text}".strip()
             base = _score_answer_text(merged)
             if base <= 0:
@@ -545,20 +673,31 @@ def _pick_answer_box(
             score = float(base + 8) - (dist / max(1.0, max(page_w, page_h))) * 28.0
             if cx > ax + aw * 0.3:
                 score += 12.0
-            candidates.append((score, rect, merged))
+            candidates.append((score, rect, merged, [t1_id, t2_id]))
 
     if candidates:
         candidates.sort(key=lambda item: (-item[0], item[1][1], item[1][0]))
-        _score, rect, text = candidates[0]
-        clipped = _expand_and_clip(rect, pad_x=10.0, pad_y=8.0, page_w=page_w, page_h=page_h)
-        return clipped, normalize_answer_text(text)
+        for _score, rect, text, token_ids in candidates:
+            clipped = _expand_and_clip(rect, pad_x=10.0, pad_y=8.0, page_w=page_w, page_h=page_h)
+            overlaps = False
+            for page_idx, reserved_rect in reserved_answer_boxes:
+                if page_idx != anchor.page_index:
+                    continue
+                if _rect_iou(clipped, reserved_rect) > 0.18:
+                    overlaps = True
+                    break
+            if overlaps:
+                continue
+            return clipped, normalize_answer_text(text), token_ids
 
     fallback_pool = [t for t in anchor_tokens if not _overlaps_label(t, anchor)]
+    if fallback_pool:
+        fallback_pool = [t for t in fallback_pool if _token_key(t) not in reserved_token_keys]
     if fallback_pool:
         fallback_pool.sort(key=lambda t: (_distance_sq(t.center, anchor.center), t.y, t.x))
         tok = fallback_pool[0]
         rect = _expand_and_clip(tok.rect, pad_x=10.0, pad_y=8.0, page_w=page_w, page_h=page_h)
-        return rect, normalize_answer_text(tok.text)
+        return rect, normalize_answer_text(tok.text), [_token_key(tok)]
 
     rx, ry, rw, rh = region_box
     fallback = (
@@ -567,7 +706,7 @@ def _pick_answer_box(
         max(24.0, min(rw * 0.22, page_w * 0.2)),
         max(18.0, min(rh * 0.22, page_h * 0.12)),
     )
-    return _expand_and_clip(fallback, pad_x=0.0, pad_y=0.0, page_w=page_w, page_h=page_h), ""
+    return _expand_and_clip(fallback, pad_x=0.0, pad_y=0.0, page_w=page_w, page_h=page_h), "", []
 
 
 def build_anchor_template_regions(
@@ -639,7 +778,12 @@ def build_anchor_template_regions(
             }
         )
 
-    anchor_numbers = _assign_anchor_numbers(anchors)
+    selected_anchors, selection_warnings = _select_manifest_anchors(anchors, tokens)
+    warnings.extend(selection_warnings)
+    if not selected_anchors:
+        raise ValueError("template_anchor_selection_empty")
+
+    anchor_index_map = {id(anchor): idx for idx, anchor in enumerate(anchors)}
     token_map = _assign_tokens_to_anchors(tokens, anchors)
     page_tokens: Dict[int, List[_Token]] = {}
     for tok in tokens:
@@ -655,11 +799,32 @@ def build_anchor_template_regions(
             }
         )
 
-    ordered = sorted(range(len(anchors)), key=lambda idx: anchor_numbers[idx])
+    def _priority(method: str) -> int:
+        if method == "ocr_anchor_explicit":
+            return 0
+        if method == "ocr_anchor_pair":
+            return 1
+        if method == "ocr_anchor_implicit":
+            return 2
+        return 3
+
+    processing_order = sorted(
+        selected_anchors.items(),
+        key=lambda item: (
+            _priority(item[1].label_method),
+            item[1].page_index,
+            item[1].y,
+            item[1].x,
+            item[0],
+        ),
+    )
     regions: List[AnchorRegion] = []
-    for rank, anchor_idx in enumerate(ordered, start=1):
-        anchor = anchors[anchor_idx]
-        qnum = anchor_numbers[anchor_idx]
+    reserved_tokens: set[str] = set()
+    reserved_answer_boxes: List[Tuple[int, Tuple[float, float, float, float]]] = []
+    for rank, (qnum, anchor) in enumerate(processing_order, start=1):
+        anchor_idx = anchor_index_map.get(id(anchor))
+        if anchor_idx is None:
+            continue
         page_w, page_h = page_sizes.get(anchor.page_index) or (float(image_size[0]), float(image_size[1]))
         local_tokens = token_map.get(anchor_idx) or []
         candidate_rects = [anchor.rect] + [tok.rect for tok in local_tokens]
@@ -687,13 +852,18 @@ def build_anchor_template_regions(
                 page_h=page_h,
             )
 
-        answer_box, expected_text = _pick_answer_box(
+        answer_box, expected_text, used_token_ids = _pick_answer_box(
             anchor=anchor,
             anchor_tokens=local_tokens,
             page_tokens=page_tokens.get(anchor.page_index) or [],
             page_size=(page_w, page_h),
             region_box=region_box,
+            reserved_token_keys=reserved_tokens,
+            reserved_answer_boxes=reserved_answer_boxes,
         )
+        for token_id in used_token_ids:
+            reserved_tokens.add(token_id)
+        reserved_answer_boxes.append((anchor.page_index, answer_box))
         regions.append(
             AnchorRegion(
                 qid=f"Q{qnum}",
@@ -704,6 +874,25 @@ def build_anchor_template_regions(
                 index=rank,
                 page_index=anchor.page_index,
             )
+        )
+
+    overlap_pairs: List[str] = []
+    for i in range(len(regions)):
+        a = regions[i]
+        for j in range(i + 1, len(regions)):
+            b = regions[j]
+            if a.page_index != b.page_index:
+                continue
+            overlap = _rect_iou(a.answer_box, b.answer_box)
+            if overlap > 0.18:
+                overlap_pairs.append(f"{a.qid}-{b.qid}")
+    if overlap_pairs:
+        warnings.append(
+            {
+                "code": "ANCHOR_DUPLICATE_ANSWER_BOXES",
+                "pairs": overlap_pairs,
+                "message": "Detected overlapping answer boxes between questions.",
+            }
         )
 
     regions.sort(key=lambda r: int(str(r.qid).lstrip("Q") or "0"))

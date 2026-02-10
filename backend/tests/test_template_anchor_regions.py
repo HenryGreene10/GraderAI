@@ -166,3 +166,57 @@ def test_anchor_detection_handles_split_q_and_digit_tokens():
     assert len(regions) == 2
     assert [r.qid for r in regions] == ["Q1", "Q2"]
     assert all(r.answer_box[2] > 0 and r.answer_box[3] > 0 for r in regions)
+
+
+def test_explicit_numbers_are_not_renumbered_and_missing_q1_is_flagged():
+    lines = []
+    for idx in range(2, 10):
+        y = 140 + (idx - 2) * 130
+        lines.append(_line([_word(f"Q{idx}.", 90, y, 74, 30)]))
+        lines.append(_line([_word(str(10 + idx), 480, y + 2, 46, 30)]))
+
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1200,
+                    "height": 1600,
+                    "unit": "pixel",
+                    "lines": lines,
+                }
+            ]
+        }
+    }
+    regions, warnings = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1200, 1600))
+    qids = [r.qid for r in regions]
+    assert qids == ["Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8", "Q9"]
+    codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
+    assert "ANCHOR_COVERAGE_BELOW_THRESHOLD" in codes
+
+
+def test_token_reservation_avoids_reusing_same_answer_span():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1000,
+                    "height": 1400,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q1.", 90, 210, 70, 30)]),
+                        _line([_word("Q2.", 92, 280, 70, 30)]),
+                        _line([_word("42", 500, 245, 46, 30)]),
+                    ],
+                }
+            ]
+        }
+    }
+    regions, warnings = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1000, 1400))
+    assert len(regions) == 2
+    a = regions[0].answer_box
+    b = regions[1].answer_box
+    assert not (abs(a[0] - b[0]) < 1e-6 and abs(a[1] - b[1]) < 1e-6 and abs(a[2] - b[2]) < 1e-6 and abs(a[3] - b[3]) < 1e-6)

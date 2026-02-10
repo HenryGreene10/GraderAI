@@ -245,4 +245,7 @@ async def scan_upload(
         "resulting_upload_id": resulting_upload_id,
         "template_version": result.template_version if mode == "master_key" else None,
         "template_upload_id": result.template_upload_id if mode == "master_key" else None,
+        "approval_blocked": result.approval_blocked if mode == "master_key" else None,
+        "approval_warning": result.approval_warning if mode == "master_key" else None,
+        "warnings": result.warnings if mode == "master_key" else [],
     }

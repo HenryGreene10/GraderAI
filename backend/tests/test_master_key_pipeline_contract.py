@@ -20,7 +20,9 @@ def _mock_result(assignment_id: str) -> MasterKeyApprovalResult:
         template_uploaded_at="2026-02-10T00:00:00+00:00",
         boxes_detected=2,
         qids=["Q1", "Q2"],
-        warnings=["w1"],
+        warnings=[{"code": "TEST_WARNING", "message": "w1"}],
+        approval_blocked=False,
+        approval_warning=None,
     )
 
 
