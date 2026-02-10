@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .template import normalize_answer_text
 
@@ -69,6 +69,17 @@ _ANSWER_REM_RE = re.compile(r"^\d+\s*[Rr]\s*\d+$")
 _ANSWER_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?(?:/\d+)?$")
 _ANSWER_ANY_DIGIT_RE = re.compile(r"\d")
 _EXPLICIT_COVERAGE_THRESHOLD = 0.95
+
+
+def _anchor_trace_key(anchor: _Anchor) -> str:
+    return (
+        f"{anchor.page_index}:{anchor.line_index}:{anchor.x:.3f}:{anchor.y:.3f}:"
+        f"{anchor.w:.3f}:{anchor.h:.3f}:{anchor.label_method}:{anchor.parsed_num}:{anchor.text}"
+    )
+
+
+def _anchor_bbox_list(anchor: _Anchor) -> List[float]:
+    return [float(anchor.x), float(anchor.y), float(anchor.w), float(anchor.h)]
 
 
 def _as_float(value: object) -> Optional[float]:
@@ -385,9 +396,14 @@ def _dedupe_anchor_candidates(
     return kept
 
 
-def _detect_anchors(tokens: List[_Token], page_sizes: Dict[int, Tuple[float, float]]) -> List[_Anchor]:
+def _detect_anchors(
+    tokens: List[_Token],
+    page_sizes: Dict[int, Tuple[float, float]],
+    *,
+    include_debug: bool = False,
+) -> Any:
     if not tokens:
-        return []
+        return ([], {"candidates": [], "median_h_by_page": {}}) if include_debug else []
     median_h_by_page = _median_word_height_by_page(tokens)
     candidates: List[_Anchor] = []
     for tok in tokens:
@@ -397,8 +413,11 @@ def _detect_anchors(tokens: List[_Token], page_sizes: Dict[int, Tuple[float, flo
             candidates.append(cand)
     candidates.extend(_pair_q_tokens_with_number_tokens(tokens, median_h_by_page))
     if not candidates:
-        return []
-    return _dedupe_anchor_candidates(candidates, median_h_by_page)
+        return ([], {"candidates": [], "median_h_by_page": median_h_by_page}) if include_debug else []
+    deduped = _dedupe_anchor_candidates(candidates, median_h_by_page)
+    if include_debug:
+        return deduped, {"candidates": candidates, "median_h_by_page": median_h_by_page}
+    return deduped
 
 
 def _extract_explicit_numbers_from_tokens(tokens: List[_Token]) -> List[int]:
@@ -432,12 +451,22 @@ def _anchor_overlap(a: _Anchor, b: _Anchor, h_ref: float) -> bool:
 def _select_manifest_anchors(
     anchors: List[_Anchor],
     tokens: List[_Token],
-) -> Tuple[Dict[int, _Anchor], List[Dict[str, object]]]:
+) -> Tuple[Dict[int, _Anchor], List[Dict[str, object]], Dict[str, object]]:
     warnings: List[Dict[str, object]] = []
+    trace: Dict[str, object] = {
+        "expected_max_explicit": None,
+        "explicit_numbers_seen": [],
+        "covered_count": 0,
+        "coverage": None,
+        "missing_explicit": [],
+        "anchor_decisions": {},
+        "missing_detail": [],
+    }
     if not anchors:
-        return {}, warnings
+        return {}, warnings, trace
 
     explicit_numbers_seen = _extract_explicit_numbers_from_tokens(tokens)
+    trace["explicit_numbers_seen"] = list(explicit_numbers_seen)
     median_h_by_page = _median_word_height_by_page(tokens)
 
     explicit = [
@@ -454,15 +483,26 @@ def _select_manifest_anchors(
     selected: Dict[int, _Anchor] = {}
     if explicit:
         explicit.sort(key=lambda a: (a.page_index, a.y, a.x))
+        decisions: Dict[int, str] = {}
         for anchor in explicit:
             num = int(anchor.parsed_num or 0)
             if num <= 0:
+                decisions[id(anchor)] = "REJECTED_INVALID_NUMBER"
                 continue
             prev = selected.get(num)
-            if prev is None or _is_better_anchor(anchor, prev):
+            if prev is None:
                 selected[num] = anchor
+                decisions[id(anchor)] = "SELECTED_EXPLICIT"
+                continue
+            if _is_better_anchor(anchor, prev):
+                decisions[id(prev)] = "REJECTED_EXPLICIT_WORSE_DUPLICATE"
+                selected[num] = anchor
+                decisions[id(anchor)] = "SELECTED_EXPLICIT_REPLACED"
+            else:
+                decisions[id(anchor)] = "REJECTED_EXPLICIT_WORSE_DUPLICATE"
 
         max_explicit = max(selected.keys()) if selected else 0
+        trace["expected_max_explicit"] = max_explicit if max_explicit > 0 else None
         for missing in range(1, max_explicit + 1):
             if missing in selected:
                 continue
@@ -470,18 +510,47 @@ def _select_manifest_anchors(
                 a for a in implicit if int(a.parsed_num or 0) == missing and a.confidence >= 2
             ]
             candidates.sort(key=lambda a: (a.page_index, a.y, a.x))
+            missing_attempts: List[Dict[str, object]] = []
             for cand in candidates:
                 h_ref = max(8.0, float(median_h_by_page.get(cand.page_index) or cand.h or 24.0))
                 if any(_anchor_overlap(cand, taken, h_ref) for taken in selected.values()):
+                    decisions[id(cand)] = "REJECTED_IMPLICIT_OVERLAP_WITH_SELECTED"
+                    missing_attempts.append(
+                        {
+                            "anchor_key": _anchor_trace_key(cand),
+                            "reason": "REJECTED_IMPLICIT_OVERLAP_WITH_SELECTED",
+                        }
+                    )
                     continue
                 selected[missing] = cand
+                decisions[id(cand)] = "SELECTED_IMPLICIT_FILL"
+                missing_attempts.append(
+                    {
+                        "anchor_key": _anchor_trace_key(cand),
+                        "reason": "SELECTED_IMPLICIT_FILL",
+                    }
+                )
                 break
+            if missing not in selected:
+                trace_missing = trace.get("missing_detail")
+                if isinstance(trace_missing, list):
+                    trace_missing.append(
+                        {
+                            "question_id": f"Q{missing}",
+                            "status": "MISSING",
+                            "candidates": missing_attempts,
+                        }
+                    )
 
         if explicit_numbers_seen:
             max_seen = max(explicit_numbers_seen)
             covered = len([n for n in selected.keys() if 1 <= n <= max_seen])
             coverage = float(covered) / float(max_seen) if max_seen > 0 else 0.0
+            trace["expected_max_explicit"] = max_seen if max_seen > 0 else trace.get("expected_max_explicit")
+            trace["covered_count"] = covered
+            trace["coverage"] = round(coverage, 4)
             missing_explicit = sorted(set(explicit_numbers_seen) - set(selected.keys()))
+            trace["missing_explicit"] = list(missing_explicit)
             if missing_explicit:
                 warnings.append(
                     {
@@ -504,12 +573,22 @@ def _select_manifest_anchors(
                         ),
                     }
                 )
+        for anchor in implicit:
+            if id(anchor) not in decisions:
+                decisions[id(anchor)] = "REJECTED_IMPLICIT_NOT_REQUIRED"
+        for anchor in anchors:
+            if anchor.parsed_num is None:
+                decisions[id(anchor)] = "REJECTED_NO_PARSED_NUMBER"
+        trace["anchor_decisions"] = decisions
     else:
         numbers = _assign_anchor_numbers(anchors)
+        decisions = {}
         for idx, anchor in enumerate(anchors):
             selected[int(numbers[idx])] = anchor
+            decisions[id(anchor)] = "SELECTED_FALLBACK_ORDER"
+        trace["anchor_decisions"] = decisions
 
-    return dict(sorted(selected.items())), warnings
+    return dict(sorted(selected.items())), warnings, trace
 
 
 def _assign_anchor_numbers(anchors: List[_Anchor]) -> Dict[int, int]:
@@ -713,12 +792,44 @@ def build_anchor_template_regions(
     *,
     ocr_boxes: object,
     image_size: Tuple[int, int],
-) -> Tuple[List[AnchorRegion], List[Dict[str, object]]]:
+) -> Tuple[List[AnchorRegion], List[Dict[str, object]], Dict[str, object]]:
     warnings: List[Dict[str, object]] = []
     tokens, page_sizes = _extract_tokens_and_page_sizes(ocr_boxes, image_size)
-    anchors = _detect_anchors(tokens, page_sizes)
+    anchors, detect_debug = _detect_anchors(tokens, page_sizes, include_debug=True)
+    candidates = list((detect_debug or {}).get("candidates") or [])
+    median_h_by_page = (detect_debug or {}).get("median_h_by_page") or {}
+
+    candidate_reason: Dict[int, str] = {}
+    candidate_entries: List[Dict[str, object]] = []
+    for cand in candidates:
+        candidate_entries.append(
+            {
+                "text": cand.text,
+                "bbox_px": _anchor_bbox_list(cand),
+                "method": cand.label_method,
+                "parsed_num": cand.parsed_num,
+            }
+        )
+        candidate_reason[id(cand)] = "not_selected"
+
     if not anchors:
         raise ValueError("template_anchor_labels_missing")
+
+    deduped_ids = {id(a) for a in anchors}
+    for cand in candidates:
+        if id(cand) in deduped_ids:
+            candidate_reason[id(cand)] = "kept_after_dedupe"
+            continue
+        h_ref = max(8.0, float(median_h_by_page.get(cand.page_index) or cand.h or 24.0))
+        center_thresh_sq = (1.2 * h_ref) * (1.2 * h_ref)
+        reason = "deduped_by_overlap_or_proximity"
+        for kept in anchors:
+            if kept.page_index != cand.page_index:
+                continue
+            if _rect_iou(cand.rect, kept.rect) >= 0.30 or _distance_sq(cand.center, kept.center) <= center_thresh_sq:
+                reason = "deduped_by_overlap_or_proximity"
+                break
+        candidate_reason[id(cand)] = reason
 
     anchors.sort(key=lambda a: (a.page_index, a.y, a.x))
     parsed_numbers = [a.parsed_num for a in anchors if a.parsed_num is not None]
@@ -778,7 +889,7 @@ def build_anchor_template_regions(
             }
         )
 
-    selected_anchors, selection_warnings = _select_manifest_anchors(anchors, tokens)
+    selected_anchors, selection_warnings, selection_trace = _select_manifest_anchors(anchors, tokens)
     warnings.extend(selection_warnings)
     if not selected_anchors:
         raise ValueError("template_anchor_selection_empty")
@@ -819,6 +930,7 @@ def build_anchor_template_regions(
         ),
     )
     regions: List[AnchorRegion] = []
+    selected_details: List[Dict[str, object]] = []
     reserved_tokens: set[str] = set()
     reserved_answer_boxes: List[Tuple[int, Tuple[float, float, float, float]]] = []
     for rank, (qnum, anchor) in enumerate(processing_order, start=1):
@@ -864,6 +976,15 @@ def build_anchor_template_regions(
         for token_id in used_token_ids:
             reserved_tokens.add(token_id)
         reserved_answer_boxes.append((anchor.page_index, answer_box))
+        selected_details.append(
+            {
+                "question_id": f"Q{qnum}",
+                "text": anchor.text,
+                "bbox_px": _anchor_bbox_list(anchor),
+                "method": anchor.label_method,
+                "parsed_num": anchor.parsed_num,
+            }
+        )
         regions.append(
             AnchorRegion(
                 qid=f"Q{qnum}",
@@ -895,5 +1016,59 @@ def build_anchor_template_regions(
             }
         )
 
+    decision_map = selection_trace.get("anchor_decisions") if isinstance(selection_trace, dict) else {}
+    if not isinstance(decision_map, dict):
+        decision_map = {}
+    selected_anchor_ids = {id(a) for a in selected_anchors.values()}
+    for anchor in anchors:
+        if id(anchor) in selected_anchor_ids:
+            candidate_reason[id(anchor)] = "selected"
+            continue
+        decision = str(decision_map.get(id(anchor)) or "").strip().lower()
+        if decision:
+            candidate_reason[id(anchor)] = decision
+
+    rejected_entries: List[Dict[str, object]] = []
+    for cand in candidates:
+        reason = str(candidate_reason.get(id(cand)) or "not_selected")
+        if reason == "selected":
+            continue
+        if reason == "kept_after_dedupe":
+            reason = "not_selected"
+        rejected_entries.append(
+            {
+                "text": cand.text,
+                "bbox_px": _anchor_bbox_list(cand),
+                "method": cand.label_method,
+                "parsed_num": cand.parsed_num,
+                "reason": reason,
+            }
+        )
+
+    missing_numbers: List[int] = []
+    if isinstance(selection_trace, dict):
+        raw_missing = selection_trace.get("missing_explicit")
+        if isinstance(raw_missing, list):
+            missing_numbers = [int(v) for v in raw_missing if isinstance(v, (int, float))]
+        raw_expected = selection_trace.get("expected_max_explicit")
+        if isinstance(raw_expected, (int, float)) and int(raw_expected) > 0:
+            expected_max = int(raw_expected)
+            selected_nums = sorted({int(k) for k in selected_anchors.keys()})
+            gap_missing = [n for n in range(1, expected_max + 1) if n not in selected_nums]
+            missing_numbers = sorted({*missing_numbers, *gap_missing})
+
+    anchor_trace: Dict[str, object] = {
+        "candidates": candidate_entries,
+        "selected": selected_details,
+        "rejected": rejected_entries,
+        "missing_numbers": missing_numbers,
+        "summary": {
+            "candidate_count": len(candidate_entries),
+            "selected_count": len(selected_details),
+            "rejected_count": len(rejected_entries),
+            "missing_count": len(missing_numbers),
+        },
+    }
+
     regions.sort(key=lambda r: int(str(r.qid).lstrip("Q") or "0"))
-    return regions, warnings
+    return regions, warnings, anchor_trace

@@ -21,6 +21,7 @@ def _mock_result(assignment_id: str) -> MasterKeyApprovalResult:
         boxes_detected=2,
         qids=["Q1", "Q2"],
         warnings=[{"code": "TEST_WARNING", "message": "w1"}],
+        anchor_trace={"version": 1, "summary": {"selected_total": 2}},
         approval_blocked=False,
         approval_warning=None,
     )

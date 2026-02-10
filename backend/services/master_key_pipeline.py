@@ -36,6 +36,7 @@ class MasterKeyApprovalResult:
     boxes_detected: int
     qids: list[str]
     warnings: list[dict[str, object]]
+    anchor_trace: dict[str, object] | None
     approval_blocked: bool
     approval_warning: str | None
 
@@ -93,7 +94,7 @@ async def run_master_key_approval_pipeline(
     try:
         raw = await ocr_service.extract_text(image_bytes=template_png)
         norm = normalize_ocr_result(raw)
-        regions, warnings = build_anchor_template_regions(
+        regions, warnings, anchor_trace = build_anchor_template_regions(
             ocr_boxes=norm.get("boxes"),
             image_size=(template_w, template_h),
         )
@@ -137,6 +138,8 @@ async def run_master_key_approval_pipeline(
             template_height_px=template_h,
             approved_at=template_uploaded_at,
         )
+    if isinstance(anchor_trace, dict):
+        template_regions["anchor_trace"] = anchor_trace
 
     anchor_ambiguity_high = "ANCHOR_AMBIGUITY_HIGH" in warning_codes
     needs_review_for_template = anchor_ambiguity_high or approval_blocked
@@ -206,6 +209,7 @@ async def run_master_key_approval_pipeline(
         boxes_detected=boxes_detected,
         qids=qids,
         warnings=[w for w in (warnings or []) if isinstance(w, dict)],
+        anchor_trace=anchor_trace if isinstance(anchor_trace, dict) else None,
         approval_blocked=approval_blocked,
         approval_warning=approval_warning,
     )
