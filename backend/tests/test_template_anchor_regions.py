@@ -227,3 +227,32 @@ def test_token_reservation_avoids_reusing_same_answer_span():
     b = regions[1].answer_box
     assert not (abs(a[0] - b[0]) < 1e-6 and abs(a[1] - b[1]) < 1e-6 and abs(a[2] - b[2]) < 1e-6 and abs(a[3] - b[3]) < 1e-6)
     assert isinstance(anchor_trace.get("rejected"), list)
+
+
+def test_hard_gate_rejects_header_distractor_without_nearby_answer_pair():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1200,
+                    "height": 1600,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("1.", 84, 42, 30, 24), _word("Score", 130, 42, 72, 24)]),
+                        _line([_word("Q1.", 92, 220, 70, 30), _word("12", 480, 222, 46, 30)]),
+                        _line([_word("Q2.", 92, 360, 70, 30), _word("14", 480, 362, 46, 30)]),
+                    ],
+                }
+            ]
+        }
+    }
+    regions, warnings, anchor_trace = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1200, 1600))
+    assert [r.qid for r in regions] == ["Q1", "Q2"]
+    rejected = anchor_trace.get("rejected") or []
+    assert any(
+        item.get("text") == "1." and item.get("reason") == "hard_gate_no_answer_pair"
+        for item in rejected
+        if isinstance(item, dict)
+    )

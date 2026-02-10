@@ -675,6 +675,108 @@ def _score_answer_text(text: str) -> int:
     return 5
 
 
+def _geometry_answer_span_candidates(
+    *,
+    anchor: _Anchor,
+    page_tokens: List[_Token],
+    page_size: Tuple[float, float],
+    h_ref: float,
+) -> List[Dict[str, object]]:
+    page_w, page_h = page_size
+    ax, ay, aw, ah = anchor.rect
+    anchor_cx, anchor_cy = anchor.center
+    dx_min = max(10.0, 0.8 * h_ref)
+    dx_max = min(page_w * 0.58, 24.0 * h_ref)
+    dy_max = min(page_h * 0.07, 1.8 * h_ref)
+
+    def _valid_span_center(cx: float, cy: float) -> Tuple[bool, float, float]:
+        dx = cx - anchor_cx
+        dy = abs(cy - anchor_cy)
+        right_column_floor = max(anchor_cx + dx_min, page_w * 0.24)
+        if cx < right_column_floor:
+            return False, dx, dy
+        if dx < dx_min or dx > dx_max:
+            return False, dx, dy
+        if dy > dy_max:
+            return False, dx, dy
+        return True, dx, dy
+
+    spans: List[Dict[str, object]] = []
+    for tok in page_tokens:
+        if _overlaps_label(tok, anchor):
+            continue
+        cx, cy = tok.center
+        ok, dx, dy = _valid_span_center(cx, cy)
+        if not ok:
+            continue
+        spans.append(
+            {
+                "rect": tok.rect,
+                "text": tok.text,
+                "token_ids": [_token_key(tok)],
+                "dx": dx,
+                "dy": dy,
+                "text_score": _score_answer_text(tok.text),
+            }
+        )
+
+    by_line: Dict[int, List[_Token]] = {}
+    for tok in page_tokens:
+        if _overlaps_label(tok, anchor):
+            continue
+        by_line.setdefault(tok.line_index, []).append(tok)
+    for line_idx in sorted(by_line.keys()):
+        line_tokens = sorted(by_line[line_idx], key=lambda t: (t.x, t.word_index))
+        for i in range(len(line_tokens) - 1):
+            t1 = line_tokens[i]
+            t2 = line_tokens[i + 1]
+            rect = _union_rect([t1.rect, t2.rect])
+            if not rect:
+                continue
+            cx = rect[0] + rect[2] / 2.0
+            cy = rect[1] + rect[3] / 2.0
+            ok, dx, dy = _valid_span_center(cx, cy)
+            if not ok:
+                continue
+            merged = f"{t1.text} {t2.text}".strip()
+            spans.append(
+                {
+                    "rect": rect,
+                    "text": merged,
+                    "token_ids": [_token_key(t1), _token_key(t2)],
+                    "dx": dx,
+                    "dy": dy,
+                    "text_score": _score_answer_text(merged),
+                }
+            )
+    spans.sort(
+        key=lambda item: (
+            float(item.get("dy") or 0.0),
+            float(item.get("dx") or 0.0),
+            -int(item.get("text_score") or 0),
+            float((item.get("rect") or [0, 0, 0, 0])[1]),
+            float((item.get("rect") or [0, 0, 0, 0])[0]),
+        )
+    )
+    return spans
+
+
+def _best_geometry_answer_span(
+    *,
+    anchor: _Anchor,
+    page_tokens: List[_Token],
+    page_size: Tuple[float, float],
+    h_ref: float,
+) -> Optional[Dict[str, object]]:
+    spans = _geometry_answer_span_candidates(
+        anchor=anchor,
+        page_tokens=page_tokens,
+        page_size=page_size,
+        h_ref=h_ref,
+    )
+    return spans[0] if spans else None
+
+
 def _token_key(token: _Token) -> str:
     return (
         f"{token.page_index}:{token.line_index}:{token.word_index}:"
@@ -691,6 +793,7 @@ def _pick_answer_box(
     region_box: Tuple[float, float, float, float],
     reserved_token_keys: set[str],
     reserved_answer_boxes: List[Tuple[int, Tuple[float, float, float, float]]],
+    preferred_span: Optional[Dict[str, object]] = None,
 ) -> Tuple[Tuple[float, float, float, float], str, List[str]]:
     page_w, page_h = page_size
     ax, ay, aw, ah = anchor.rect
@@ -710,6 +813,29 @@ def _pick_answer_box(
             continue
         nearby.append(tok)
     nearby.sort(key=lambda t: (t.line_index, t.x, t.word_index))
+
+    if isinstance(preferred_span, dict):
+        pref_rect = preferred_span.get("rect")
+        pref_text = str(preferred_span.get("text") or "")
+        pref_token_ids = preferred_span.get("token_ids") if isinstance(preferred_span.get("token_ids"), list) else []
+        if isinstance(pref_rect, (list, tuple)) and len(pref_rect) >= 4:
+            clipped_pref = _expand_and_clip(
+                (float(pref_rect[0]), float(pref_rect[1]), float(pref_rect[2]), float(pref_rect[3])),
+                pad_x=10.0,
+                pad_y=8.0,
+                page_w=page_w,
+                page_h=page_h,
+            )
+            pref_overlap = False
+            for page_idx, reserved_rect in reserved_answer_boxes:
+                if page_idx != anchor.page_index:
+                    continue
+                if _rect_iou(clipped_pref, reserved_rect) > 0.18:
+                    pref_overlap = True
+                    break
+            if not pref_overlap:
+                if all(token_id not in reserved_token_keys for token_id in pref_token_ids):
+                    return clipped_pref, normalize_answer_text(pref_text), list(pref_token_ids)
 
     candidates: List[Tuple[float, Tuple[float, float, float, float], str, List[str]]] = []
 
@@ -889,18 +1015,39 @@ def build_anchor_template_regions(
             }
         )
 
-    selected_anchors, selection_warnings, selection_trace = _select_manifest_anchors(anchors, tokens)
-    warnings.extend(selection_warnings)
-    if not selected_anchors:
-        raise ValueError("template_anchor_selection_empty")
-
-    anchor_index_map = {id(anchor): idx for idx, anchor in enumerate(anchors)}
-    token_map = _assign_tokens_to_anchors(tokens, anchors)
     page_tokens: Dict[int, List[_Token]] = {}
     for tok in tokens:
         page_tokens.setdefault(tok.page_index, []).append(tok)
 
-    implicit_count = sum(1 for a in anchors if a.label_method == "ocr_anchor_implicit")
+    gate_span_by_anchor: Dict[int, Dict[str, object]] = {}
+    eligible_anchors: List[_Anchor] = []
+    for anchor in anchors:
+        page_w, page_h = page_sizes.get(anchor.page_index) or (float(image_size[0]), float(image_size[1]))
+        h_ref = max(8.0, float(median_h_by_page.get(anchor.page_index) or anchor.h or 24.0))
+        best_span = _best_geometry_answer_span(
+            anchor=anchor,
+            page_tokens=page_tokens.get(anchor.page_index) or [],
+            page_size=(page_w, page_h),
+            h_ref=h_ref,
+        )
+        if not isinstance(best_span, dict):
+            candidate_reason[id(anchor)] = "hard_gate_no_answer_pair"
+            continue
+        gate_span_by_anchor[id(anchor)] = best_span
+        eligible_anchors.append(anchor)
+
+    if not eligible_anchors:
+        raise ValueError("template_anchor_hard_gate_empty")
+
+    selected_anchors, selection_warnings, selection_trace = _select_manifest_anchors(eligible_anchors, tokens)
+    warnings.extend(selection_warnings)
+    if not selected_anchors:
+        raise ValueError("template_anchor_selection_empty")
+
+    anchor_index_map = {id(anchor): idx for idx, anchor in enumerate(eligible_anchors)}
+    token_map = _assign_tokens_to_anchors(tokens, eligible_anchors)
+
+    implicit_count = sum(1 for a in eligible_anchors if a.label_method == "ocr_anchor_implicit")
     if implicit_count:
         warnings.append(
             {
@@ -972,6 +1119,7 @@ def build_anchor_template_regions(
             region_box=region_box,
             reserved_token_keys=reserved_tokens,
             reserved_answer_boxes=reserved_answer_boxes,
+            preferred_span=gate_span_by_anchor.get(id(anchor)),
         )
         for token_id in used_token_ids:
             reserved_tokens.add(token_id)
