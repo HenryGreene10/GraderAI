@@ -13,9 +13,10 @@ from PIL import Image
 from ..config import SUBMISSIONS_BUCKET
 from . import ocr as ocr_service
 from .db import get_assignment, require_supabase
+from .ocr import normalize_ocr_result
 from .scanner import MAX_DIM_PX, normalize_image_bytes
 from .storage import upload_bytes
-from .template import TemplateValidationError, extract_template_regions
+from .template_anchor_regions import build_anchor_template_regions
 from .template_manifest import with_approved_manifest
 from .template_regions import build_template_regions_payload
 
@@ -88,22 +89,12 @@ async def run_master_key_approval_pipeline(
     template_storage_path = f"{SUBMISSIONS_BUCKET}/{template_key}"
 
     try:
-        regions, warnings = await extract_template_regions(
-            template_png,
-            ocr_service.extract_text,
+        raw = await ocr_service.extract_text(image_bytes=template_png)
+        norm = normalize_ocr_result(raw)
+        regions, warnings = build_anchor_template_regions(
+            ocr_boxes=norm.get("boxes"),
             image_size=(template_w, template_h),
         )
-    except TemplateValidationError as exc:
-        logger.warning(
-            "template_validation_failed assignment_id=%s size=%sx%s regions=%s region_index=%s answer_boxes_count=%s",
-            assignment_id,
-            template_w,
-            template_h,
-            exc.debug.get("regions_count"),
-            exc.detail.get("region_index"),
-            exc.detail.get("answer_boxes_count"),
-        )
-        raise HTTPException(status_code=400, detail=exc.detail)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
