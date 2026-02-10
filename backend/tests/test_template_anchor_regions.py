@@ -110,3 +110,59 @@ def test_k5_anchor_regions_build_manifest_with_nine_questions():
         assert isinstance(box, list) and len(box) == 4
         assert float(box[2]) > 0
         assert float(box[3]) > 0
+
+
+def test_anchor_detection_handles_two_question_labels_on_same_ocr_line():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1000,
+                    "height": 1400,
+                    "unit": "pixel",
+                    "lines": [
+                        _line(
+                            [
+                                _word("Q1.", 90, 200, 70, 30),
+                                _word("12", 420, 202, 46, 30),
+                                _word("Q2.", 560, 200, 70, 30),
+                                _word("14", 860, 202, 46, 30),
+                            ]
+                        )
+                    ],
+                }
+            ]
+        }
+    }
+    regions, warnings = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1000, 1400))
+    assert regions, warnings
+    assert len(regions) == 2
+    assert [r.qid for r in regions] == ["Q1", "Q2"]
+    assert all(r.answer_box[2] > 0 and r.answer_box[3] > 0 for r in regions)
+
+
+def test_anchor_detection_handles_split_q_and_digit_tokens():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1100,
+                    "height": 1500,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q1.", 96, 210, 74, 30), _word("8", 460, 212, 32, 30)]),
+                        _line([_word("Q", 98, 360, 28, 30), _word("2)", 140, 360, 42, 30), _word("11", 480, 362, 40, 30)]),
+                    ],
+                }
+            ]
+        }
+    }
+    regions, warnings = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1100, 1500))
+    assert regions, warnings
+    assert len(regions) == 2
+    assert [r.qid for r in regions] == ["Q1", "Q2"]
+    assert all(r.answer_box[2] > 0 and r.answer_box[3] > 0 for r in regions)
