@@ -35,7 +35,7 @@ class MasterKeyApprovalResult:
     template_uploaded_at: str
     boxes_detected: int
     qids: list[str]
-    warnings: list[str]
+    warnings: list[dict[str, object]]
 
 
 def _utc_iso() -> str:
@@ -113,6 +113,12 @@ async def run_master_key_approval_pipeline(
         approved_at=template_uploaded_at,
     )
 
+    warning_codes = {
+        str(item.get("code"))
+        for item in (warnings or [])
+        if isinstance(item, dict) and item.get("code")
+    }
+    anchor_ambiguity_high = "ANCHOR_AMBIGUITY_HIGH" in warning_codes
     sb = require_supabase()
     sb.table("assignments").update(
         {
@@ -126,6 +132,9 @@ async def run_master_key_approval_pipeline(
             "template_uploaded_at": template_uploaded_at,
         }
     ).eq("id", assignment_id).execute()
+    if anchor_ambiguity_high:
+        sb.table("assignments").update({"needs_review": True}).eq("id", assignment_id).execute()
+        logger.warning("template_anchor_ambiguity assignment_id=%s codes=%s", assignment_id, sorted(warning_codes))
 
     logger.info(
         "template_regions_saved assignment_id=%s regions=%s template_w=%s template_h=%s",
@@ -159,5 +168,5 @@ async def run_master_key_approval_pipeline(
         template_uploaded_at=template_uploaded_at,
         boxes_detected=boxes_detected,
         qids=qids,
-        warnings=[str(w) for w in (warnings or [])],
+        warnings=[w for w in (warnings or []) if isinstance(w, dict)],
     )

@@ -63,6 +63,7 @@ class _Anchor:
 
 _EXPLICIT_LABEL_RE = re.compile(r"[\(\[]?\s*Q\s*([0-9]{1,2})\s*[\)\].,:;]?", re.I)
 _EXPLICIT_TOKEN_RE = re.compile(r"^[\(\[]?\s*Q\s*([0-9]{1,2})\s*[\)\].,:;]?$", re.I)
+_Q_ONLY_TOKEN_RE = re.compile(r"^[\(\[]?\s*Q\s*[\)\].,:;]?$", re.I)
 _IMPLICIT_TOKEN_RE = re.compile(r"^[\(\[]?\s*([0-9]{1,2})\s*[\)\].,:;]?$")
 _ANSWER_REM_RE = re.compile(r"^\d+\s*[Rr]\s*\d+$")
 _ANSWER_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?(?:/\d+)?$")
@@ -135,6 +136,20 @@ def _distance_sq(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     dx = a[0] - b[0]
     dy = a[1] - b[1]
     return dx * dx + dy * dy
+
+
+def _rect_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax1, ay1 = ax + aw, ay + ah
+    bx1, by1 = bx + bw, by + bh
+    inter_w = max(0.0, min(ax1, bx1) - max(ax, bx))
+    inter_h = max(0.0, min(ay1, by1) - max(ay, by))
+    inter = inter_w * inter_h
+    if inter <= 0:
+        return 0.0
+    union = (aw * ah) + (bw * bh) - inter
+    return inter / union if union > 0 else 0.0
 
 
 def _extract_tokens_and_page_sizes(
@@ -212,86 +227,177 @@ def _extract_tokens_and_page_sizes(
     return tokens, page_sizes
 
 
-def _parse_anchor_from_line(tokens: List[_Token], page_w: float) -> Optional[_Anchor]:
-    if not tokens:
-        return None
-    tokens = sorted(tokens, key=lambda t: t.word_index)
-    line_text = " ".join(t.text for t in tokens).strip()
-    rect = _union_rect([t.rect for t in tokens])
-    if not rect:
-        return None
-    x, y, w, h = rect
-    parsed_num = None
-    confidence = 0
-    label_method = "order"
+def _median_word_height_by_page(tokens: List[_Token]) -> Dict[int, float]:
+    by_page: Dict[int, List[float]] = {}
+    for tok in tokens:
+        if tok.h > 0:
+            by_page.setdefault(tok.page_index, []).append(tok.h)
+    out: Dict[int, float] = {}
+    for page_index, values in by_page.items():
+        values = sorted(values)
+        mid = len(values) // 2
+        if len(values) % 2 == 1:
+            out[page_index] = values[mid]
+        else:
+            out[page_index] = (values[mid - 1] + values[mid]) / 2.0
+    return out
 
-    match = _EXPLICIT_LABEL_RE.search(line_text)
-    if match:
-        parsed_num = int(match.group(1))
-        confidence = 3
-        label_method = "ocr_anchor_explicit"
-    else:
-        for idx, tok in enumerate(tokens):
-            token_text = tok.text.strip()
-            m_one = _EXPLICIT_TOKEN_RE.match(token_text)
-            if m_one:
-                parsed_num = int(m_one.group(1))
-                confidence = 3
-                label_method = "ocr_anchor_explicit"
-                x, y, w, h = tok.rect
+
+def _candidate_from_token(token: _Token, page_w: float) -> Optional[_Anchor]:
+    text = token.text.strip()
+    if not text:
+        return None
+
+    m_explicit = _EXPLICIT_TOKEN_RE.match(text)
+    if m_explicit:
+        return _Anchor(
+            page_index=token.page_index,
+            line_index=token.line_index,
+            x=token.x,
+            y=token.y,
+            w=token.w,
+            h=token.h,
+            parsed_num=int(m_explicit.group(1)),
+            confidence=5,
+            label_method="ocr_anchor_explicit",
+            text=text,
+        )
+
+    if _Q_ONLY_TOKEN_RE.match(text):
+        return _Anchor(
+            page_index=token.page_index,
+            line_index=token.line_index,
+            x=token.x,
+            y=token.y,
+            w=token.w,
+            h=token.h,
+            parsed_num=None,
+            confidence=1,
+            label_method="ocr_anchor_unknown",
+            text=text,
+        )
+
+    m_implicit = _IMPLICIT_TOKEN_RE.match(text)
+    if m_implicit:
+        left_margin = token.x <= max(120.0, page_w * 0.28)
+        if left_margin:
+            return _Anchor(
+                page_index=token.page_index,
+                line_index=token.line_index,
+                x=token.x,
+                y=token.y,
+                w=token.w,
+                h=token.h,
+                parsed_num=int(m_implicit.group(1)),
+                confidence=2,
+                label_method="ocr_anchor_implicit",
+                text=text,
+            )
+    return None
+
+
+def _pair_q_tokens_with_number_tokens(
+    tokens: List[_Token],
+    median_h_by_page: Dict[int, float],
+) -> List[_Anchor]:
+    by_page: Dict[int, List[_Token]] = {}
+    for tok in tokens:
+        by_page.setdefault(tok.page_index, []).append(tok)
+    out: List[_Anchor] = []
+    for page_index, page_tokens in by_page.items():
+        h = max(8.0, float(median_h_by_page.get(page_index) or 24.0))
+        q_tokens = [t for t in page_tokens if _Q_ONLY_TOKEN_RE.match(t.text.strip())]
+        num_tokens = [t for t in page_tokens if _IMPLICIT_TOKEN_RE.match(t.text.strip())]
+        for q in sorted(q_tokens, key=lambda t: (t.y, t.x, t.word_index)):
+            best = None
+            best_score = None
+            qx, qy = q.center
+            for n in num_tokens:
+                nx, ny = n.center
+                dx = nx - qx
+                dy = abs(ny - qy)
+                if dy > (1.4 * h):
+                    continue
+                if dx < (-0.7 * h) or dx > (5.0 * h):
+                    continue
+                score = abs(dx) + dy * 2.0
+                if best_score is None or score < best_score or (
+                    score == best_score and (n.y, n.x, n.word_index) < (best.y, best.x, best.word_index)  # type: ignore[union-attr]
+                ):
+                    best = n
+                    best_score = score
+            if not best:
+                continue
+            match = _IMPLICIT_TOKEN_RE.match(best.text.strip())
+            if not match:
+                continue
+            pair_rect = _union_rect([q.rect, best.rect])
+            if not pair_rect:
+                continue
+            out.append(
+                _Anchor(
+                    page_index=page_index,
+                    line_index=min(q.line_index, best.line_index),
+                    x=pair_rect[0],
+                    y=pair_rect[1],
+                    w=pair_rect[2],
+                    h=pair_rect[3],
+                    parsed_num=int(match.group(1)),
+                    confidence=4,
+                    label_method="ocr_anchor_pair",
+                    text=f"{q.text} {best.text}",
+                )
+            )
+    return out
+
+
+def _is_better_anchor(candidate: _Anchor, current: _Anchor) -> bool:
+    if candidate.confidence != current.confidence:
+        return candidate.confidence > current.confidence
+    if (candidate.y, candidate.x) != (current.y, current.x):
+        return (candidate.y, candidate.x) < (current.y, current.x)
+    return (candidate.w * candidate.h) < (current.w * current.h)
+
+
+def _dedupe_anchor_candidates(
+    candidates: List[_Anchor],
+    median_h_by_page: Dict[int, float],
+) -> List[_Anchor]:
+    kept: List[_Anchor] = []
+    ordered = sorted(candidates, key=lambda a: (-a.confidence, a.page_index, a.y, a.x, a.text))
+    for cand in ordered:
+        page_h = max(8.0, float(median_h_by_page.get(cand.page_index) or 24.0))
+        center_thresh_sq = (1.2 * page_h) * (1.2 * page_h)
+        matched_idx = None
+        for idx, cur in enumerate(kept):
+            if cur.page_index != cand.page_index:
+                continue
+            if _rect_iou(cand.rect, cur.rect) >= 0.30 or _distance_sq(cand.center, cur.center) <= center_thresh_sq:
+                matched_idx = idx
                 break
-            if idx + 1 < len(tokens) and token_text.upper() == "Q":
-                m_pair = _IMPLICIT_TOKEN_RE.match(tokens[idx + 1].text.strip())
-                if m_pair:
-                    parsed_num = int(m_pair.group(1))
-                    confidence = 3
-                    label_method = "ocr_anchor_explicit"
-                    pair = _union_rect([tok.rect, tokens[idx + 1].rect])
-                    if pair:
-                        x, y, w, h = pair
-                    break
-
-    if parsed_num is None and tokens:
-        leftmost = min(tokens, key=lambda t: t.x)
-        left_margin = leftmost.x <= max(120.0, page_w * 0.28)
-        m_implicit = _IMPLICIT_TOKEN_RE.match(leftmost.text.strip())
-        if left_margin and m_implicit:
-            parsed_num = int(m_implicit.group(1))
-            confidence = 1
-            label_method = "ocr_anchor_implicit"
-            x, y, w, h = leftmost.rect
-
-    if parsed_num is None:
-        return None
-    return _Anchor(
-        page_index=tokens[0].page_index,
-        line_index=tokens[0].line_index,
-        x=x,
-        y=y,
-        w=w,
-        h=h,
-        parsed_num=parsed_num,
-        confidence=confidence,
-        label_method=label_method,
-        text=line_text,
-    )
+        if matched_idx is None:
+            kept.append(cand)
+            continue
+        if _is_better_anchor(cand, kept[matched_idx]):
+            kept[matched_idx] = cand
+    kept.sort(key=lambda a: (a.page_index, a.y, a.x))
+    return kept
 
 
 def _detect_anchors(tokens: List[_Token], page_sizes: Dict[int, Tuple[float, float]]) -> List[_Anchor]:
-    by_line: Dict[Tuple[int, int], List[_Token]] = {}
+    if not tokens:
+        return []
+    median_h_by_page = _median_word_height_by_page(tokens)
+    candidates: List[_Anchor] = []
     for tok in tokens:
-        by_line.setdefault((tok.page_index, tok.line_index), []).append(tok)
-
-    anchors: List[_Anchor] = []
-    for key in sorted(by_line.keys()):
-        page_index, _line_index = key
-        page_w = (page_sizes.get(page_index) or (0.0, 0.0))[0]
-        anchor = _parse_anchor_from_line(by_line[key], page_w)
-        if anchor:
-            anchors.append(anchor)
-
-    anchors.sort(key=lambda a: (a.page_index, a.y, a.x))
-    return anchors
+        page_w = (page_sizes.get(tok.page_index) or (0.0, 0.0))[0]
+        cand = _candidate_from_token(tok, page_w)
+        if cand:
+            candidates.append(cand)
+    candidates.extend(_pair_q_tokens_with_number_tokens(tokens, median_h_by_page))
+    if not candidates:
+        return []
+    return _dedupe_anchor_candidates(candidates, median_h_by_page)
 
 
 def _assign_anchor_numbers(anchors: List[_Anchor]) -> Dict[int, int]:
@@ -476,6 +582,63 @@ def build_anchor_template_regions(
         raise ValueError("template_anchor_labels_missing")
 
     anchors.sort(key=lambda a: (a.page_index, a.y, a.x))
+    parsed_numbers = [a.parsed_num for a in anchors if a.parsed_num is not None]
+    anchor_count = len(anchors)
+    unknown_count = sum(1 for a in anchors if a.parsed_num is None)
+    out_of_range = sorted(
+        {
+            int(num)
+            for num in parsed_numbers
+            if not (1 <= int(num) <= anchor_count)
+        }
+    )
+    freq: Dict[int, int] = {}
+    for raw in parsed_numbers:
+        num = int(raw)
+        if 1 <= num <= anchor_count:
+            freq[num] = freq.get(num, 0) + 1
+    duplicate_numbers = sorted(num for num, count in freq.items() if count > 1)
+    if unknown_count:
+        warnings.append(
+            {
+                "code": "ANCHOR_NUMBER_FALLBACK_ORDER",
+                "unknown_count": unknown_count,
+                "message": "Some anchors had unreadable numbers; deterministic reading-order numbering applied.",
+            }
+        )
+    if duplicate_numbers:
+        warnings.append(
+            {
+                "code": "ANCHOR_DUPLICATE_NUMBERS",
+                "numbers": duplicate_numbers,
+                "message": "Duplicate question numbers detected in OCR anchors.",
+            }
+        )
+    if out_of_range:
+        warnings.append(
+            {
+                "code": "ANCHOR_OUT_OF_RANGE_NUMBERS",
+                "numbers": out_of_range,
+                "message": "Some parsed anchor numbers are outside the detected anchor count.",
+            }
+        )
+    ambiguity_high = (
+        unknown_count > max(1, anchor_count // 3)
+        or len(duplicate_numbers) >= 2
+        or (unknown_count > 0 and bool(duplicate_numbers))
+    )
+    if ambiguity_high:
+        warnings.append(
+            {
+                "code": "ANCHOR_AMBIGUITY_HIGH",
+                "anchor_count": anchor_count,
+                "unknown_count": unknown_count,
+                "duplicate_numbers": duplicate_numbers,
+                "out_of_range_numbers": out_of_range,
+                "message": "Anchor numbering ambiguity is high; template should be reviewed.",
+            }
+        )
+
     anchor_numbers = _assign_anchor_numbers(anchors)
     token_map = _assign_tokens_to_anchors(tokens, anchors)
     page_tokens: Dict[int, List[_Token]] = {}
