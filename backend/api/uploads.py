@@ -109,18 +109,42 @@ def _filter_to_expected_qids(expected_qids: list[str], values: dict[str, str]) -
 
 def _template_mark_integrity_reasons(
     *,
-    expected_count: int,
+    expected_qids: list[str],
+    graded_qids: list[str],
     marks_placed: int | None,
     marks_skipped_missing: int | None,
     unplaced_items: list[str],
 ) -> list[str]:
     reasons: list[str] = []
+    expected = [str(qid) for qid in expected_qids]
+    graded = [str(qid) for qid in graded_qids]
+    expected_set = set(expected)
+    graded_set = set(graded)
+    duplicate_qids: list[str] = []
+    seen: set[str] = set()
+    for qid in graded:
+        if qid in seen and qid not in duplicate_qids:
+            duplicate_qids.append(qid)
+        seen.add(qid)
+    unknown_qids = sorted((graded_set - expected_set), key=_qid_sort_key)
+    missing_qids = sorted((expected_set - graded_set), key=_qid_sort_key)
+
     question_marks_count = int(marks_placed or 0) + int(marks_skipped_missing or 0)
-    if question_marks_count != int(expected_count):
-        reasons.append(f"manifest_mark_count_mismatch:{question_marks_count}!={int(expected_count)}")
+    if question_marks_count != len(graded):
+        reasons.append(f"graded_mark_count_mismatch:{question_marks_count}!={len(graded)}")
+    if len(graded) != len(expected):
+        reasons.append(f"manifest_item_count_mismatch:{len(graded)}!={len(expected)}")
+    if question_marks_count != len(expected):
+        reasons.append(f"manifest_mark_count_mismatch:{question_marks_count}!={len(expected)}")
     missing_count = int(marks_skipped_missing or 0)
     if missing_count > 0:
         reasons.append(f"manifest_missing_marks:{missing_count}")
+    if unknown_qids:
+        reasons.append(f"manifest_unknown_qids:{','.join(unknown_qids)}")
+    if missing_qids:
+        reasons.append(f"manifest_missing_qids:{','.join(missing_qids)}")
+    if duplicate_qids:
+        reasons.append(f"manifest_duplicate_qids:{','.join(duplicate_qids)}")
     if unplaced_items:
         reasons.append(f"manifest_unplaced_items:{len(unplaced_items)}")
     return reasons
@@ -717,9 +741,10 @@ async def run_grade_pipeline(
                 page_sizes_pt=page_sizes,
             )
             if template_manifest:
-                expected_count = int(template_manifest.question_count or len(expected_qids))
+                graded_qids = [str(item.question_id) for item in grade_result.items]
                 integrity_reasons = _template_mark_integrity_reasons(
-                    expected_count=expected_count,
+                    expected_qids=expected_qids,
+                    graded_qids=graded_qids,
                     marks_placed=marks_placed,
                     marks_skipped_missing=marks_skipped_missing,
                     unplaced_items=unplaced_items,
