@@ -1061,6 +1061,7 @@ def _best_anchor_for_box_row(
     box: Tuple[float, float, float, float],
     row_tokens: List[_Token],
     page_size: Tuple[float, float],
+    reserved_anchor_keys: Optional[set[str]] = None,
 ) -> Tuple[Optional[_Anchor], List[_Anchor]]:
     page_w, _page_h = page_size
     if not row_tokens:
@@ -1089,7 +1090,12 @@ def _best_anchor_for_box_row(
             c.x,
         )
     )
-    return parsed[0], deduped
+    reserved = reserved_anchor_keys or set()
+    for cand in parsed:
+        if _anchor_trace_key(cand) in reserved:
+            continue
+        return cand, deduped
+    return None, deduped
 
 
 def _extract_answer_text_in_box(
@@ -1155,8 +1161,10 @@ def _build_box_driven_regions(
     candidate_entries: List[Dict[str, object]] = []
     selected_entries: List[Dict[str, object]] = []
     rejected_entries: List[Dict[str, object]] = []
+    row_entries: List[Dict[str, object]] = []
     unreadable_rows: List[int] = []
     row_records: List[Dict[str, object]] = []
+    reserved_anchor_keys: set[str] = set()
 
     for row_index, box in enumerate(boxes, start=1):
         bx, by, bw, bh = box
@@ -1167,7 +1175,13 @@ def _build_box_driven_regions(
         if roi is None:
             roi = (0.0, max(0.0, by - vpad), max(1.0, bx - right_gap), bh + (2.0 * vpad))
         row_tokens = [tok for tok in page_tokens if _rect_center_in(tok.rect, roi)]
-        best_anchor, row_candidates = _best_anchor_for_box_row(box=box, row_tokens=row_tokens, page_size=(page_w, page_h))
+        reserved_before = set(reserved_anchor_keys)
+        best_anchor, row_candidates = _best_anchor_for_box_row(
+            box=box,
+            row_tokens=row_tokens,
+            page_size=(page_w, page_h),
+            reserved_anchor_keys=reserved_anchor_keys,
+        )
 
         for cand in row_candidates:
             candidate_entries.append(
@@ -1182,16 +1196,20 @@ def _build_box_driven_regions(
         if best_anchor is None:
             unreadable_rows.append(row_index)
             for cand in row_candidates:
+                reason = f"unreadable_q_label_row_{row_index}"
+                if _anchor_trace_key(cand) in reserved_before:
+                    reason = "anchor_reserved_by_previous_row"
                 rejected_entries.append(
                     {
                         "text": cand.text,
                         "bbox_px": _anchor_bbox_list(cand),
                         "method": cand.label_method,
                         "parsed_num": cand.parsed_num,
-                        "reason": f"unreadable_q_label_row_{row_index}",
+                        "reason": reason,
                     }
                 )
         else:
+            reserved_anchor_keys.add(_anchor_trace_key(best_anchor))
             selected_entries.append(
                 {
                     "question_id": f"ROW{row_index}",
@@ -1204,20 +1222,37 @@ def _build_box_driven_regions(
             for cand in row_candidates:
                 if _anchor_trace_key(cand) == _anchor_trace_key(best_anchor):
                     continue
+                reason = f"not_best_for_row_{row_index}"
+                if _anchor_trace_key(cand) in reserved_before:
+                    reason = "anchor_reserved_by_previous_row"
                 rejected_entries.append(
                     {
                         "text": cand.text,
                         "bbox_px": _anchor_bbox_list(cand),
                         "method": cand.label_method,
                         "parsed_num": cand.parsed_num,
-                        "reason": f"not_best_for_row_{row_index}",
+                        "reason": reason,
                     }
                 )
+
+        row_entries.append(
+            {
+                "row_index": row_index,
+                "box_bbox_px": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
+                "roi_bbox_px": [float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])],
+                "anchor_bbox_px": (
+                    _anchor_bbox_list(best_anchor) if isinstance(best_anchor, _Anchor) else None
+                ),
+                "anchor_text": (best_anchor.text if isinstance(best_anchor, _Anchor) else None),
+                "parsed_num": (int(best_anchor.parsed_num) if isinstance(best_anchor, _Anchor) and best_anchor.parsed_num is not None else None),
+            }
+        )
 
         row_records.append(
             {
                 "row_index": row_index,
                 "box": box,
+                "roi": roi,
                 "anchor": best_anchor,
             }
         )
@@ -1298,6 +1333,7 @@ def _build_box_driven_regions(
         "candidates": candidate_entries,
         "selected": selected_entries,
         "rejected": rejected_entries,
+        "rows": row_entries,
         "missing_numbers": missing_numbers,
         "summary": {
             "candidate_count": len(candidate_entries),

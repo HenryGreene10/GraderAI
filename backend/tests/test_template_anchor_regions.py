@@ -318,6 +318,10 @@ def test_box_driven_mode_uses_box_count_as_question_count():
     assert len(regions) == 9
     assert anchor_trace.get("summary", {}).get("selected_count") == 8
     assert anchor_trace.get("missing_numbers") == [1]
+    rows = anchor_trace.get("rows") or []
+    assert len(rows) == 9
+    assert isinstance(rows[0].get("box_bbox_px"), list)
+    assert isinstance(rows[0].get("roi_bbox_px"), list)
     codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
     assert "BOX_UNREADABLE_Q_LABEL_ROWS" in codes
 
@@ -351,3 +355,41 @@ def test_box_driven_mode_flags_duplicate_q_numbers():
     )
     codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
     assert "BOX_DUPLICATE_Q_NUMBERS" in codes
+
+
+def test_box_driven_mode_reserves_anchor_token_across_rows():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1000,
+                    "height": 1400,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q7.", 110, 320, 70, 30), _word("18", 520, 322, 44, 30)]),
+                    ],
+                }
+            ]
+        }
+    }
+    hints = [
+        (500.0, 300.0, 74.0, 38.0),
+        (500.0, 340.0, 74.0, 38.0),
+    ]
+    regions, warnings, anchor_trace = build_anchor_template_regions(
+        ocr_boxes=boxes,
+        image_size=(1000, 1400),
+        answer_box_hints=hints,
+    )
+    assert len(regions) == 2
+    selected = anchor_trace.get("selected") or []
+    parsed_nums = [item.get("parsed_num") for item in selected if isinstance(item, dict)]
+    assert parsed_nums.count(7) == 1
+    rejected = anchor_trace.get("rejected") or []
+    assert any(
+        item.get("reason") == "anchor_reserved_by_previous_row"
+        for item in rejected
+        if isinstance(item, dict)
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -9,6 +10,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 from PIL import Image
+from PIL import ImageDraw
 
 from ..config import SUBMISSIONS_BUCKET
 from . import ocr as ocr_service
@@ -63,6 +65,47 @@ def _normalize_template_image(payload: bytes) -> tuple[bytes, int, int]:
         template_png = buf.getvalue()
         template_w, template_h = new_w, new_h
     return template_png, template_w, template_h
+
+
+def _save_anchor_debug_overlay(
+    *,
+    template_png: bytes,
+    assignment_id: str,
+    anchor_trace: dict[str, object],
+) -> str:
+    rows = anchor_trace.get("rows") if isinstance(anchor_trace, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return ""
+
+    image = Image.open(BytesIO(template_png)).convert("RGB")
+    draw = ImageDraw.Draw(image)
+
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        box = item.get("box_bbox_px")
+        roi = item.get("roi_bbox_px")
+        anchor = item.get("anchor_bbox_px")
+        parsed_num = item.get("parsed_num")
+
+        if isinstance(box, list) and len(box) >= 4:
+            bx, by, bw, bh = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+            draw.rectangle([bx, by, bx + bw, by + bh], outline=(0, 170, 0), width=3)
+        if isinstance(roi, list) and len(roi) >= 4:
+            rx, ry, rw, rh = float(roi[0]), float(roi[1]), float(roi[2]), float(roi[3])
+            draw.rectangle([rx, ry, rx + rw, ry + rh], outline=(0, 102, 255), width=2)
+        if isinstance(anchor, list) and len(anchor) >= 4:
+            ax, ay, aw, ah = float(anchor[0]), float(anchor[1]), float(anchor[2]), float(anchor[3])
+            draw.rectangle([ax, ay, ax + aw, ay + ah], outline=(220, 0, 0), width=3)
+            label = f"Q{parsed_num}" if isinstance(parsed_num, int) and parsed_num > 0 else "Q?"
+            draw.text((ax + 3, max(0.0, ay - 14)), label, fill=(220, 0, 0))
+
+    tmp_dir = os.path.join(os.path.dirname(__file__), "..", "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    filename = f"template_anchor_overlay_{assignment_id}_{int(datetime.now(timezone.utc).timestamp())}.png"
+    path = os.path.join(tmp_dir, filename)
+    image.save(path, format="PNG")
+    return path
 
 
 async def run_master_key_approval_pipeline(
@@ -155,6 +198,16 @@ async def run_master_key_approval_pipeline(
             approved_at=template_uploaded_at,
         )
     if isinstance(anchor_trace, dict):
+        try:
+            overlay_path = _save_anchor_debug_overlay(
+                template_png=template_png,
+                assignment_id=assignment_id,
+                anchor_trace=anchor_trace,
+            )
+            if overlay_path:
+                anchor_trace["debug_overlay_path"] = overlay_path
+        except Exception as exc:
+            logger.warning("template_anchor_overlay_failed assignment_id=%s error=%s", assignment_id, exc)
         template_regions["anchor_trace"] = anchor_trace
 
     anchor_ambiguity_high = "ANCHOR_AMBIGUITY_HIGH" in warning_codes
