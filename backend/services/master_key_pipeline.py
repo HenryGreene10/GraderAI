@@ -19,6 +19,7 @@ from .storage import upload_bytes
 from .template_anchor_regions import build_anchor_template_regions
 from .template_manifest import manifest_from_template_regions, manifest_to_template_regions_payload, with_approved_manifest
 from .template_regions import build_template_regions_payload
+from .template import detect_answer_boxes
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +93,21 @@ async def run_master_key_approval_pipeline(
     template_storage_path = f"{SUBMISSIONS_BUCKET}/{template_key}"
 
     try:
+        answer_box_hints: list[tuple[float, float, float, float]] = []
+        try:
+            answer_box_hints = [
+                (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+                for b in (detect_answer_boxes(template_png) or [])
+                if isinstance(b, (list, tuple)) and len(b) >= 4
+            ]
+        except Exception as exc:
+            logger.warning("template_answer_box_detection_failed assignment_id=%s error=%s", assignment_id, exc)
         raw = await ocr_service.extract_text(image_bytes=template_png)
         norm = normalize_ocr_result(raw)
         regions, warnings, anchor_trace = build_anchor_template_regions(
             ocr_boxes=norm.get("boxes"),
             image_size=(template_w, template_h),
+            answer_box_hints=answer_box_hints,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -114,6 +125,11 @@ async def run_master_key_approval_pipeline(
         if isinstance(item, dict) and item.get("code")
     }
     blocking_codes = {
+        "BOX_COUNT_TOO_FEW",
+        "BOX_OVERLAP_AMBIGUOUS",
+        "BOX_CONFIDENCE_LOW",
+        "BOX_DUPLICATE_Q_NUMBERS",
+        "BOX_UNREADABLE_Q_LABEL_ROWS",
         "ANCHOR_DUPLICATE_ANSWER_BOXES",
         "ANCHOR_EXPLICIT_MISSING_FROM_MANIFEST",
         "ANCHOR_COVERAGE_BELOW_THRESHOLD",

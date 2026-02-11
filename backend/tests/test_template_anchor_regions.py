@@ -284,3 +284,70 @@ def test_targeted_recovery_prefers_expected_row_for_missing_q1():
     q1 = next((item for item in (anchor_trace.get("selected") or []) if item.get("question_id") == "Q1"), None)
     assert q1 is not None
     assert float((q1.get("bbox_px") or [0, 0, 0, 0])[1]) >= 180.0
+
+
+def test_box_driven_mode_uses_box_count_as_question_count():
+    lines = []
+    for idx in range(2, 10):
+        y = 220 + (idx - 2) * 120
+        lines.append(_line([_word(f"Q{idx}.", 92, y, 70, 30)]))
+        lines.append(_line([_word(str(10 + idx), 520, y + 2, 46, 30)]))
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1200,
+                    "height": 1600,
+                    "unit": "pixel",
+                    "lines": lines,
+                }
+            ]
+        }
+    }
+    hints = []
+    for i in range(9):
+        y = 210 + i * 120
+        hints.append((500.0, float(y), 70.0, 36.0))
+    regions, warnings, anchor_trace = build_anchor_template_regions(
+        ocr_boxes=boxes,
+        image_size=(1200, 1600),
+        answer_box_hints=hints,
+    )
+    assert len(regions) == 9
+    assert anchor_trace.get("summary", {}).get("selected_count") == 8
+    assert anchor_trace.get("missing_numbers") == [1]
+    codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
+    assert "BOX_UNREADABLE_Q_LABEL_ROWS" in codes
+
+
+def test_box_driven_mode_flags_duplicate_q_numbers():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1000,
+                    "height": 1400,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q1.", 96, 220, 70, 30), _word("12", 480, 222, 46, 30)]),
+                        _line([_word("Q1.", 96, 360, 70, 30), _word("14", 480, 362, 46, 30)]),
+                    ],
+                }
+            ]
+        }
+    }
+    hints = [
+        (460.0, 210.0, 74.0, 38.0),
+        (460.0, 350.0, 74.0, 38.0),
+    ]
+    _regions, warnings, _trace = build_anchor_template_regions(
+        ocr_boxes=boxes,
+        image_size=(1000, 1400),
+        answer_box_hints=hints,
+    )
+    codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
+    assert "BOX_DUPLICATE_Q_NUMBERS" in codes

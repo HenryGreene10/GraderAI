@@ -1012,11 +1012,318 @@ def _pick_answer_box(
     return _expand_and_clip(fallback, pad_x=0.0, pad_y=0.0, page_w=page_w, page_h=page_h), "", []
 
 
+def _rect_center_in(rect: Tuple[float, float, float, float], box: Tuple[float, float, float, float]) -> bool:
+    x, y, w, h = rect
+    bx, by, bw, bh = box
+    cx = x + (w / 2.0)
+    cy = y + (h / 2.0)
+    return bx <= cx <= (bx + bw) and by <= cy <= (by + bh)
+
+
+def _clip_box(
+    box: Tuple[float, float, float, float],
+    page_w: float,
+    page_h: float,
+) -> Optional[Tuple[float, float, float, float]]:
+    x, y, w, h = box
+    if w <= 0 or h <= 0:
+        return None
+    x0 = max(0.0, x)
+    y0 = max(0.0, y)
+    x1 = min(page_w, x + w)
+    y1 = min(page_h, y + h)
+    cw = x1 - x0
+    ch = y1 - y0
+    if cw <= 1.0 or ch <= 1.0:
+        return None
+    return (x0, y0, cw, ch)
+
+
+def _suppress_overlapping_boxes(
+    boxes: List[Tuple[float, float, float, float]],
+    *,
+    iou_threshold: float = 0.22,
+) -> Tuple[List[Tuple[float, float, float, float]], int]:
+    ordered = sorted(boxes, key=lambda r: (-(r[2] * r[3]), r[1], r[0]))
+    kept: List[Tuple[float, float, float, float]] = []
+    removed = 0
+    for box in ordered:
+        if any(_rect_iou(box, other) > iou_threshold for other in kept):
+            removed += 1
+            continue
+        kept.append(box)
+    kept.sort(key=lambda r: (r[1], r[0]))
+    return kept, removed
+
+
+def _best_anchor_for_box_row(
+    *,
+    box: Tuple[float, float, float, float],
+    row_tokens: List[_Token],
+    page_size: Tuple[float, float],
+) -> Tuple[Optional[_Anchor], List[_Anchor]]:
+    page_w, _page_h = page_size
+    if not row_tokens:
+        return None, []
+    h_by_page = _median_word_height_by_page(row_tokens)
+    candidates: List[_Anchor] = []
+    for tok in row_tokens:
+        cand = _candidate_from_token(tok, page_w)
+        if cand:
+            candidates.append(cand)
+    candidates.extend(_pair_q_tokens_with_number_tokens(row_tokens, h_by_page))
+    if not candidates:
+        return None, []
+    deduped = _dedupe_anchor_candidates(candidates, h_by_page)
+    parsed = [c for c in deduped if c.parsed_num is not None]
+    if not parsed:
+        return None, deduped
+    box_cy = box[1] + (box[3] / 2.0)
+    box_x = box[0]
+    parsed.sort(
+        key=lambda c: (
+            -int(c.confidence),
+            abs(c.center[1] - box_cy),
+            abs(c.center[0] - box_x),
+            c.y,
+            c.x,
+        )
+    )
+    return parsed[0], deduped
+
+
+def _extract_answer_text_in_box(
+    *,
+    box: Tuple[float, float, float, float],
+    page_tokens: List[_Token],
+) -> str:
+    hits = [tok for tok in page_tokens if _rect_center_in(tok.rect, box)]
+    if not hits:
+        return ""
+    hits.sort(key=lambda t: (t.line_index, t.x, t.word_index))
+    text = " ".join(tok.text for tok in hits if tok.text)
+    return normalize_answer_text(text)
+
+
+def _build_box_driven_regions(
+    *,
+    tokens: List[_Token],
+    page_sizes: Dict[int, Tuple[float, float]],
+    image_size: Tuple[int, int],
+    answer_box_hints: List[Tuple[float, float, float, float]],
+) -> Tuple[List[AnchorRegion], List[Dict[str, object]], Dict[str, object]]:
+    warnings: List[Dict[str, object]] = []
+    page_w = float((page_sizes.get(0) or (float(image_size[0]), float(image_size[1])))[0] or float(image_size[0]) or 0.0)
+    page_h = float((page_sizes.get(0) or (float(image_size[0]), float(image_size[1])))[1] or float(image_size[1]) or 0.0)
+
+    raw_boxes: List[Tuple[float, float, float, float]] = []
+    for item in answer_box_hints:
+        try:
+            box = (float(item[0]), float(item[1]), float(item[2]), float(item[3]))
+        except Exception:
+            continue
+        clipped = _clip_box(box, page_w, page_h)
+        if clipped:
+            raw_boxes.append(clipped)
+
+    if not raw_boxes:
+        raise ValueError("template_answer_boxes_missing")
+
+    boxes, overlap_removed = _suppress_overlapping_boxes(raw_boxes, iou_threshold=0.22)
+    if overlap_removed > 0:
+        warnings.append(
+            {
+                "code": "BOX_OVERLAP_AMBIGUOUS",
+                "removed_count": overlap_removed,
+                "message": "Detected overlapping answer boxes; review needed.",
+            }
+        )
+
+    page_tokens = [tok for tok in tokens if tok.page_index == 0]
+    explicit_seen = _extract_explicit_numbers_from_tokens(tokens)
+    explicit_max = max(explicit_seen) if explicit_seen else 0
+    if explicit_max > 0 and len(boxes) < explicit_max:
+        warnings.append(
+            {
+                "code": "BOX_COUNT_TOO_FEW",
+                "box_count": len(boxes),
+                "expected_at_least": explicit_max,
+                "message": "Detected answer-box count is below explicit OCR label count.",
+            }
+        )
+
+    candidate_entries: List[Dict[str, object]] = []
+    selected_entries: List[Dict[str, object]] = []
+    rejected_entries: List[Dict[str, object]] = []
+    unreadable_rows: List[int] = []
+    row_records: List[Dict[str, object]] = []
+
+    for row_index, box in enumerate(boxes, start=1):
+        bx, by, bw, bh = box
+        left_w = max(220.0, bw * 7.0)
+        right_gap = max(12.0, bw * 0.25)
+        vpad = max(24.0, bh * 1.7)
+        roi = _clip_box((bx - left_w, by - vpad, max(1.0, left_w - right_gap), bh + (2.0 * vpad)), page_w, page_h)
+        if roi is None:
+            roi = (0.0, max(0.0, by - vpad), max(1.0, bx - right_gap), bh + (2.0 * vpad))
+        row_tokens = [tok for tok in page_tokens if _rect_center_in(tok.rect, roi)]
+        best_anchor, row_candidates = _best_anchor_for_box_row(box=box, row_tokens=row_tokens, page_size=(page_w, page_h))
+
+        for cand in row_candidates:
+            candidate_entries.append(
+                {
+                    "text": cand.text,
+                    "bbox_px": _anchor_bbox_list(cand),
+                    "method": cand.label_method,
+                    "parsed_num": cand.parsed_num,
+                }
+            )
+
+        if best_anchor is None:
+            unreadable_rows.append(row_index)
+            for cand in row_candidates:
+                rejected_entries.append(
+                    {
+                        "text": cand.text,
+                        "bbox_px": _anchor_bbox_list(cand),
+                        "method": cand.label_method,
+                        "parsed_num": cand.parsed_num,
+                        "reason": f"unreadable_q_label_row_{row_index}",
+                    }
+                )
+        else:
+            selected_entries.append(
+                {
+                    "question_id": f"ROW{row_index}",
+                    "text": best_anchor.text,
+                    "bbox_px": _anchor_bbox_list(best_anchor),
+                    "method": best_anchor.label_method,
+                    "parsed_num": best_anchor.parsed_num,
+                }
+            )
+            for cand in row_candidates:
+                if _anchor_trace_key(cand) == _anchor_trace_key(best_anchor):
+                    continue
+                rejected_entries.append(
+                    {
+                        "text": cand.text,
+                        "bbox_px": _anchor_bbox_list(cand),
+                        "method": cand.label_method,
+                        "parsed_num": cand.parsed_num,
+                        "reason": f"not_best_for_row_{row_index}",
+                    }
+                )
+
+        row_records.append(
+            {
+                "row_index": row_index,
+                "box": box,
+                "anchor": best_anchor,
+            }
+        )
+
+    parsed_to_rows: Dict[int, List[int]] = {}
+    for row in row_records:
+        anchor = row.get("anchor")
+        if isinstance(anchor, _Anchor) and anchor.parsed_num is not None:
+            parsed_to_rows.setdefault(int(anchor.parsed_num), []).append(int(row["row_index"]))
+    duplicate_numbers = sorted(num for num, rows in parsed_to_rows.items() if len(rows) > 1)
+    if duplicate_numbers:
+        warnings.append(
+            {
+                "code": "BOX_DUPLICATE_Q_NUMBERS",
+                "numbers": duplicate_numbers,
+                "message": "Duplicate Q numbers detected across answer-box rows.",
+            }
+        )
+
+    if unreadable_rows:
+        warnings.append(
+            {
+                "code": "BOX_UNREADABLE_Q_LABEL_ROWS",
+                "rows": unreadable_rows,
+                "message": "Unreadable Q label in one or more answer-box rows.",
+            }
+        )
+
+    if len(boxes) <= 1 or (len(unreadable_rows) > max(1, len(boxes) // 3)):
+        warnings.append(
+            {
+                "code": "BOX_CONFIDENCE_LOW",
+                "box_count": len(boxes),
+                "unreadable_rows": len(unreadable_rows),
+                "message": "Answer-box detection confidence is low.",
+            }
+        )
+
+    used_numbers: set[int] = set()
+    regions: List[AnchorRegion] = []
+    for row in row_records:
+        row_index = int(row["row_index"])
+        box = row["box"]
+        anchor = row.get("anchor")
+        qid: str
+        label_method = "ocr_anchor_unreadable"
+        if isinstance(anchor, _Anchor) and anchor.parsed_num is not None and int(anchor.parsed_num) not in used_numbers:
+            used_numbers.add(int(anchor.parsed_num))
+            qid = f"Q{int(anchor.parsed_num)}"
+            label_method = anchor.label_method
+        else:
+            qid = f"QROW{row_index}"
+        bx, by, bw, bh = box
+        region_box = _expand_and_clip(
+            (max(0.0, bx - max(220.0, bw * 7.0)), max(0.0, by - max(24.0, bh * 1.7)), max(120.0, bw + max(220.0, bw * 7.0)), bh + (2.0 * max(24.0, bh * 1.7))),
+            pad_x=0.0,
+            pad_y=0.0,
+            page_w=page_w,
+            page_h=page_h,
+        )
+        expected_text = _extract_answer_text_in_box(box=box, page_tokens=page_tokens)
+        regions.append(
+            AnchorRegion(
+                qid=qid,
+                region=region_box,
+                answer_box=box,
+                expected_answer_text=expected_text,
+                label_method=label_method,
+                index=row_index,
+                page_index=0,
+            )
+        )
+
+    regions.sort(key=lambda r: (r.page_index, r.region[1], r.region[0], str(r.qid)))
+
+    missing_numbers = [n for n in range(1, len(boxes) + 1) if n not in used_numbers]
+    anchor_trace: Dict[str, object] = {
+        "candidates": candidate_entries,
+        "selected": selected_entries,
+        "rejected": rejected_entries,
+        "missing_numbers": missing_numbers,
+        "summary": {
+            "candidate_count": len(candidate_entries),
+            "selected_count": len(selected_entries),
+            "rejected_count": len(rejected_entries),
+            "missing_count": len(missing_numbers),
+        },
+    }
+    return regions, warnings, anchor_trace
+
+
 def build_anchor_template_regions(
     *,
     ocr_boxes: object,
     image_size: Tuple[int, int],
+    answer_box_hints: Optional[List[Tuple[float, float, float, float]]] = None,
 ) -> Tuple[List[AnchorRegion], List[Dict[str, object]], Dict[str, object]]:
+    if answer_box_hints:
+        tokens, page_sizes = _extract_tokens_and_page_sizes(ocr_boxes, image_size)
+        return _build_box_driven_regions(
+            tokens=tokens,
+            page_sizes=page_sizes,
+            image_size=image_size,
+            answer_box_hints=answer_box_hints,
+        )
+
     warnings: List[Dict[str, object]] = []
     tokens, page_sizes = _extract_tokens_and_page_sizes(ocr_boxes, image_size)
     anchors, detect_debug = _detect_anchors(tokens, page_sizes, include_debug=True)
