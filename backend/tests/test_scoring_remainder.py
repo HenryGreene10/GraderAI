@@ -33,6 +33,18 @@ def test_remainder_slash_variant():
     assert parse_quotient_remainder("161/03") == (161, 3)
 
 
+def test_remainder_single_number_implies_zero_remainder():
+    assert parse_quotient_remainder("78") == (78, 0)
+
+
+def test_remainder_division_expression_is_supported():
+    assert parse_quotient_remainder("5)588") == (117, 3)
+    status, score, _rationale, low_conf = score_quotient_remainder("5)588", "117 R3")
+    assert status == "correct"
+    assert score == 1.0
+    assert low_conf is False
+
+
 def test_remainder_ocr_digit_confusions():
     status, score, _rationale, low_conf = score_quotient_remainder("161 R3", "16l R O3")
     assert status == "correct"

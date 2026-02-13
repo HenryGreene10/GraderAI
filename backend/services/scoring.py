@@ -8,6 +8,7 @@ from .llm_grader import LLMAnswer
 
 RUBRIC_VERSION = "quotient-remainder-1"
 PROMPT_VERSION = "answer-extract-v1"
+_DIVISION_EXPR_RE = re.compile(r"^\s*(-?\d+)\s*\)\s*(-?\d+)\s*$")
 
 
 def _normalize_remainder_text(text: str) -> str:
@@ -32,7 +33,25 @@ def _normalize_remainder_text(text: str) -> str:
     return raw
 
 
+def _parse_division_expression(text: str) -> Optional[Tuple[int, int]]:
+    match = _DIVISION_EXPR_RE.fullmatch(str(text or "").strip())
+    if not match:
+        return None
+    try:
+        divisor = int(match.group(1))
+        dividend = int(match.group(2))
+    except Exception:
+        return None
+    if divisor == 0:
+        return None
+    quotient, remainder = divmod(dividend, divisor)
+    return int(quotient), int(remainder)
+
+
 def parse_quotient_remainder(text: str) -> Optional[Tuple[int, int]]:
+    division_expr = _parse_division_expression(text)
+    if division_expr is not None:
+        return division_expr
     normalized = _normalize_remainder_text(text)
     if not normalized:
         return None
@@ -48,7 +67,13 @@ def parse_quotient_remainder(text: str) -> Optional[Tuple[int, int]]:
         # Handle missing "R" when two numeric groups are present (e.g., "161 03" -> 161 R3).
         fallback = re.match(r"^(-?\d+)\s+0*([0-9]{1,2})$", normalized)
         if not fallback:
-            return None
+            single = re.match(r"^(-?\d+)$", normalized)
+            if not single:
+                return None
+            try:
+                return int(single.group(1)), 0
+            except Exception:
+                return None
         try:
             return int(fallback.group(1)), int(fallback.group(2))
         except Exception:
@@ -67,6 +92,14 @@ def score_quotient_remainder(expected_raw: str, observed_raw: str) -> Tuple[str,
     if expected_parsed == observed_parsed:
         return "correct", 1.0, "Exact quotient/remainder match", False
     return "incorrect", 0.0, "Quotient/remainder mismatch", False
+
+
+def canonicalize_quotient_remainder(text: str) -> str:
+    parsed = parse_quotient_remainder(text)
+    if parsed is None:
+        return str(text or "").strip()
+    quotient, remainder = parsed
+    return f"{quotient} R{remainder}"
 
 
 def _sorted_qids(qids: List[str]) -> List[str]:

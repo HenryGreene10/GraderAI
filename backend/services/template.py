@@ -279,16 +279,16 @@ def detect_answer_boxes(image_bytes: bytes) -> List[Tuple[float, float, float, f
 
     img_h, img_w = image.shape[:2]
     img_area = float(img_w * img_h)
-    min_w = max(24, int(round(img_w * 0.06)))
-    min_h = max(18, int(round(img_h * 0.04)))
+    min_w = max(20, int(round(img_w * 0.04)))
+    min_h = max(14, int(round(img_h * 0.022)))
     rects = _find_rects(
         thresh,
         img_area,
-        min_area_ratio=0.001,
-        max_area_ratio=0.12,
+        min_area_ratio=0.0005,
+        max_area_ratio=0.16,
         min_w=min_w,
         min_h=min_h,
-        aspect_range=(0.3, 6.0),
+        aspect_range=(0.25, 8.0),
     )
     if rects:
         return rects
@@ -298,11 +298,11 @@ def detect_answer_boxes(image_bytes: bytes) -> List[Tuple[float, float, float, f
     return _find_rects(
         edges,
         img_area,
-        min_area_ratio=0.0008,
-        max_area_ratio=0.15,
+        min_area_ratio=0.0004,
+        max_area_ratio=0.20,
         min_w=min_w,
         min_h=min_h,
-        aspect_range=(0.2, 7.0),
+        aspect_range=(0.2, 10.0),
     )
 
 

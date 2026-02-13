@@ -17,7 +17,7 @@ from ..services import ocr as ocr_service
 from ..services.ocr import normalize_ocr_result
 from ..services.llm_grader import grade_with_llm
 from ..services.answer_extraction import extract_answers_from_ocr
-from ..services.scoring import score_answer_maps
+from ..services.scoring import canonicalize_quotient_remainder, score_answer_maps
 from ..services.template_regions import (
     build_overlay_from_regions,
     extract_answers_from_regions,
@@ -109,18 +109,42 @@ def _filter_to_expected_qids(expected_qids: list[str], values: dict[str, str]) -
 
 def _template_mark_integrity_reasons(
     *,
-    expected_count: int,
+    expected_qids: list[str],
+    graded_qids: list[str],
     marks_placed: int | None,
     marks_skipped_missing: int | None,
     unplaced_items: list[str],
 ) -> list[str]:
     reasons: list[str] = []
+    expected = [str(qid) for qid in expected_qids]
+    graded = [str(qid) for qid in graded_qids]
+    expected_set = set(expected)
+    graded_set = set(graded)
+    duplicate_qids: list[str] = []
+    seen: set[str] = set()
+    for qid in graded:
+        if qid in seen and qid not in duplicate_qids:
+            duplicate_qids.append(qid)
+        seen.add(qid)
+    unknown_qids = sorted((graded_set - expected_set), key=_qid_sort_key)
+    missing_qids = sorted((expected_set - graded_set), key=_qid_sort_key)
+
     question_marks_count = int(marks_placed or 0) + int(marks_skipped_missing or 0)
-    if question_marks_count != int(expected_count):
-        reasons.append(f"manifest_mark_count_mismatch:{question_marks_count}!={int(expected_count)}")
+    if question_marks_count != len(graded):
+        reasons.append(f"graded_mark_count_mismatch:{question_marks_count}!={len(graded)}")
+    if len(graded) != len(expected):
+        reasons.append(f"manifest_item_count_mismatch:{len(graded)}!={len(expected)}")
+    if question_marks_count != len(expected):
+        reasons.append(f"manifest_mark_count_mismatch:{question_marks_count}!={len(expected)}")
     missing_count = int(marks_skipped_missing or 0)
     if missing_count > 0:
         reasons.append(f"manifest_missing_marks:{missing_count}")
+    if unknown_qids:
+        reasons.append(f"manifest_unknown_qids:{','.join(unknown_qids)}")
+    if missing_qids:
+        reasons.append(f"manifest_missing_qids:{','.join(missing_qids)}")
+    if duplicate_qids:
+        reasons.append(f"manifest_duplicate_qids:{','.join(duplicate_qids)}")
     if unplaced_items:
         reasons.append(f"manifest_unplaced_items:{len(unplaced_items)}")
     return reasons
@@ -357,7 +381,10 @@ async def get_student_answers(
     row = get_upload(
         upload_id,
         user_id,
-        columns="id,owner_id,ocr_status,ocr_error,ocr_text,ocr_boxes,ocr_confidence",
+        columns=(
+            "id,owner_id,assignment_id,ocr_status,ocr_error,ocr_text,ocr_boxes,ocr_confidence,"
+            "normalized_width_px,normalized_height_px"
+        ),
     )
     status = (row.get("ocr_status") or "").strip().lower()
     if status != "done":
@@ -365,6 +392,52 @@ async def get_student_answers(
     ocr_text = str(row.get("ocr_text") or "").strip()
     if not ocr_text:
         raise HTTPException(status_code=400, detail="ocr_text_missing")
+
+    assignment_id = str(row.get("assignment_id") or "").strip()
+    if assignment_id:
+        try:
+            assignment = get_assignment(
+                assignment_id,
+                user_id,
+                columns="id,owner_id,template_regions_json,template_version",
+            )
+        except HTTPException:
+            assignment = None
+        if assignment:
+            regions_payload = assignment.get("template_regions_json") or {}
+            regions_map, _ = parse_regions_payload(regions_payload)
+            if regions_map:
+                expected_qids = sorted(list(regions_map.keys()), key=_qid_sort_key)
+                fallback_size: Optional[Tuple[float, float]] = None
+                try:
+                    nw = float(row.get("normalized_width_px") or 0.0)
+                    nh = float(row.get("normalized_height_px") or 0.0)
+                    if nw > 0 and nh > 0:
+                        fallback_size = (nw, nh)
+                except Exception:
+                    fallback_size = None
+                region_answers, missing_qids = extract_answers_from_regions(
+                    row.get("ocr_boxes"),
+                    regions_payload,
+                    fallback_size=fallback_size,
+                )
+                answers = _filter_to_expected_qids(expected_qids, region_answers)
+                response = {
+                    "answers": answers,
+                    "prompt_version": "template-regions-v1",
+                }
+                if include_metadata:
+                    response["metadata"] = {
+                        "source": "template_regions",
+                        "assignment_id": assignment_id,
+                        "template_version": assignment.get("template_version"),
+                        "expected_qids": expected_qids,
+                        "missing_qids": [qid for qid in expected_qids if qid in set(missing_qids)],
+                        "ocr_text": ocr_text,
+                        "ocr_boxes": row.get("ocr_boxes"),
+                        "ocr_confidence": row.get("ocr_confidence"),
+                    }
+                return response
 
     answers, prompt_version = await extract_answers_from_ocr(ocr_text, role="student")
     response = {
@@ -472,6 +545,7 @@ async def run_grade_pipeline(
             raise HTTPException(status_code=400, detail="Missing storage_path")
 
         assignment = None
+        assignment_lookup_error = None
         template_regions = None
         template_storage_path = None
         template_version = None
@@ -487,12 +561,25 @@ async def run_grade_pipeline(
                     row["assignment_id"],
                     user_id,
                     columns=(
-                        "id,template_storage_path,template_regions_json,template_version,"
+                        "id,owner_id,template_storage_path,template_regions_json,template_version,"
                         "template_width_px,template_height_px"
                     ),
                 )
-            except HTTPException:
+            except HTTPException as exc:
+                assignment_lookup_error = str(exc.detail or "assignment_lookup_failed")
                 assignment = None
+        if row.get("assignment_id") and assignment is None:
+            reason = assignment_lookup_error or "assignment_lookup_failed"
+            update_upload(
+                row["id"],
+                {
+                    "status": "error",
+                    "needs_review": True,
+                    "ocr_error": f"assignment_lookup_failed: {reason}",
+                    "updated_at": _utc_iso(),
+                },
+            )
+            raise HTTPException(status_code=409, detail=f"assignment_lookup_failed: {reason}")
         if assignment:
             template_regions = assignment.get("template_regions_json") or []
             template_storage_path = assignment.get("template_storage_path")
@@ -653,14 +740,14 @@ async def run_grade_pipeline(
             key_answers: dict[str, str]
             if template_manifest:
                 key_answers = {
-                    q.question_id: str(q.expected_answer_text or "").strip()
+                    q.question_id: canonicalize_quotient_remainder(str(q.expected_answer_text or "").strip())
                     for q in template_manifest.questions
                 }
             else:
                 key_answers = {}
                 for qid in expected_qids:
                     entry = regions_map.get(qid) or {}
-                    key_answers[qid] = str(entry.get("expected_answer_text") or "").strip()
+                    key_answers[qid] = canonicalize_quotient_remainder(str(entry.get("expected_answer_text") or "").strip())
             filtered_students = _filter_to_expected_qids(expected_qids, student_answers)
             missing = sorted({qid for qid in expected_qids if qid in missing_qids}, key=_qid_sort_key)
             grade_result, answers, answer_rows = score_answer_maps(key_answers, filtered_students)
@@ -717,9 +804,10 @@ async def run_grade_pipeline(
                 page_sizes_pt=page_sizes,
             )
             if template_manifest:
-                expected_count = int(template_manifest.question_count or len(expected_qids))
+                graded_qids = [str(item.question_id) for item in grade_result.items]
                 integrity_reasons = _template_mark_integrity_reasons(
-                    expected_count=expected_count,
+                    expected_qids=expected_qids,
+                    graded_qids=graded_qids,
                     marks_placed=marks_placed,
                     marks_skipped_missing=marks_skipped_missing,
                     unplaced_items=unplaced_items,
