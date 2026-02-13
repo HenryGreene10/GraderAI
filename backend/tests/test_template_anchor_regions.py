@@ -406,6 +406,83 @@ def test_anchor_mode_ignores_trailing_dot_label_like_answer_text():
     assert text.strip() != "8."
 
 
+def test_anchor_mode_fallback_does_not_steal_footer_k5_text():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1224,
+                    "height": 1584,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q7.", 105, 1041, 50, 56), _word("17", 530, 1035, 35, 52), _word("R3", 566, 1035, 33, 52)]),
+                        _line([_word("Q8.", 415, 1051, 51, 40)]),
+                        _line([_word("K-5", 350, 1417, 57, 42)]),
+                    ],
+                }
+            ]
+        }
+    }
+
+    regions, _warnings, _anchor_trace = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1224, 1584))
+    by_qid = {r.qid: r for r in regions}
+    q8 = by_qid.get("Q8")
+    assert q8 is not None
+    assert str(q8.expected_answer_text or "").upper() != "K-5"
+    # Q8 answer box should stay near the question row, not drift to footer text.
+    assert float(q8.answer_box[1]) < 1250.0
+
+
+def test_anchor_mode_left_column_can_reach_far_right_answer_span():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1224,
+                    "height": 1584,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q7.", 105, 1041, 45, 59), _word("17", 530, 1035, 35, 52), _word("R3", 566, 1035, 33, 52)]),
+                    ],
+                }
+            ]
+        }
+    }
+    regions, _warnings, _trace = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1224, 1584))
+    assert len(regions) == 1
+    assert regions[0].qid == "Q7"
+    assert "17" in str(regions[0].expected_answer_text or "")
+    # Ensure this is a detected answer span, not a tiny fallback box near the label.
+    assert float(regions[0].answer_box[0]) > 300.0
+
+
+def test_anchor_mode_fallback_box_is_bounded_when_answer_missing():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1224,
+                    "height": 1584,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q7.", 105, 1041, 45, 59)]),
+                    ],
+                }
+            ]
+        }
+    }
+    regions, _warnings, _trace = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1224, 1584))
+    assert len(regions) == 1
+    # Missing-answer fallback should remain compact/stable for overlay anchoring.
+    assert float(regions[0].answer_box[3]) < 72.0
+
+
 def test_box_driven_mode_uses_box_count_as_question_count():
     lines = []
     for idx in range(2, 10):

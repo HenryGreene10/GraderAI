@@ -49,6 +49,8 @@ def _parse_division_expression(text: str) -> Optional[Tuple[int, int]]:
 
 
 def parse_quotient_remainder(text: str) -> Optional[Tuple[int, int]]:
+    original = str(text or "")
+    had_alpha = bool(re.search(r"[A-Za-z]", original))
     division_expr = _parse_division_expression(text)
     if division_expr is not None:
         return division_expr
@@ -69,6 +71,9 @@ def parse_quotient_remainder(text: str) -> Optional[Tuple[int, int]]:
         if not fallback:
             single = re.match(r"^(-?\d+)$", normalized)
             if not single:
+                return None
+            # Prevent non-answer alpha strings like "K-5" from becoming numeric answers.
+            if had_alpha:
                 return None
             try:
                 return int(single.group(1)), 0

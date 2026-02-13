@@ -180,6 +180,8 @@ Current diagnostic/cleanup titles (this pass):
 • D-15: Make template approval state explicit in UI and upload gates (student uploads blocked until `manifest_locked`; add controlled manual-approve endpoint for test unblocking).
 • D-16: Make master-key approval blockers severity-aware (soften `ANCHOR_AMBIGUITY_HIGH`, `BOX_MODE_FALLBACK_APPLIED`, `EXPECTED_TEXT_QUALITY_LOW` when coverage is strong).
 • D-17: Reduce false `needs_review` in quotient/remainder grading (single-integer => `R0`, parse `d)D` division expressions, canonicalize key answers, and strengthen region answer ranking against cross-region bleed).
+• D-18: Prevent anchor fallback row drift into footer/adjacent handwriting (enforce anchor-row geometry on selected answer boxes and reject weak fallback text outside band).
+• D-19: Stabilize left-column anchor reach + fallback box size (allow farther-right same-row answer spans; cap missing-answer fallback bbox to avoid oversized/drifting overlay marks).
 
 ## Acceptance Criteria (Phase A)
 • Clean PDFs grade correctly (near-perfect scores).  

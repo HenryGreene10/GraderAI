@@ -836,6 +836,10 @@ def _score_answer_text(text: str) -> int:
         return 0
     if _looks_like_division_expression_text(compact):
         return 0
+    # Reject mixed alpha-digit text unless it matches noisy remainder form (e.g., "23RO").
+    if re.search(r"[A-Za-z]", compact):
+        if not re.fullmatch(r"\d+\s*[Rr]\s*[0-9OoIl|]+", compact):
+            return 10
     if _ANSWER_REM_RE.match(compact):
         return 120
     if _ANSWER_NUMERIC_RE.match(compact):
@@ -1016,10 +1020,21 @@ def _pick_answer_box(
     ax, ay, aw, ah = anchor.rect
     anchor_cx, anchor_cy = anchor.center
     search_x0 = max(0.0, ax - max(30.0, page_w * 0.04))
-    search_x1 = min(page_w, ax + max(220.0, page_w * 0.34, aw * 6.0))
+    search_x1 = min(page_w, ax + max(240.0, page_w * 0.52, aw * 8.0))
     # Keep answer-span search close to the anchor row; large vertical windows caused cross-row steals.
     search_y0 = max(0.0, ay - max(34.0, ah * 1.2))
     search_y1 = min(page_h, ay + max(120.0, ah * 2.6))
+
+    def _within_anchor_band(rect: Tuple[float, float, float, float]) -> bool:
+        rx, ry, rw, rh = rect
+        cx = rx + (rw / 2.0)
+        cy = ry + (rh / 2.0)
+        dx = cx - anchor_cx
+        dy = abs(cy - anchor_cy)
+        dx_min = -max(10.0, ah * 0.35)
+        dx_max = max(260.0, page_w * 0.52, aw * 8.0)
+        dy_max = max(92.0, ah * 2.4)
+        return (dx_min <= dx <= dx_max) and (dy <= dy_max)
 
     nearby = []
     for tok in page_tokens:
@@ -1053,7 +1068,8 @@ def _pick_answer_box(
                     break
             if not pref_overlap:
                 if all(token_id not in reserved_token_keys for token_id in pref_token_ids):
-                    return clipped_pref, normalize_answer_text(pref_text), list(pref_token_ids)
+                    if _within_anchor_band(clipped_pref):
+                        return clipped_pref, normalize_answer_text(pref_text), list(pref_token_ids)
 
     candidates: List[Tuple[float, float, float, Tuple[float, float, float, float], str, List[str]]] = []
 
@@ -1112,6 +1128,8 @@ def _pick_answer_box(
         )
         for _dx, _dy, _neg_score, rect, text, token_ids in candidates:
             clipped = _expand_and_clip(rect, pad_x=10.0, pad_y=8.0, page_w=page_w, page_h=page_h)
+            if not _within_anchor_band(clipped):
+                continue
             overlaps = False
             for page_idx, reserved_rect in reserved_answer_boxes:
                 if page_idx != anchor.page_index:
@@ -1127,23 +1145,27 @@ def _pick_answer_box(
     if fallback_pool:
         fallback_pool = [t for t in fallback_pool if _token_key(t) not in reserved_token_keys]
     if fallback_pool:
+        fallback_pool = [t for t in fallback_pool if _within_anchor_band(t.rect)]
         scored_pool = [
             (max(0, _score_answer_text(t.text)), _distance_sq(t.center, anchor.center), t)
             for t in fallback_pool
         ]
         strong = [item for item in scored_pool if item[0] >= _MIN_ANSWER_TEXT_SCORE]
-        use_pool = strong or scored_pool
-        use_pool.sort(key=lambda item: (-item[0], item[1], item[2].y, item[2].x))
-        tok = use_pool[0][2]
-        rect = _expand_and_clip(tok.rect, pad_x=10.0, pad_y=8.0, page_w=page_w, page_h=page_h)
-        return rect, normalize_answer_text(tok.text), [_token_key(tok)]
+        if strong:
+            strong.sort(key=lambda item: (-item[0], item[1], item[2].y, item[2].x))
+            tok = strong[0][2]
+            rect = _expand_and_clip(tok.rect, pad_x=10.0, pad_y=8.0, page_w=page_w, page_h=page_h)
+            if _within_anchor_band(rect):
+                return rect, normalize_answer_text(tok.text), [_token_key(tok)]
 
     rx, ry, rw, rh = region_box
+    fallback_w = max(24.0, min(max(42.0, aw * 2.0), page_w * 0.16))
+    fallback_h = max(20.0, min(max(24.0, ah * 1.05), page_h * 0.07))
     fallback = (
         min(page_w - 1.0, max(0.0, ax + aw + 20.0)),
         min(page_h - 1.0, max(0.0, ay + max(6.0, ah * 0.2))),
-        max(24.0, min(rw * 0.22, page_w * 0.2)),
-        max(18.0, min(rh * 0.22, page_h * 0.12)),
+        fallback_w,
+        fallback_h,
     )
     return _expand_and_clip(fallback, pad_x=0.0, pad_y=0.0, page_w=page_w, page_h=page_h), "", []
 

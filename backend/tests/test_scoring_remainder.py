@@ -45,6 +45,10 @@ def test_remainder_division_expression_is_supported():
     assert low_conf is False
 
 
+def test_non_answer_alpha_numeric_label_is_not_parsed_as_number():
+    assert parse_quotient_remainder("K-5") is None
+
+
 def test_remainder_ocr_digit_confusions():
     status, score, _rationale, low_conf = score_quotient_remainder("161 R3", "16l R O3")
     assert status == "correct"
