@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -26,6 +27,26 @@ from .template import detect_answer_boxes
 logger = logging.getLogger(__name__)
 
 TEMPLATE_MIN_LONG_EDGE = 1200
+_Q_LABELISH_RE = re.compile(r"^\s*[\(\[]?\s*Q\s*\d{0,2}\s*[\)\].,:;]?\s*$", re.I)
+_DIV_EXPR_RE = re.compile(r"^\s*\d+\)\d+\s*$")
+_ONLY_PUNCT_RE = re.compile(r"^\s*[\W_]+\s*$")
+_BLOCKING_WARNING_CODES = {
+    "BOX_COUNT_TOO_FEW",
+    "BOX_COUNT_TOO_MANY",
+    "BOX_OVERLAP_AMBIGUOUS",
+    "BOX_CONFIDENCE_LOW",
+    "BOX_DUPLICATE_Q_NUMBERS",
+    "BOX_MISSING_Q_NUMBERS",
+    "BOX_ROW_FALLBACK_QIDS",
+    "BOX_UNREADABLE_Q_LABEL_ROWS",
+    "BOX_MODE_FALLBACK_APPLIED",
+    "ANCHOR_AMBIGUITY_HIGH",
+    "ANCHOR_HARD_GATE_RELAXED",
+    "ANCHOR_DUPLICATE_ANSWER_BOXES",
+    "ANCHOR_EXPLICIT_MISSING_FROM_MANIFEST",
+    "ANCHOR_COVERAGE_BELOW_THRESHOLD",
+    "EXPECTED_TEXT_QUALITY_LOW",
+}
 
 
 @dataclass
@@ -46,6 +67,50 @@ class MasterKeyApprovalResult:
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _is_low_quality_expected_text(text: str) -> bool:
+    s = str(text or "").strip()
+    if not s:
+        return True
+    if _ONLY_PUNCT_RE.match(s):
+        return True
+    if _Q_LABELISH_RE.match(s):
+        return True
+    if _DIV_EXPR_RE.match(s):
+        return True
+    return False
+
+
+def _append_expected_text_quality_warning(
+    template_regions_payload: dict[str, object],
+    warnings: list[dict[str, object]],
+) -> None:
+    regions = template_regions_payload.get("regions") if isinstance(template_regions_payload, dict) else None
+    if not isinstance(regions, list):
+        return
+    bad_qids: list[str] = []
+    for item in regions:
+        if not isinstance(item, dict):
+            continue
+        qid = str(item.get("qid") or "").strip()
+        expected = str(item.get("expected_answer_text") or "")
+        if qid and _is_low_quality_expected_text(expected):
+            bad_qids.append(qid)
+    if not bad_qids:
+        return
+    warnings.append(
+        {
+            "code": "EXPECTED_TEXT_QUALITY_LOW",
+            "count": len(bad_qids),
+            "qids": bad_qids,
+            "message": "One or more expected answer texts look invalid (empty, label-like, punctuation, or division-expression).",
+        }
+    )
+
+
+def _blocking_reasons_from_warning_codes(warning_codes: set[str]) -> list[str]:
+    return sorted(code for code in warning_codes if code in _BLOCKING_WARNING_CODES)
 
 
 def _normalize_template_image(payload: bytes) -> tuple[bytes, int, int]:
@@ -162,22 +227,13 @@ async def run_master_key_approval_pipeline(
     template_upload_id = str(uuid4())
     template_uploaded_at = _utc_iso()
     template_regions_raw = build_template_regions_payload(regions, (template_w, template_h))
+    _append_expected_text_quality_warning(template_regions_raw, warnings)
     warning_codes = {
         str(item.get("code"))
         for item in (warnings or [])
         if isinstance(item, dict) and item.get("code")
     }
-    blocking_codes = {
-        "BOX_COUNT_TOO_FEW",
-        "BOX_OVERLAP_AMBIGUOUS",
-        "BOX_CONFIDENCE_LOW",
-        "BOX_DUPLICATE_Q_NUMBERS",
-        "BOX_UNREADABLE_Q_LABEL_ROWS",
-        "ANCHOR_DUPLICATE_ANSWER_BOXES",
-        "ANCHOR_EXPLICIT_MISSING_FROM_MANIFEST",
-        "ANCHOR_COVERAGE_BELOW_THRESHOLD",
-    }
-    blocking_hits = sorted(code for code in warning_codes if code in blocking_codes)
+    blocking_hits = _blocking_reasons_from_warning_codes(warning_codes)
     approval_blocked = bool(blocking_hits)
     if approval_blocked:
         manifest = manifest_from_template_regions(
@@ -209,6 +265,8 @@ async def run_master_key_approval_pipeline(
         except Exception as exc:
             logger.warning("template_anchor_overlay_failed assignment_id=%s error=%s", assignment_id, exc)
         template_regions["anchor_trace"] = anchor_trace
+    if warnings:
+        template_regions["warnings"] = [w for w in warnings if isinstance(w, dict)]
 
     anchor_ambiguity_high = "ANCHOR_AMBIGUITY_HIGH" in warning_codes
     needs_review_for_template = anchor_ambiguity_high or approval_blocked

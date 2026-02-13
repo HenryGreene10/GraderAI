@@ -381,7 +381,10 @@ async def get_student_answers(
     row = get_upload(
         upload_id,
         user_id,
-        columns="id,owner_id,ocr_status,ocr_error,ocr_text,ocr_boxes,ocr_confidence",
+        columns=(
+            "id,owner_id,assignment_id,ocr_status,ocr_error,ocr_text,ocr_boxes,ocr_confidence,"
+            "normalized_width_px,normalized_height_px"
+        ),
     )
     status = (row.get("ocr_status") or "").strip().lower()
     if status != "done":
@@ -389,6 +392,52 @@ async def get_student_answers(
     ocr_text = str(row.get("ocr_text") or "").strip()
     if not ocr_text:
         raise HTTPException(status_code=400, detail="ocr_text_missing")
+
+    assignment_id = str(row.get("assignment_id") or "").strip()
+    if assignment_id:
+        try:
+            assignment = get_assignment(
+                assignment_id,
+                user_id,
+                columns="id,owner_id,template_regions_json,template_version",
+            )
+        except HTTPException:
+            assignment = None
+        if assignment:
+            regions_payload = assignment.get("template_regions_json") or {}
+            regions_map, _ = parse_regions_payload(regions_payload)
+            if regions_map:
+                expected_qids = sorted(list(regions_map.keys()), key=_qid_sort_key)
+                fallback_size: Optional[Tuple[float, float]] = None
+                try:
+                    nw = float(row.get("normalized_width_px") or 0.0)
+                    nh = float(row.get("normalized_height_px") or 0.0)
+                    if nw > 0 and nh > 0:
+                        fallback_size = (nw, nh)
+                except Exception:
+                    fallback_size = None
+                region_answers, missing_qids = extract_answers_from_regions(
+                    row.get("ocr_boxes"),
+                    regions_payload,
+                    fallback_size=fallback_size,
+                )
+                answers = _filter_to_expected_qids(expected_qids, region_answers)
+                response = {
+                    "answers": answers,
+                    "prompt_version": "template-regions-v1",
+                }
+                if include_metadata:
+                    response["metadata"] = {
+                        "source": "template_regions",
+                        "assignment_id": assignment_id,
+                        "template_version": assignment.get("template_version"),
+                        "expected_qids": expected_qids,
+                        "missing_qids": [qid for qid in expected_qids if qid in set(missing_qids)],
+                        "ocr_text": ocr_text,
+                        "ocr_boxes": row.get("ocr_boxes"),
+                        "ocr_confidence": row.get("ocr_confidence"),
+                    }
+                return response
 
     answers, prompt_version = await extract_answers_from_ocr(ocr_text, role="student")
     response = {
@@ -496,6 +545,7 @@ async def run_grade_pipeline(
             raise HTTPException(status_code=400, detail="Missing storage_path")
 
         assignment = None
+        assignment_lookup_error = None
         template_regions = None
         template_storage_path = None
         template_version = None
@@ -511,12 +561,25 @@ async def run_grade_pipeline(
                     row["assignment_id"],
                     user_id,
                     columns=(
-                        "id,template_storage_path,template_regions_json,template_version,"
+                        "id,owner_id,template_storage_path,template_regions_json,template_version,"
                         "template_width_px,template_height_px"
                     ),
                 )
-            except HTTPException:
+            except HTTPException as exc:
+                assignment_lookup_error = str(exc.detail or "assignment_lookup_failed")
                 assignment = None
+        if row.get("assignment_id") and assignment is None:
+            reason = assignment_lookup_error or "assignment_lookup_failed"
+            update_upload(
+                row["id"],
+                {
+                    "status": "error",
+                    "needs_review": True,
+                    "ocr_error": f"assignment_lookup_failed: {reason}",
+                    "updated_at": _utc_iso(),
+                },
+            )
+            raise HTTPException(status_code=409, detail=f"assignment_lookup_failed: {reason}")
         if assignment:
             template_regions = assignment.get("template_regions_json") or []
             template_storage_path = assignment.get("template_storage_path")

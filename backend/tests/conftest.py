@@ -115,7 +115,10 @@ class FakeTable:
 
             aid = self._where.get("id")
             if aid:
-                return _Resp(self.db["assignments"].get(aid))
+                row = self.db["assignments"].get(aid)
+                if self._op == "update" and row is not None:
+                    row.update(self._payload or {})
+                return _Resp(row)
 
             rows = []
             for row in self.db["assignments"].values():

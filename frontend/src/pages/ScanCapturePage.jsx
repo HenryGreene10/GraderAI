@@ -424,7 +424,17 @@ export default function ScanCapturePage() {
         throw new Error(`Status ${resp.status}: ${detail}`);
       }
       setStatus("complete");
-      setMessage("Master key saved ✅ You can close this tab.");
+      if (data?.approval_blocked) {
+        const warning = data?.approval_warning || "Master key needs review before approval.";
+        setMessage(warning);
+        toast({
+          variant: "destructive",
+          title: "Master key uploaded but blocked",
+          description: warning,
+        });
+      } else {
+        setMessage("Master key approved. You can close this tab.");
+      }
     } catch (err) {
       toast({
         variant: "destructive",
@@ -544,7 +554,11 @@ export default function ScanCapturePage() {
             </div>
           )}
 
-          {message && <div className="text-sm text-slate-700">{message}</div>}
+          {message && (
+            <div className={`text-sm ${message.toLowerCase().includes("review") ? "text-red-600" : "text-slate-700"}`}>
+              {message}
+            </div>
+          )}
         </div>
 
         {mode === "student" && (

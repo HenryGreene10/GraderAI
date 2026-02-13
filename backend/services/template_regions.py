@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..models.schemas import Overlay, OverlayMark, GradeResult
 from .coords import px_to_pdf
+from .template import normalize_answer_text
+
+
+_ANSWER_REM_RE = re.compile(r"^\d+\s*[Rr]\s*\d+$")
+_ANSWER_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?(?:/\d+)?$")
+_ANSWER_ANY_DIGIT_RE = re.compile(r"\d")
+_DIVISION_EXPRESSION_RE = re.compile(r"^\d+\)\d+$")
+_Q_LABEL_RE = re.compile(r"^[\(\[]?\s*Q\s*\d{0,2}\s*[\)\].,:;]?$", re.I)
+_MIN_ANSWER_SCORE = 45
 
 
 def build_template_regions_payload(
@@ -131,20 +141,18 @@ def extract_answers_from_regions(
             missing.append(qid)
             answers[qid] = ""
             continue
-        x0, y0, x1, y1 = rect
         page_words = [w for w in words if w["page_index"] == page_index]
-        hits = []
-        for w in page_words:
-            cx = (w["rect"][0] + w["rect"][2]) / 2.0
-            cy = (w["rect"][1] + w["rect"][3]) / 2.0
-            if x0 <= cx <= x1 and y0 <= cy <= y1:
-                hits.append(w)
-        hits.sort(key=lambda w: (w["rect"][1], w["rect"][0]))
-        if not hits:
+        text, score = _best_text_for_rect(page_words, rect)
+        region_rect = _entry_region_box_to_px(entry, size)
+        if region_rect:
+            fallback_text, fallback_score = _best_text_for_rect(page_words, region_rect)
+            if fallback_score > score:
+                text, score = fallback_text, fallback_score
+        if score < _MIN_ANSWER_SCORE or not text:
             missing.append(qid)
             answers[qid] = ""
             continue
-        answers[qid] = " ".join(w["text"] for w in hits if w["text"])
+        answers[qid] = text
     return answers, missing
 
 
@@ -295,6 +303,31 @@ def _entry_bbox_to_px(
     return x, y, x + w, y + h
 
 
+def _entry_region_box_to_px(
+    entry: Dict[str, Any],
+    size: Tuple[float, float],
+) -> Optional[Tuple[float, float, float, float]]:
+    region_box = entry.get("region_box_px")
+    if isinstance(region_box, (list, tuple)) and len(region_box) >= 4:
+        x, y, w, h = region_box[0], region_box[1], region_box[2], region_box[3]
+    else:
+        return None
+    try:
+        x = float(x or 0.0)
+        y = float(y or 0.0)
+        w = float(w or 0.0)
+        h = float(h or 0.0)
+    except Exception:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    max_val = max(x, y, w, h)
+    if max_val <= 1.5:
+        sx, sy = size
+        return x * sx, y * sy, (x + w) * sx, (y + h) * sy
+    return x, y, x + w, y + h
+
+
 def _rect_from_bbox(bbox: Iterable[float]) -> Optional[Tuple[float, float, float, float]]:
     vals = list(bbox)
     if len(vals) < 8:
@@ -325,8 +358,8 @@ def _extract_word_boxes(ocr_boxes: object) -> List[Dict[str, Any]]:
     read_results = analyze.get("readResults") or []
     words: List[Dict[str, Any]] = []
     for page_index, page in enumerate(read_results):
-        for line in page.get("lines") or []:
-            for word in line.get("words") or []:
+        for line_index, line in enumerate(page.get("lines") or []):
+            for word_index, word in enumerate(line.get("words") or []):
                 text = str(word.get("text") or "").strip()
                 bbox = word.get("boundingBox") or []
                 rect = _rect_from_bbox(bbox)
@@ -337,6 +370,83 @@ def _extract_word_boxes(ocr_boxes: object) -> List[Dict[str, Any]]:
                         "text": text,
                         "rect": rect,
                         "page_index": page_index,
+                        "line_index": line_index,
+                        "word_index": word_index,
                     }
                 )
     return words
+
+
+def _rect_center_in(rect: Tuple[float, float, float, float], region: Tuple[float, float, float, float]) -> bool:
+    x0, y0, x1, y1 = rect
+    rx0, ry0, rx1, ry1 = region
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    return rx0 <= cx <= rx1 and ry0 <= cy <= ry1
+
+
+def _candidate_score(text: str) -> int:
+    normalized = normalize_answer_text(text)
+    compact = re.sub(r"\s+", " ", str(normalized or "").strip())
+    if not compact:
+        return 0
+    if _Q_LABEL_RE.fullmatch(compact):
+        return 0
+    tokens = compact.split(" ")
+    base = 0
+    if _ANSWER_REM_RE.fullmatch(compact):
+        base = 140
+    elif _ANSWER_NUMERIC_RE.fullmatch(compact):
+        base = 100
+    elif _ANSWER_ANY_DIGIT_RE.search(compact):
+        base = 60
+    if any(_DIVISION_EXPRESSION_RE.fullmatch(tok) for tok in tokens):
+        base -= 40
+    if len(tokens) > 3:
+        base -= 10
+    return max(0, base)
+
+
+def _best_text_for_rect(
+    page_words: List[Dict[str, Any]],
+    rect: Tuple[float, float, float, float],
+) -> Tuple[str, int]:
+    hits = [w for w in page_words if _rect_center_in(w["rect"], rect)]
+    if not hits:
+        return "", 0
+    hits.sort(key=lambda w: (int(w.get("line_index") or 0), w["rect"][0], int(w.get("word_index") or 0)))
+    candidates: List[Tuple[int, int, str]] = []
+    for w in hits:
+        text = str(w.get("text") or "").strip()
+        if not text:
+            continue
+        score = _candidate_score(text)
+        candidates.append((score, 1, normalize_answer_text(text)))
+
+    by_line: Dict[int, List[Dict[str, Any]]] = {}
+    for w in hits:
+        by_line.setdefault(int(w.get("line_index") or 0), []).append(w)
+    for line_words in by_line.values():
+        ordered = sorted(line_words, key=lambda w: (w["rect"][0], int(w.get("word_index") or 0)))
+        n = len(ordered)
+        for i in range(n):
+            for span_len in (2, 3):
+                j = i + span_len
+                if j > n:
+                    continue
+                chunk = ordered[i:j]
+                joined = " ".join(str(w.get("text") or "").strip() for w in chunk).strip()
+                if not joined:
+                    continue
+                score = _candidate_score(joined)
+                candidates.append((score, span_len, normalize_answer_text(joined)))
+
+    joined_all = " ".join(str(w.get("text") or "").strip() for w in hits).strip()
+    if joined_all:
+        candidates.append((_candidate_score(joined_all), max(1, len(joined_all.split())), normalize_answer_text(joined_all)))
+
+    if not candidates:
+        return "", 0
+    candidates.sort(key=lambda item: (item[0], -item[1], len(item[2])), reverse=True)
+    best_score, _span_len, best_text = candidates[0]
+    return best_text, int(best_score)

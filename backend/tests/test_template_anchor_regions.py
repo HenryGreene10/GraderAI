@@ -286,12 +286,133 @@ def test_targeted_recovery_prefers_expected_row_for_missing_q1():
     assert float((q1.get("bbox_px") or [0, 0, 0, 0])[1]) >= 180.0
 
 
+def test_anchor_mode_expected_answers_do_not_use_q_labels():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1200,
+                    "height": 1600,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q1.", 92, 220, 70, 30), _word("23R0", 470, 222, 90, 30)]),
+                        _line(
+                            [
+                                _word("Q2.", 92, 360, 70, 30),
+                                _word("71", 470, 362, 40, 30),
+                                _word("R7", 520, 362, 40, 30),
+                                _word("Q3.", 700, 360, 70, 30),
+                            ]
+                        ),
+                        _line([_word("Q3.", 92, 500, 70, 30), _word("78", 470, 502, 46, 30), _word("R1", 526, 502, 40, 30)]),
+                    ],
+                }
+            ]
+        }
+    }
+    regions, _warnings, _anchor_trace = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1200, 1600))
+    expected_by_qid = {r.qid: str(r.expected_answer_text or "") for r in regions}
+    assert expected_by_qid.get("Q2") in {"71 R7", "71R7"}
+    assert not str(expected_by_qid.get("Q2") or "").upper().startswith("Q")
+    assert all(str(text or "").strip() not in {"", ".", "Q"} for text in expected_by_qid.values())
+
+
+def test_anchor_mode_does_not_steal_answer_from_later_row():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1224,
+                    "height": 1584,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q1.", 110, 443, 52, 34), _word("23RO", 218, 447, 68, 32)]),
+                        _line([_word("Q2.", 421, 439, 45, 38), _word("171R7", 521, 448, 68, 30)]),
+                        _line([_word("Q3.", 721, 440, 44, 42), _word("78", 829, 440, 34, 30), _word("R1", 869, 439, 28, 30)]),
+                        _line([_word("Q4.", 114, 752, 52, 36), _word("161", 210, 746, 34, 34), _word("R3", 253, 743, 36, 34)]),
+                    ],
+                }
+            ]
+        }
+    }
+    regions, _warnings, _anchor_trace = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1224, 1584))
+    expected_by_qid = {r.qid: str(r.expected_answer_text or "") for r in regions}
+    q1_text = str(expected_by_qid.get("Q1") or "")
+    assert "23" in q1_text
+    assert "161" not in q1_text
+
+
+def test_anchor_mode_assigns_unknown_q_anchor_to_next_number():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1224,
+                    "height": 1584,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q1.", 110, 443, 52, 34), _word("23R0", 218, 447, 68, 32)]),
+                        _line([_word("Q2.", 421, 439, 45, 38), _word("171R7", 521, 448, 68, 30)]),
+                        _line([_word("Q3.", 721, 440, 44, 42), _word("78", 829, 440, 34, 30), _word("R1", 869, 439, 28, 30)]),
+                        _line([_word("Q4.", 114, 752, 52, 36), _word("161", 210, 746, 34, 34), _word("R3", 253, 743, 36, 34)]),
+                        _line([_word("Q5.", 420, 744, 52, 36), _word("131", 511, 738, 48, 38), _word("R5", 563, 738, 36, 38)]),
+                        _line([_word("Q6.", 720, 745, 49, 34), _word("39", 819, 741, 35, 33), _word("R3", 860, 739, 35, 33)]),
+                        _line([_word("Q7.", 105, 1041, 45, 59), _word("17", 530, 1035, 35, 52), _word("R3", 566, 1035, 33, 52)]),
+                        _line([_word("Q8.", 415, 1051, 51, 40), _word("117", 610, 1038, 50, 48), _word("R3", 665, 1038, 34, 48)]),
+                        _line([_word("Q", 706, 1039, 28, 57), _word("127", 816, 1048, 44, 32), _word("R3", 868, 1046, 33, 32)]),
+                    ],
+                }
+            ]
+        }
+    }
+    regions, warnings, _anchor_trace = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1224, 1584))
+    expected_by_qid = {r.qid: str(r.expected_answer_text or "") for r in regions}
+    assert "Q9" in expected_by_qid
+    assert "127" in str(expected_by_qid.get("Q9") or "")
+    codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
+    assert "ANCHOR_UNKNOWN_NUMBER_FILL" in codes
+
+
+def test_anchor_mode_ignores_trailing_dot_label_like_answer_text():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1224,
+                    "height": 1584,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q7.", 105, 1041, 50, 56)]),
+                        _line([_word("8.", 430, 1046, 36, 48)]),
+                        _line([_word("17", 530, 1035, 35, 52), _word("R3", 566, 1035, 33, 52)]),
+                    ],
+                }
+            ]
+        }
+    }
+    regions, _warnings, _anchor_trace = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1224, 1584))
+    assert len(regions) == 1
+    text = str(regions[0].expected_answer_text or "")
+    assert "17" in text
+    assert "R3" in text
+    assert text.strip() != "8."
+
+
 def test_box_driven_mode_uses_box_count_as_question_count():
     lines = []
     for idx in range(2, 10):
         y = 220 + (idx - 2) * 120
         lines.append(_line([_word(f"Q{idx}.", 92, y, 70, 30)]))
         lines.append(_line([_word(str(10 + idx), 520, y + 2, 46, 30)]))
+    lines.append(_line([_word("99", 520, 1172, 46, 30)]))
     boxes = {
         "analyzeResult": {
             "readResults": [
@@ -324,6 +445,40 @@ def test_box_driven_mode_uses_box_count_as_question_count():
     assert isinstance(rows[0].get("roi_bbox_px"), list)
     codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
     assert "BOX_UNREADABLE_Q_LABEL_ROWS" in codes
+    assert "BOX_MISSING_Q_NUMBERS" in codes
+    assert "BOX_ROW_FALLBACK_QIDS" in codes
+
+
+def test_box_driven_mode_flags_box_count_too_many():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1000,
+                    "height": 1400,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q1.", 96, 220, 70, 30), _word("12", 480, 222, 46, 30)]),
+                        _line([_word("Q2.", 96, 360, 70, 30), _word("14", 480, 362, 46, 30)]),
+                    ],
+                }
+            ]
+        }
+    }
+    hints = [
+        (460.0, 210.0, 74.0, 38.0),
+        (460.0, 350.0, 74.0, 38.0),
+        (700.0, 210.0, 74.0, 38.0),
+    ]
+    _regions, warnings, _trace = build_anchor_template_regions(
+        ocr_boxes=boxes,
+        image_size=(1000, 1400),
+        answer_box_hints=hints,
+    )
+    codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
+    assert "BOX_COUNT_TOO_MANY" in codes
 
 
 def test_box_driven_mode_flags_duplicate_q_numbers():
@@ -355,6 +510,79 @@ def test_box_driven_mode_flags_duplicate_q_numbers():
     )
     codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
     assert "BOX_DUPLICATE_Q_NUMBERS" in codes
+
+
+def test_box_driven_mode_filters_q_label_and_division_boxes():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1200,
+                    "height": 1600,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q1.", 96, 220, 70, 30), _word("12", 480, 222, 46, 30)]),
+                        _line([_word("Q2.", 96, 360, 70, 30), _word("14", 480, 362, 46, 30)]),
+                        _line([_word("7)780", 180, 520, 120, 34)]),
+                    ],
+                }
+            ]
+        }
+    }
+    hints = [
+        (460.0, 210.0, 74.0, 38.0),  # answer box
+        (460.0, 350.0, 74.0, 38.0),  # answer box
+        (90.0, 210.0, 82.0, 40.0),   # q-label bubble/box false positive
+        (170.0, 510.0, 140.0, 44.0), # division expression false positive
+    ]
+    regions, warnings, anchor_trace = build_anchor_template_regions(
+        ocr_boxes=boxes,
+        image_size=(1200, 1600),
+        answer_box_hints=hints,
+    )
+    assert len(regions) == 2
+    codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
+    assert "BOX_CANDIDATES_FILTERED" in codes
+    filtered = anchor_trace.get("filtered") or []
+    assert len(filtered) >= 2
+
+
+def test_box_driven_mode_falls_back_to_anchor_mode_on_low_coverage():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1200,
+                    "height": 1600,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q1.", 96, 220, 70, 30), _word("12", 480, 222, 46, 30)]),
+                        _line([_word("Q2.", 96, 360, 70, 30), _word("14", 480, 362, 46, 30)]),
+                        _line([_word("Q3.", 96, 500, 70, 30), _word("16", 480, 502, 46, 30)]),
+                        _line([_word("Q4.", 96, 640, 70, 30), _word("18", 480, 642, 46, 30)]),
+                    ],
+                }
+            ]
+        }
+    }
+    hints = [
+        (460.0, 210.0, 74.0, 38.0),
+        (460.0, 350.0, 74.0, 38.0),
+    ]
+    regions, warnings, anchor_trace = build_anchor_template_regions(
+        ocr_boxes=boxes,
+        image_size=(1200, 1600),
+        answer_box_hints=hints,
+    )
+    qids = [r.qid for r in regions]
+    assert qids == ["Q1", "Q2", "Q3", "Q4"]
+    codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
+    assert "BOX_MODE_FALLBACK_APPLIED" in codes
+    assert isinstance(anchor_trace.get("box_mode_discarded"), dict)
 
 
 def test_box_driven_mode_reserves_anchor_token_across_rows():

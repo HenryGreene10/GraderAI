@@ -316,9 +316,13 @@ export default function AssignmentsPage() {
   const scanAutoOpenedRef = useRef(false);
   const lastScanResultRef = useRef(null);
 
-  const masterKeyReady = SCAN_REQUIRED
-    ? Boolean(assignment?.template_storage_path)
-    : Boolean(assignment?.template_storage_path && assignment?.template_regions_count);
+  const templateManifestLocked = Boolean(assignment?.template_manifest_locked);
+  const templateApprovalBlocked = Boolean(assignment?.template_approval_blocked);
+  const templateApprovalReasons = Array.isArray(assignment?.template_approval_block_reasons)
+    ? assignment.template_approval_block_reasons.filter(Boolean)
+    : [];
+  const masterKeyReady = Boolean(assignment?.template_storage_path && templateManifestLocked);
+  const masterKeyBlocked = Boolean(assignment?.template_storage_path && (!templateManifestLocked || templateApprovalBlocked));
   const masterKeyFilename = assignment?.template_original_name
     || (assignment?.template_storage_path || "").split("/").pop()
     || "";
@@ -382,9 +386,21 @@ export default function AssignmentsPage() {
         if (scanSession.mode === "master_key") {
           if (status === "complete" && !scanCompleted) {
             setScanCompleted(true);
-            await loadAssignment();
+            const latestAssignment = await loadAssignment();
             await loadUploads({ silent: true });
-            toast({ title: "Master key saved" });
+            if (latestAssignment?.template_manifest_locked) {
+              toast({ title: "Master key approved" });
+            } else {
+              const reasons = Array.isArray(latestAssignment?.template_approval_block_reasons)
+                ? latestAssignment.template_approval_block_reasons.filter(Boolean)
+                : [];
+              const reasonText = reasons.length ? reasons.join(", ") : "review required";
+              toast({
+                variant: "destructive",
+                title: "Master key uploaded but blocked",
+                description: reasonText,
+              });
+            }
           }
           return;
         }
@@ -414,13 +430,16 @@ export default function AssignmentsPage() {
         throw new Error(text || `Failed: ${resp.status}`);
       }
       const data = await resp.json();
-      setAssignment(data.assignment || null);
+      const nextAssignment = data.assignment || null;
+      setAssignment(nextAssignment);
+      return nextAssignment;
     } catch (err) {
       toast({
         variant: "destructive",
         title: "Failed to load assignment",
         description: err?.message || "Try again.",
       });
+      return null;
     }
   }
 
@@ -555,9 +574,20 @@ export default function AssignmentsPage() {
     try {
       const { token } = await createScanSession("master_key");
       const imageFile = await normalizeDevMasterFile(file);
-      await uploadScanFile(token, imageFile);
-      await loadAssignment();
-      toast({ title: "DEV: Master key uploaded" });
+      const uploadResult = await uploadScanFile(token, imageFile);
+      const latestAssignment = await loadAssignment();
+      if (uploadResult?.approval_blocked || !latestAssignment?.template_manifest_locked) {
+        const reasons = Array.isArray(latestAssignment?.template_approval_block_reasons)
+          ? latestAssignment.template_approval_block_reasons.filter(Boolean)
+          : [];
+        toast({
+          variant: "destructive",
+          title: "DEV: master key blocked",
+          description: reasons.length ? reasons.join(", ") : "review required",
+        });
+      } else {
+        toast({ title: "DEV: master key approved" });
+      }
     } catch (err) {
       toast({
         variant: "destructive",
@@ -1178,11 +1208,19 @@ export default function AssignmentsPage() {
         {assignment?.template_storage_path ? (
           <div className="space-y-1 text-sm text-muted-foreground">
             <div className="flex flex-wrap items-center gap-2">
-              <Badge variant="secondary">Master Key ready</Badge>
+              <Badge variant={masterKeyReady ? "secondary" : "destructive"}>
+                {masterKeyReady ? "Master Key approved" : "Master Key blocked"}
+              </Badge>
               {assignment?.template_regions_count ? (
                 <span>{assignment.template_regions_count} questions detected</span>
               ) : null}
             </div>
+            {masterKeyBlocked && (
+              <div className="text-sm text-destructive">
+                Approval required before student grading.
+                {templateApprovalReasons.length ? ` ${templateApprovalReasons.join(", ")}` : ""}
+              </div>
+            )}
             {(masterKeyFilename || masterKeyUploadedAt) && (
               <div>
                 Last uploaded:{" "}
@@ -1228,7 +1266,9 @@ export default function AssignmentsPage() {
           <h2 className="text-lg font-semibold">Step 2: Scan Student Worksheets</h2>
           <div className="flex items-center gap-2">
             {!masterKeyReady && (
-              <Badge variant="outline">Scan master key first</Badge>
+              <Badge variant="outline">
+                {masterKeyBlocked ? "Master key approval required" : "Scan master key first"}
+              </Badge>
             )}
             <Button
               onClick={() => startScanSession("student")}
@@ -1248,7 +1288,7 @@ export default function AssignmentsPage() {
         )}
         {!masterKeyReady && (
           <div className="text-sm text-muted-foreground">
-            Student scans unlock after the master key has been saved.
+            Student scans unlock after the master key has been approved.
           </div>
         )}
         {isDev && (

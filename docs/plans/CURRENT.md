@@ -162,6 +162,23 @@ Status snapshot for this track:
 • A7.7–A7.10 pending
 • Execution pause: waiting for manual verification before starting A7.7
 
+Current diagnostic/cleanup titles (this pass):
+• D-1: Remove silent assignment/template fallback in upload grading (enforce explicit failure when assignment lookup fails).  
+• D-2: Add template-approval blockers for box-count too-many, missing Q numbers, and synthetic `QROW*` fallback ids.  
+• D-3: Tighten row ROI/anchor selection in box-driven template extraction (favor row proximity before confidence).  
+• D-4: Loosen answer-box detector thresholds to reduce missed boxed answers on worksheet templates.  
+• D-5: Add regression coverage for template-use enforcement and new box-driven warning codes.
+• D-6: Add pre-anchor candidate filtering for non-answer boxes (Q-label circles, division-expression boxes, and far-off header artifacts).
+• D-7: Harden anchor-mode expected-answer span selection to reject Q-label-like text and prioritize answer-like OCR spans.
+• D-8: Tighten anchor expected-answer pairing to reduce cross-row/cross-column steals while preserving wide-layout worksheets (bucketed proximity ranking + relaxed hard-gate fallback).
+• D-9: Persist template extraction warnings in assignment metadata and block manifest approval on high anchor ambiguity.
+• D-10: Fail template approval when box-mode fallback is applied or expected-answer texts are low-quality, preventing bad manifests from auto-grading students.
+• D-11: Recover unreadable `Q` labels by assigning unknown anchors with strong answer-pair geometry to the next deterministic question number.
+• D-12: Align debug answer endpoints with template grading contract (prefer `template_regions_json` over OCR+LLM fallback when template regions exist).
+• D-13: Add region-level answer candidate scoring fallback (prefer answer-like spans in `region_box_px` over noisy division expressions from misaligned `bbox_px`).
+• D-14: Strengthen anchor span scoring against label-like numerics (`8.`) and add non-adjacent numeric+remainder merge (`127` + `R3`) for noisy OCR lines.
+• D-15: Make template approval state explicit in UI and upload gates (student uploads blocked until `manifest_locked`; add controlled manual-approve endpoint for test unblocking).
+
 ## Acceptance Criteria (Phase A)
 • Clean PDFs grade correctly (near-perfect scores).  
 • One can upload a key + students and download a reliable graded PDF.

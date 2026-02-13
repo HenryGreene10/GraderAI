@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import secrets
@@ -24,8 +25,8 @@ from ..services.ocr import normalize_ocr_result
 from ..services.answer_extraction import extract_answers_from_ocr
 from ..services.master_key_pipeline import run_master_key_approval_pipeline
 from ..services.template import detect_answer_boxes, detect_question_regions
-from ..services.template_manifest import load_template_manifest
-from ..services.template_regions import parse_regions_payload
+from ..services.template_manifest import load_template_manifest, with_approved_manifest
+from ..services.template_regions import expected_answers_from_regions, parse_regions_payload
 from .ocr import run_ocr_for_upload
 
 router = APIRouter(prefix="/api/assignments", tags=["assignments"])
@@ -45,6 +46,13 @@ ALLOWED_MIME = {
 }
 
 
+def _qid_sort_key(qid: str) -> tuple[int, str]:
+    digits = "".join(ch for ch in str(qid) if ch.isdigit())
+    if digits:
+        return int(digits), str(qid)
+    return 10_000, str(qid)
+
+
 class AssignmentCreate(BaseModel):
     title: str
     description: Optional[str] = None
@@ -53,6 +61,10 @@ class AssignmentCreate(BaseModel):
 
 class ScanSessionCreate(BaseModel):
     mode: Literal["master_key", "student"]
+
+
+class TemplateManualApproveBody(BaseModel):
+    force: bool = False
 
 
 def _scan_sessions_missing(exc: Exception) -> bool:
@@ -81,11 +93,38 @@ def _assignment_payload(row: dict, uploads_count: int = 0) -> dict:
     }
 
 
+def _template_regions_payload(raw_payload: object) -> object:
+    if isinstance(raw_payload, (dict, list)):
+        return raw_payload
+    if isinstance(raw_payload, str):
+        try:
+            parsed = json.loads(raw_payload)
+        except Exception:
+            return {}
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return {}
+
+
+def _template_approval_reasons(payload: object) -> list[str]:
+    data = payload if isinstance(payload, dict) else {}
+    raw_reasons = data.get("manifest_approval_block_reasons")
+    if not isinstance(raw_reasons, list):
+        return []
+    reasons = [str(item).strip() for item in raw_reasons if str(item).strip()]
+    return sorted(set(reasons))
+
+
 def _assignment_detail_payload(row: dict) -> dict:
     base = _assignment_payload(row, uploads_count=0)
-    regions = row.get("template_regions_json") or {}
+    regions = _template_regions_payload(row.get("template_regions_json") or {})
+    regions_dict = regions if isinstance(regions, dict) else {}
     detected_qids = []
     regions_count = 0
+    manifest_locked = bool(regions_dict.get("manifest_locked"))
+    manifest_approved_at = str(regions_dict.get("manifest_approved_at") or "").strip() or None
+    approval_blocked = bool(regions_dict.get("manifest_approval_blocked"))
+    approval_reasons = _template_approval_reasons(regions_dict)
     try:
         manifest, _embedded = load_template_manifest(
             regions,
@@ -111,6 +150,11 @@ def _assignment_detail_payload(row: dict) -> dict:
             "template_upload_id": row.get("template_upload_id"),
             "template_original_name": row.get("template_original_name"),
             "template_uploaded_at": row.get("template_uploaded_at"),
+            "template_manifest_locked": manifest_locked,
+            "template_manifest_approved_at": manifest_approved_at,
+            "template_approval_blocked": approval_blocked,
+            "template_approval_block_reasons": approval_reasons,
+            "template_ready_for_grading": bool(row.get("template_storage_path") and manifest_locked and manifest_approved_at),
         }
     )
     return base
@@ -405,6 +449,25 @@ async def get_answer_key(
     if not row.get("template_storage_path"):
         raise HTTPException(status_code=404, detail="template_missing")
 
+    regions_payload = row.get("template_regions_json") or {}
+    regions_map, _meta = parse_regions_payload(regions_payload)
+    region_answers = expected_answers_from_regions(regions_map) if regions_map else {}
+    if region_answers:
+        sorted_qids = sorted(region_answers.keys(), key=_qid_sort_key)
+        answers = {qid: str(region_answers.get(qid) or "").strip() for qid in sorted_qids}
+        prompt_version = "template-regions-v1"
+        response = {
+            "answers": answers,
+            "prompt_version": prompt_version,
+        }
+        if include_metadata:
+            response["metadata"] = {
+                "source": "template_regions",
+                "regions_full": regions_payload,
+                "template_uploaded_at": row.get("template_uploaded_at"),
+            }
+        return response
+
     template_bytes = download_submission_bytes(row.get("template_storage_path"))
     raw = ocr_service.extract_text(image_bytes=template_bytes)
     if hasattr(raw, "__await__"):
@@ -539,6 +602,73 @@ async def upload_template(
     }
 
 
+@router.post("/{assignment_id}/template/approve")
+def approve_template_manifest(
+    assignment_id: str,
+    body: TemplateManualApproveBody,
+    user_id: str = Depends(get_current_user_id),
+):
+    if os.getenv("ALLOW_TEMPLATE_MANUAL_APPROVAL") != "1":
+        raise HTTPException(status_code=403, detail="manual_template_approval_disabled")
+
+    row = get_assignment(
+        assignment_id,
+        user_id,
+        columns=(
+            "id,owner_id,template_storage_path,template_regions_json,template_width_px,"
+            "template_height_px,template_version,needs_review"
+        ),
+    )
+    if not row.get("template_storage_path"):
+        raise HTTPException(status_code=409, detail="template_missing")
+
+    regions_payload = _template_regions_payload(row.get("template_regions_json") or {})
+    regions_map, _ = parse_regions_payload(regions_payload)
+    if not regions_map:
+        raise HTTPException(status_code=409, detail="template_regions_missing")
+
+    regions_dict = regions_payload if isinstance(regions_payload, dict) else {}
+    blocked_reasons = _template_approval_reasons(regions_dict)
+    approval_blocked = bool(regions_dict.get("manifest_approval_blocked"))
+    if approval_blocked and not body.force:
+        joined = ", ".join(blocked_reasons) if blocked_reasons else "unknown_reasons"
+        raise HTTPException(status_code=409, detail=f"template_manifest_blocked: {joined}")
+
+    approved_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    approved_payload = with_approved_manifest(
+        regions_payload,
+        template_version=int(row.get("template_version") or 1),
+        template_width_px=row.get("template_width_px"),
+        template_height_px=row.get("template_height_px"),
+        approved_at=approved_at,
+    )
+    approved_payload["manifest_approval_blocked"] = False
+    approved_payload["manifest_approval_block_reasons"] = []
+    approved_payload["manifest_manual_approved"] = True
+    approved_payload["manifest_manual_approved_at"] = approved_at
+    approved_payload["manifest_manual_approved_by"] = user_id
+    if blocked_reasons:
+        approved_payload["manifest_manual_approved_from_reasons"] = blocked_reasons
+
+    sb = require_supabase()
+    sb.table("assignments").update(
+        {
+            "template_regions_json": approved_payload,
+            "needs_review": True if blocked_reasons else bool(row.get("needs_review")),
+        }
+    ).eq("id", assignment_id).execute()
+
+    return {
+        "ok": True,
+        "assignment_id": assignment_id,
+        "manifest_locked": True,
+        "manifest_approved_at": approved_at,
+        "manual_approved": True,
+        "forced": bool(body.force),
+        "prior_block_reasons": blocked_reasons,
+    }
+
+
 @router.post("/{assignment_id}/uploads")
 async def upload_assignment_files(
     assignment_id: str,
@@ -549,14 +679,29 @@ async def upload_assignment_files(
     assignment = get_assignment(
         assignment_id,
         user_id,
-        columns="id,owner_id,template_storage_path,template_regions_json,template_upload_id",
+        columns=(
+            "id,owner_id,template_storage_path,template_regions_json,template_upload_id,template_version,"
+            "template_width_px,template_height_px"
+        ),
     )
 
-    template_regions = assignment.get("template_regions_json") or []
+    template_regions = _template_regions_payload(assignment.get("template_regions_json") or {})
     template_storage_path = assignment.get("template_storage_path")
     regions_map, _ = parse_regions_payload(template_regions)
     if not template_storage_path or not regions_map:
         raise HTTPException(status_code=409, detail="Upload master key first.")
+    try:
+        load_template_manifest(
+            template_regions,
+            template_version=int(assignment.get("template_version") or 1),
+            template_width_px=assignment.get("template_width_px"),
+            template_height_px=assignment.get("template_height_px"),
+            require_approved=True,
+        )
+    except Exception as exc:
+        reasons = _template_approval_reasons(template_regions)
+        reasons_txt = f" ({', '.join(reasons)})" if reasons else ""
+        raise HTTPException(status_code=409, detail=f"Master key pending approval: {exc}{reasons_txt}")
 
     if not files:
         raise HTTPException(status_code=400, detail="files_required")

@@ -68,7 +68,9 @@ _IMPLICIT_TOKEN_RE = re.compile(r"^[\(\[]?\s*([0-9]{1,2})\s*[\)\].,:;]?$")
 _ANSWER_REM_RE = re.compile(r"^\d+\s*[Rr]\s*\d+$")
 _ANSWER_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?(?:/\d+)?$")
 _ANSWER_ANY_DIGIT_RE = re.compile(r"\d")
+_DIVISION_EXPRESSION_RE = re.compile(r"^\d+\)\d+$")
 _EXPLICIT_COVERAGE_THRESHOLD = 0.95
+_MIN_ANSWER_TEXT_SCORE = 50
 
 
 def _anchor_trace_key(anchor: _Anchor) -> str:
@@ -640,6 +642,69 @@ def _select_manifest_anchors(
                         }
                     )
 
+        # If an anchor has an unreadable number (e.g. OCR sees only "Q"),
+        # keep it instead of dropping the whole row. Assign by reading order.
+        unknown = [
+            a
+            for a in anchors
+            if a.parsed_num is None and a.label_method == "ocr_anchor_unknown"
+        ]
+        unknown.sort(key=lambda a: (a.page_index, a.y, a.x))
+
+        def _left_neighbor_number(cand: _Anchor) -> Optional[int]:
+            h_ref = max(8.0, float(median_h_by_page.get(cand.page_index) or cand.h or 24.0))
+            row_band = max(20.0, 1.4 * h_ref)
+            best_num: Optional[int] = None
+            best_dx: Optional[float] = None
+            for num, other in selected.items():
+                if other.page_index != cand.page_index:
+                    continue
+                dy = abs(other.center[1] - cand.center[1])
+                if dy > row_band:
+                    continue
+                dx = cand.center[0] - other.center[0]
+                if dx <= (0.4 * h_ref):
+                    continue
+                if best_dx is None or dx < best_dx:
+                    best_dx = dx
+                    best_num = int(num)
+            return best_num
+
+        unknown_fills = 0
+        for cand in unknown:
+            h_ref = max(8.0, float(median_h_by_page.get(cand.page_index) or cand.h or 24.0))
+            if any(_anchor_overlap(cand, taken, h_ref) for taken in selected.values()):
+                decisions[id(cand)] = "REJECTED_UNKNOWN_OVERLAP_WITH_SELECTED"
+                continue
+
+            left_num = _left_neighbor_number(cand)
+            chosen_num: Optional[int] = None
+            if left_num is not None and (left_num + 1) not in selected:
+                chosen_num = left_num + 1
+            if chosen_num is None:
+                max_existing = max(selected.keys()) if selected else 0
+                target_max = max(max_existing, max_existing + 1)
+                missing_pool = [n for n in range(1, target_max + 1) if n not in selected]
+                if missing_pool:
+                    chosen_num = missing_pool[0]
+                else:
+                    chosen_num = max_existing + 1
+
+            if chosen_num in selected:
+                decisions[id(cand)] = "REJECTED_UNKNOWN_NUMBER_CONFLICT"
+                continue
+            selected[int(chosen_num)] = cand
+            decisions[id(cand)] = "SELECTED_UNKNOWN_FILL"
+            unknown_fills += 1
+        if unknown_fills > 0:
+            warnings.append(
+                {
+                    "code": "ANCHOR_UNKNOWN_NUMBER_FILL",
+                    "count": unknown_fills,
+                    "message": "Assigned question numbers to unreadable Q anchors by reading order.",
+                }
+            )
+
         if explicit_numbers_seen:
             max_seen = max(explicit_numbers_seen)
             covered = len([n for n in selected.keys() if 1 <= n <= max_seen])
@@ -675,7 +740,7 @@ def _select_manifest_anchors(
             if id(anchor) not in decisions:
                 decisions[id(anchor)] = "REJECTED_IMPLICIT_NOT_REQUIRED"
         for anchor in anchors:
-            if anchor.parsed_num is None:
+            if anchor.parsed_num is None and id(anchor) not in decisions:
                 decisions[id(anchor)] = "REJECTED_NO_PARSED_NUMBER"
         trace["anchor_decisions"] = decisions
     else:
@@ -760,16 +825,23 @@ def _overlaps_label(token: _Token, anchor: _Anchor) -> bool:
 
 
 def _score_answer_text(text: str) -> int:
-    cleaned = re.sub(r"[(){}\[\],;:]+", "", text.strip())
-    compact = re.sub(r"\s+", " ", cleaned).strip()
+    normalized = normalize_answer_text(text)
+    compact = re.sub(r"\s+", " ", str(normalized or "").strip())
     if not compact:
+        return 0
+    if re.fullmatch(r"\d+[.,:;]$", compact):
+        # Common OCR from circled labels (e.g. "8.") should not be treated as strong answers.
+        return 10
+    if _looks_like_question_label_text(compact):
+        return 0
+    if _looks_like_division_expression_text(compact):
         return 0
     if _ANSWER_REM_RE.match(compact):
         return 120
     if _ANSWER_NUMERIC_RE.match(compact):
-        return 90
+        return 95
     if _ANSWER_ANY_DIGIT_RE.search(compact):
-        return 45
+        return 55
     return 5
 
 
@@ -784,13 +856,14 @@ def _geometry_answer_span_candidates(
     ax, ay, aw, ah = anchor.rect
     anchor_cx, anchor_cy = anchor.center
     dx_min = max(10.0, 0.8 * h_ref)
-    dx_max = min(page_w * 0.58, 24.0 * h_ref)
+    # Keep horizontal reach bounded, but allow wide worksheets where answers are farther right.
+    dx_max = min(page_w * 0.45, 22.0 * h_ref)
     dy_max = min(page_h * 0.07, 1.8 * h_ref)
 
     def _valid_span_center(cx: float, cy: float) -> Tuple[bool, float, float]:
         dx = cx - anchor_cx
         dy = abs(cy - anchor_cy)
-        right_column_floor = max(anchor_cx + dx_min, page_w * 0.24)
+        right_column_floor = anchor_cx + dx_min
         if cx < right_column_floor:
             return False, dx, dy
         if dx < dx_min or dx > dx_max:
@@ -807,6 +880,9 @@ def _geometry_answer_span_candidates(
         ok, dx, dy = _valid_span_center(cx, cy)
         if not ok:
             continue
+        text_score = _score_answer_text(tok.text)
+        if text_score < _MIN_ANSWER_TEXT_SCORE:
+            continue
         spans.append(
             {
                 "rect": tok.rect,
@@ -814,7 +890,7 @@ def _geometry_answer_span_candidates(
                 "token_ids": [_token_key(tok)],
                 "dx": dx,
                 "dy": dy,
-                "text_score": _score_answer_text(tok.text),
+                "text_score": text_score,
             }
         )
 
@@ -828,6 +904,8 @@ def _geometry_answer_span_candidates(
         for i in range(len(line_tokens) - 1):
             t1 = line_tokens[i]
             t2 = line_tokens[i + 1]
+            if _looks_like_question_label_text(t1.text) or _looks_like_question_label_text(t2.text):
+                continue
             rect = _union_rect([t1.rect, t2.rect])
             if not rect:
                 continue
@@ -837,6 +915,9 @@ def _geometry_answer_span_candidates(
             if not ok:
                 continue
             merged = f"{t1.text} {t2.text}".strip()
+            merged_score = _score_answer_text(merged)
+            if merged_score < _MIN_ANSWER_TEXT_SCORE:
+                continue
             spans.append(
                 {
                     "rect": rect,
@@ -844,14 +925,52 @@ def _geometry_answer_span_candidates(
                     "token_ids": [_token_key(t1), _token_key(t2)],
                     "dx": dx,
                     "dy": dy,
-                    "text_score": _score_answer_text(merged),
+                    "text_score": merged_score,
                 }
             )
+        # Allow non-adjacent numeric + remainder pair joins on noisy OCR lines.
+        for i in range(len(line_tokens)):
+            t_num = line_tokens[i]
+            if not _ANSWER_NUMERIC_RE.fullmatch(str(t_num.text or "").strip()):
+                continue
+            for j in range(i + 1, len(line_tokens)):
+                t_rem = line_tokens[j]
+                if not re.fullmatch(r"[Rr]\d+", str(t_rem.text or "").strip()):
+                    continue
+                if abs(t_rem.center[1] - t_num.center[1]) > (0.9 * h_ref):
+                    continue
+                gap = float(t_rem.x - (t_num.x + t_num.w))
+                if gap < (-0.2 * h_ref) or gap > (8.0 * h_ref):
+                    continue
+                rect = _union_rect([t_num.rect, t_rem.rect])
+                if not rect:
+                    continue
+                cx = rect[0] + rect[2] / 2.0
+                cy = rect[1] + rect[3] / 2.0
+                ok, dx, dy = _valid_span_center(cx, cy)
+                if not ok:
+                    continue
+                merged = f"{t_num.text} {t_rem.text}".strip()
+                merged_score = _score_answer_text(merged)
+                if merged_score < _MIN_ANSWER_TEXT_SCORE:
+                    continue
+                spans.append(
+                    {
+                        "rect": rect,
+                        "text": merged,
+                        "token_ids": [_token_key(t_num), _token_key(t_rem)],
+                        "dx": dx,
+                        "dy": dy,
+                        "text_score": merged_score,
+                    }
+                )
     spans.sort(
         key=lambda item: (
-            float(item.get("dy") or 0.0),
-            float(item.get("dx") or 0.0),
+            int(float(item.get("dx") or 0.0) / max(32.0, h_ref * 1.2)),
+            int(float(item.get("dy") or 0.0) / max(12.0, h_ref * 0.6)),
             -int(item.get("text_score") or 0),
+            float(item.get("dx") or 0.0),
+            float(item.get("dy") or 0.0),
             float((item.get("rect") or [0, 0, 0, 0])[1]),
             float((item.get("rect") or [0, 0, 0, 0])[0]),
         )
@@ -897,9 +1016,10 @@ def _pick_answer_box(
     ax, ay, aw, ah = anchor.rect
     anchor_cx, anchor_cy = anchor.center
     search_x0 = max(0.0, ax - max(30.0, page_w * 0.04))
-    search_x1 = min(page_w, ax + max(240.0, page_w * 0.65))
-    search_y0 = max(0.0, ay - max(70.0, page_h * 0.10))
-    search_y1 = min(page_h, ay + max(180.0, page_h * 0.24))
+    search_x1 = min(page_w, ax + max(220.0, page_w * 0.34, aw * 6.0))
+    # Keep answer-span search close to the anchor row; large vertical windows caused cross-row steals.
+    search_y0 = max(0.0, ay - max(34.0, ah * 1.2))
+    search_y1 = min(page_h, ay + max(120.0, ah * 2.6))
 
     nearby = []
     for tok in page_tokens:
@@ -935,21 +1055,19 @@ def _pick_answer_box(
                 if all(token_id not in reserved_token_keys for token_id in pref_token_ids):
                     return clipped_pref, normalize_answer_text(pref_text), list(pref_token_ids)
 
-    candidates: List[Tuple[float, Tuple[float, float, float, float], str, List[str]]] = []
+    candidates: List[Tuple[float, float, float, Tuple[float, float, float, float], str, List[str]]] = []
 
     for tok in nearby:
         token_id = _token_key(tok)
         if token_id in reserved_token_keys:
             continue
         base = _score_answer_text(tok.text)
-        if base <= 0:
+        if base < _MIN_ANSWER_TEXT_SCORE:
             continue
         cx, cy = tok.center
-        dist = math.sqrt(_distance_sq((cx, cy), (anchor_cx, anchor_cy)))
-        score = float(base) - (dist / max(1.0, max(page_w, page_h))) * 28.0
-        if cx > ax + aw * 0.3:
-            score += 10.0
-        candidates.append((score, tok.rect, tok.text, [token_id]))
+        dx = max(0.0, cx - anchor_cx)
+        dy = abs(cy - anchor_cy)
+        candidates.append((dx, dy, -float(base), tok.rect, tok.text, [token_id]))
 
     by_line: Dict[int, List[_Token]] = {}
     for tok in nearby:
@@ -963,24 +1081,36 @@ def _pick_answer_box(
             t2_id = _token_key(t2)
             if t1_id in reserved_token_keys or t2_id in reserved_token_keys:
                 continue
+            if _looks_like_question_label_text(t1.text) or _looks_like_question_label_text(t2.text):
+                continue
             merged = f"{t1.text} {t2.text}".strip()
             base = _score_answer_text(merged)
-            if base <= 0:
+            if base < _MIN_ANSWER_TEXT_SCORE:
                 continue
             rect = _union_rect([t1.rect, t2.rect])
             if not rect:
                 continue
             cx = rect[0] + rect[2] / 2.0
             cy = rect[1] + rect[3] / 2.0
-            dist = math.sqrt(_distance_sq((cx, cy), (anchor_cx, anchor_cy)))
-            score = float(base + 8) - (dist / max(1.0, max(page_w, page_h))) * 28.0
-            if cx > ax + aw * 0.3:
-                score += 12.0
-            candidates.append((score, rect, merged, [t1_id, t2_id]))
+            dx = max(0.0, cx - anchor_cx)
+            dy = abs(cy - anchor_cy)
+            candidates.append((dx, dy, -float(base + 8), rect, merged, [t1_id, t2_id]))
 
     if candidates:
-        candidates.sort(key=lambda item: (-item[0], item[1][1], item[1][0]))
-        for _score, rect, text, token_ids in candidates:
+        bucket_x = max(28.0, ah * 1.2)
+        bucket_y = max(10.0, ah * 0.7)
+        candidates.sort(
+            key=lambda item: (
+                int(item[0] / bucket_x),
+                int(item[1] / bucket_y),
+                item[2],
+                item[0],
+                item[1],
+                item[3][1],
+                item[3][0],
+            )
+        )
+        for _dx, _dy, _neg_score, rect, text, token_ids in candidates:
             clipped = _expand_and_clip(rect, pad_x=10.0, pad_y=8.0, page_w=page_w, page_h=page_h)
             overlaps = False
             for page_idx, reserved_rect in reserved_answer_boxes:
@@ -1081,11 +1211,15 @@ def _best_anchor_for_box_row(
         return None, deduped
     box_cy = box[1] + (box[3] / 2.0)
     box_x = box[0]
+    row_band = max(24.0, box[3] * 1.4)
+    within_band = [c for c in parsed if abs(c.center[1] - box_cy) <= row_band]
+    if within_band:
+        parsed = within_band
     parsed.sort(
         key=lambda c: (
-            -int(c.confidence),
             abs(c.center[1] - box_cy),
             abs(c.center[0] - box_x),
+            -int(c.confidence),
             c.y,
             c.x,
         )
@@ -1109,6 +1243,62 @@ def _extract_answer_text_in_box(
     hits.sort(key=lambda t: (t.line_index, t.x, t.word_index))
     text = " ".join(tok.text for tok in hits if tok.text)
     return normalize_answer_text(text)
+
+
+def _median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return float(ordered[mid])
+    return float((ordered[mid - 1] + ordered[mid]) / 2.0)
+
+
+def _question_row_centers_for_box_filter(
+    *,
+    page_tokens: List[_Token],
+    page_size: Tuple[float, float],
+) -> List[float]:
+    if not page_tokens:
+        return []
+    page_w, page_h = page_size
+    anchors = _detect_anchors(page_tokens, {0: (page_w, page_h)})
+    parsed = [a for a in anchors if isinstance(a, _Anchor) and a.parsed_num is not None]
+    if not parsed:
+        return []
+    strong = [a for a in parsed if a.label_method in {"ocr_anchor_explicit", "ocr_anchor_pair"}]
+    use = strong or parsed
+    ys = sorted(a.center[1] for a in use)
+    collapsed: List[float] = []
+    for y in ys:
+        if not collapsed:
+            collapsed.append(float(y))
+            continue
+        if abs(y - collapsed[-1]) <= 24.0:
+            collapsed[-1] = float((collapsed[-1] + y) / 2.0)
+        else:
+            collapsed.append(float(y))
+    return collapsed
+
+
+def _looks_like_question_label_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(text or "")).upper()
+    if not compact:
+        return False
+    compact = compact.lstrip("([")
+    compact = compact.rstrip(").,:;]")
+    if not compact.startswith("Q"):
+        return False
+    tail = compact[1:]
+    return tail == "" or tail.isdigit()
+
+
+def _looks_like_division_expression_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(text or "")).upper()
+    if not compact:
+        return False
+    return bool(_DIVISION_EXPRESSION_RE.fullmatch(compact))
 
 
 def _build_box_driven_regions(
@@ -1135,6 +1325,65 @@ def _build_box_driven_regions(
     if not raw_boxes:
         raise ValueError("template_answer_boxes_missing")
 
+    page_tokens = [tok for tok in tokens if tok.page_index == 0]
+    question_rows = _question_row_centers_for_box_filter(
+        page_tokens=page_tokens,
+        page_size=(page_w, page_h),
+    )
+    row_band = 0.0
+    if len(question_rows) >= 2:
+        deltas = [
+            question_rows[i] - question_rows[i - 1]
+            for i in range(1, len(question_rows))
+            if (question_rows[i] - question_rows[i - 1]) > 0
+        ]
+        row_pitch = _median(deltas)
+        if row_pitch > 0:
+            row_band = max(42.0, min(180.0, row_pitch * 0.48))
+    filtered_candidates: List[Dict[str, object]] = []
+    filtered_raw_boxes: List[Tuple[float, float, float, float]] = []
+    for box in raw_boxes:
+        reasons: List[str] = []
+        text_in_box = _extract_answer_text_in_box(box=box, page_tokens=page_tokens)
+        is_q_label = _looks_like_question_label_text(text_in_box)
+        is_div_expr = _looks_like_division_expression_text(text_in_box)
+        has_digit_signal = bool(_ANSWER_ANY_DIGIT_RE.search(text_in_box))
+        if is_q_label:
+            reasons.append("q_label_text")
+        if is_div_expr:
+            reasons.append("division_expression_text")
+        if row_band > 0.0 and question_rows:
+            cy = box[1] + (box[3] / 2.0)
+            nearest = min(abs(cy - row_y) for row_y in question_rows)
+            if nearest > row_band and not (has_digit_signal and not is_q_label and not is_div_expr):
+                reasons.append("far_from_question_rows")
+        if reasons:
+            filtered_candidates.append(
+                {
+                    "bbox_px": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
+                    "text": text_in_box,
+                    "reasons": reasons,
+                }
+            )
+            continue
+        filtered_raw_boxes.append(box)
+    if filtered_raw_boxes:
+        raw_boxes = filtered_raw_boxes
+    if filtered_candidates:
+        reason_counts: Dict[str, int] = {}
+        for item in filtered_candidates:
+            for reason in item.get("reasons", []):
+                reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+        warnings.append(
+            {
+                "code": "BOX_CANDIDATES_FILTERED",
+                "filtered_count": len(filtered_candidates),
+                "kept_count": len(raw_boxes),
+                "reasons": reason_counts,
+                "message": "Filtered non-answer-like answer-box candidates before row anchoring.",
+            }
+        )
+
     boxes, overlap_removed = _suppress_overlapping_boxes(raw_boxes, iou_threshold=0.22)
     if overlap_removed > 0:
         warnings.append(
@@ -1145,7 +1394,6 @@ def _build_box_driven_regions(
             }
         )
 
-    page_tokens = [tok for tok in tokens if tok.page_index == 0]
     explicit_seen = _extract_explicit_numbers_from_tokens(tokens)
     explicit_max = max(explicit_seen) if explicit_seen else 0
     if explicit_max > 0 and len(boxes) < explicit_max:
@@ -1157,6 +1405,15 @@ def _build_box_driven_regions(
                 "message": "Detected answer-box count is below explicit OCR label count.",
             }
         )
+    if explicit_max > 0 and len(boxes) > explicit_max:
+        warnings.append(
+            {
+                "code": "BOX_COUNT_TOO_MANY",
+                "box_count": len(boxes),
+                "expected_at_most": explicit_max,
+                "message": "Detected answer-box count is above explicit OCR label count.",
+            }
+        )
 
     candidate_entries: List[Dict[str, object]] = []
     selected_entries: List[Dict[str, object]] = []
@@ -1165,12 +1422,25 @@ def _build_box_driven_regions(
     unreadable_rows: List[int] = []
     row_records: List[Dict[str, object]] = []
     reserved_anchor_keys: set[str] = set()
+    row_pitch = 0.0
+    if len(boxes) > 1:
+        centers = sorted((b[1] + (b[3] / 2.0)) for b in boxes)
+        deltas = [centers[i] - centers[i - 1] for i in range(1, len(centers)) if (centers[i] - centers[i - 1]) > 0]
+        if deltas:
+            deltas.sort()
+            mid = len(deltas) // 2
+            if len(deltas) % 2 == 1:
+                row_pitch = float(deltas[mid])
+            else:
+                row_pitch = float((deltas[mid - 1] + deltas[mid]) / 2.0)
 
     for row_index, box in enumerate(boxes, start=1):
         bx, by, bw, bh = box
-        left_w = max(220.0, bw * 7.0)
-        right_gap = max(12.0, bw * 0.25)
-        vpad = max(24.0, bh * 1.7)
+        left_w = max(220.0, bw * 5.0, bx * 0.85)
+        right_gap = max(16.0, bw * 0.35)
+        vpad = max(18.0, bh * 1.05)
+        if row_pitch > 0:
+            vpad = min(vpad, max(18.0, row_pitch * 0.48))
         roi = _clip_box((bx - left_w, by - vpad, max(1.0, left_w - right_gap), bh + (2.0 * vpad)), page_w, page_h)
         if roi is None:
             roi = (0.0, max(0.0, by - vpad), max(1.0, bx - right_gap), bh + (2.0 * vpad))
@@ -1306,8 +1576,17 @@ def _build_box_driven_regions(
         else:
             qid = f"QROW{row_index}"
         bx, by, bw, bh = box
+        region_left_w = max(220.0, bw * 5.0, bx * 0.85)
+        region_vpad = max(18.0, bh * 1.05)
+        if row_pitch > 0:
+            region_vpad = min(region_vpad, max(18.0, row_pitch * 0.48))
         region_box = _expand_and_clip(
-            (max(0.0, bx - max(220.0, bw * 7.0)), max(0.0, by - max(24.0, bh * 1.7)), max(120.0, bw + max(220.0, bw * 7.0)), bh + (2.0 * max(24.0, bh * 1.7))),
+            (
+                max(0.0, bx - region_left_w),
+                max(0.0, by - region_vpad),
+                max(120.0, bw + region_left_w),
+                bh + (2.0 * region_vpad),
+            ),
             pad_x=0.0,
             pad_y=0.0,
             page_w=page_w,
@@ -1329,10 +1608,28 @@ def _build_box_driven_regions(
     regions.sort(key=lambda r: (r.page_index, r.region[1], r.region[0], str(r.qid)))
 
     missing_numbers = [n for n in range(1, len(boxes) + 1) if n not in used_numbers]
+    if missing_numbers:
+        warnings.append(
+            {
+                "code": "BOX_MISSING_Q_NUMBERS",
+                "numbers": missing_numbers,
+                "message": "Missing parsed Q numbers across answer-box rows.",
+            }
+        )
+    fallback_qids = sorted(str(region.qid) for region in regions if str(region.qid).startswith("QROW"))
+    if fallback_qids:
+        warnings.append(
+            {
+                "code": "BOX_ROW_FALLBACK_QIDS",
+                "qids": fallback_qids,
+                "message": "One or more rows fell back to synthetic QROW ids.",
+            }
+        )
     anchor_trace: Dict[str, object] = {
         "candidates": candidate_entries,
         "selected": selected_entries,
         "rejected": rejected_entries,
+        "filtered": filtered_candidates,
         "rows": row_entries,
         "missing_numbers": missing_numbers,
         "summary": {
@@ -1353,12 +1650,56 @@ def build_anchor_template_regions(
 ) -> Tuple[List[AnchorRegion], List[Dict[str, object]], Dict[str, object]]:
     if answer_box_hints:
         tokens, page_sizes = _extract_tokens_and_page_sizes(ocr_boxes, image_size)
-        return _build_box_driven_regions(
+        box_regions, box_warnings, box_trace = _build_box_driven_regions(
             tokens=tokens,
             page_sizes=page_sizes,
             image_size=image_size,
             answer_box_hints=answer_box_hints,
         )
+        explicit_seen = _extract_explicit_numbers_from_tokens(tokens)
+        explicit_max = max(explicit_seen) if explicit_seen else 0
+        summary = (box_trace or {}).get("summary") if isinstance(box_trace, dict) else {}
+        box_selected = int((summary or {}).get("selected_count") or 0)
+        box_missing = int((summary or {}).get("missing_count") or 0)
+        parsed_qids = [str(r.qid) for r in box_regions if str(r.qid).startswith("Q") and not str(r.qid).startswith("QROW")]
+        box_parsed_count = len(parsed_qids)
+        fallback_needed = False
+        if explicit_max > 0:
+            min_cover = max(2, int(math.ceil(explicit_max * 0.75)))
+            if box_parsed_count < min_cover:
+                fallback_needed = True
+            if box_selected < min_cover:
+                fallback_needed = True
+            if box_missing > max(1, explicit_max // 3):
+                fallback_needed = True
+        if fallback_needed:
+            anchor_regions, anchor_warnings, anchor_trace = build_anchor_template_regions(
+                ocr_boxes=ocr_boxes,
+                image_size=image_size,
+                answer_box_hints=None,
+            )
+            anchor_parsed_count = len(
+                [str(r.qid) for r in anchor_regions if str(r.qid).startswith("Q") and not str(r.qid).startswith("QROW")]
+            )
+            if (anchor_parsed_count > box_parsed_count) or (len(anchor_regions) > len(box_regions)):
+                fallback_warning = {
+                    "code": "BOX_MODE_FALLBACK_APPLIED",
+                    "message": "Box-driven extraction had low coverage; anchor-driven fallback selected.",
+                    "box_summary": summary or {},
+                    "box_regions": len(box_regions),
+                    "anchor_regions": len(anchor_regions),
+                    "explicit_max": explicit_max,
+                }
+                warnings = [fallback_warning]
+                warnings.extend(anchor_warnings or [])
+                if isinstance(anchor_trace, dict):
+                    anchor_trace["box_mode_discarded"] = {
+                        "summary": summary or {},
+                        "regions": len(box_regions),
+                        "parsed_qids": parsed_qids,
+                    }
+                return anchor_regions, warnings, anchor_trace
+        return box_regions, box_warnings, box_trace
 
     warnings: List[Dict[str, object]] = []
     tokens, page_sizes = _extract_tokens_and_page_sizes(ocr_boxes, image_size)
@@ -1478,7 +1819,13 @@ def build_anchor_template_regions(
         eligible_anchors.append(anchor)
 
     if not eligible_anchors:
-        raise ValueError("template_anchor_hard_gate_empty")
+        warnings.append(
+            {
+                "code": "ANCHOR_HARD_GATE_RELAXED",
+                "message": "Answer-pair hard gate rejected all anchors; falling back to ungated anchors.",
+            }
+        )
+        eligible_anchors = list(anchors)
 
     selected_anchors, selection_warnings, selection_trace = _select_manifest_anchors(
         eligible_anchors,
@@ -1514,11 +1861,11 @@ def build_anchor_template_regions(
     processing_order = sorted(
         selected_anchors.items(),
         key=lambda item: (
+            int(item[0]),
             _priority(item[1].label_method),
             item[1].page_index,
             item[1].y,
             item[1].x,
-            item[0],
         ),
     )
     regions: List[AnchorRegion] = []
