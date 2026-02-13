@@ -47,6 +47,17 @@ _BLOCKING_WARNING_CODES = {
     "ANCHOR_COVERAGE_BELOW_THRESHOLD",
     "EXPECTED_TEXT_QUALITY_LOW",
 }
+_SOFT_BLOCKING_WARNING_CODES = {
+    "BOX_MODE_FALLBACK_APPLIED",
+    "ANCHOR_AMBIGUITY_HIGH",
+    "EXPECTED_TEXT_QUALITY_LOW",
+}
+_HARD_BLOCKING_WARNING_CODES = _BLOCKING_WARNING_CODES - _SOFT_BLOCKING_WARNING_CODES
+_EXPECTED_TEXT_SOFT_BLOCK_RATIO = 0.20
+_EXPECTED_TEXT_SOFT_BLOCK_MIN_COUNT = 2
+_ANCHOR_SOFT_BLOCK_UNKNOWN_MIN = 2
+_ANCHOR_SOFT_BLOCK_DUPLICATE_MIN = 2
+_ANCHOR_SOFT_BLOCK_OUT_OF_RANGE_MIN = 1
 
 
 @dataclass
@@ -111,6 +122,122 @@ def _append_expected_text_quality_warning(
 
 def _blocking_reasons_from_warning_codes(warning_codes: set[str]) -> list[str]:
     return sorted(code for code in warning_codes if code in _BLOCKING_WARNING_CODES)
+
+
+def _warning_by_code(warnings: list[dict[str, object]], code: str) -> dict[str, object] | None:
+    for item in warnings:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("code") or "") == code:
+            return item
+    return None
+
+
+def _as_non_negative_int(value: object) -> int:
+    try:
+        out = int(value)
+    except Exception:
+        return 0
+    return max(0, out)
+
+
+def _as_non_negative_list_len(value: object) -> int:
+    if isinstance(value, (list, tuple, set)):
+        return max(0, len(value))
+    return 0
+
+
+def _expected_text_quality_should_block(
+    warnings: list[dict[str, object]],
+    *,
+    regions_total: int,
+) -> bool:
+    warning = _warning_by_code(warnings, "EXPECTED_TEXT_QUALITY_LOW")
+    if not warning:
+        return False
+    qids = warning.get("qids")
+    bad_count = _as_non_negative_int(warning.get("count")) or _as_non_negative_list_len(qids)
+    if bad_count <= 0:
+        return False
+    if regions_total <= 0:
+        return True
+    ratio_threshold = max(1, int(round(float(regions_total) * _EXPECTED_TEXT_SOFT_BLOCK_RATIO)))
+    block_threshold = max(_EXPECTED_TEXT_SOFT_BLOCK_MIN_COUNT, ratio_threshold)
+    return bad_count >= block_threshold
+
+
+def _anchor_ambiguity_should_block(
+    warnings: list[dict[str, object]],
+    *,
+    regions_total: int,
+) -> bool:
+    warning = _warning_by_code(warnings, "ANCHOR_AMBIGUITY_HIGH")
+    if not warning:
+        return False
+
+    unknown_count = _as_non_negative_int(warning.get("unknown_count"))
+    duplicate_count = _as_non_negative_list_len(warning.get("duplicate_numbers"))
+    out_of_range_count = _as_non_negative_list_len(warning.get("out_of_range_numbers"))
+    anchor_count = _as_non_negative_int(warning.get("anchor_count"))
+
+    if unknown_count >= _ANCHOR_SOFT_BLOCK_UNKNOWN_MIN:
+        return True
+    if duplicate_count >= _ANCHOR_SOFT_BLOCK_DUPLICATE_MIN:
+        return True
+    if out_of_range_count >= _ANCHOR_SOFT_BLOCK_OUT_OF_RANGE_MIN:
+        return True
+    if regions_total > 0 and anchor_count > 0 and anchor_count < regions_total:
+        return True
+    return False
+
+
+def _box_mode_fallback_should_block(
+    warnings: list[dict[str, object]],
+    *,
+    regions_total: int,
+) -> bool:
+    warning = _warning_by_code(warnings, "BOX_MODE_FALLBACK_APPLIED")
+    if not warning:
+        return False
+    anchor_regions = _as_non_negative_int(warning.get("anchor_regions"))
+    box_regions = _as_non_negative_int(warning.get("box_regions"))
+    if regions_total > 0 and anchor_regions >= regions_total:
+        return False
+    if regions_total > 0 and anchor_regions >= max(1, regions_total - 1):
+        return False
+    if anchor_regions > 0 and box_regions > 0 and anchor_regions >= (box_regions + 2):
+        return False
+    return True
+
+
+def _blocking_and_softened_reasons(
+    warning_codes: set[str],
+    *,
+    warnings: list[dict[str, object]],
+    regions_total: int,
+) -> tuple[list[str], list[str]]:
+    blocking: set[str] = {code for code in warning_codes if code in _HARD_BLOCKING_WARNING_CODES}
+    softened: set[str] = set()
+
+    if "EXPECTED_TEXT_QUALITY_LOW" in warning_codes:
+        if _expected_text_quality_should_block(warnings, regions_total=regions_total):
+            blocking.add("EXPECTED_TEXT_QUALITY_LOW")
+        else:
+            softened.add("EXPECTED_TEXT_QUALITY_LOW")
+
+    if "ANCHOR_AMBIGUITY_HIGH" in warning_codes:
+        if _anchor_ambiguity_should_block(warnings, regions_total=regions_total):
+            blocking.add("ANCHOR_AMBIGUITY_HIGH")
+        else:
+            softened.add("ANCHOR_AMBIGUITY_HIGH")
+
+    if "BOX_MODE_FALLBACK_APPLIED" in warning_codes:
+        if _box_mode_fallback_should_block(warnings, regions_total=regions_total):
+            blocking.add("BOX_MODE_FALLBACK_APPLIED")
+        else:
+            softened.add("BOX_MODE_FALLBACK_APPLIED")
+
+    return sorted(blocking), sorted(softened)
 
 
 def _normalize_template_image(payload: bytes) -> tuple[bytes, int, int]:
@@ -233,7 +360,12 @@ async def run_master_key_approval_pipeline(
         for item in (warnings or [])
         if isinstance(item, dict) and item.get("code")
     }
-    blocking_hits = _blocking_reasons_from_warning_codes(warning_codes)
+    regions_total = len(template_regions_raw.get("regions") or [])
+    blocking_hits, softened_hits = _blocking_and_softened_reasons(
+        warning_codes,
+        warnings=[w for w in (warnings or []) if isinstance(w, dict)],
+        regions_total=regions_total,
+    )
     approval_blocked = bool(blocking_hits)
     if approval_blocked:
         manifest = manifest_from_template_regions(
@@ -265,6 +397,15 @@ async def run_master_key_approval_pipeline(
         except Exception as exc:
             logger.warning("template_anchor_overlay_failed assignment_id=%s error=%s", assignment_id, exc)
         template_regions["anchor_trace"] = anchor_trace
+    if softened_hits:
+        template_regions["manifest_approval_softened_reasons"] = softened_hits
+        warnings.append(
+            {
+                "code": "TEMPLATE_APPROVAL_SOFTENED",
+                "softened_reasons": softened_hits,
+                "message": "Some approval warnings were observed but tolerated because extraction coverage remained strong.",
+            }
+        )
     if warnings:
         template_regions["warnings"] = [w for w in warnings if isinstance(w, dict)]
 

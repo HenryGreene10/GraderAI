@@ -1127,8 +1127,14 @@ def _pick_answer_box(
     if fallback_pool:
         fallback_pool = [t for t in fallback_pool if _token_key(t) not in reserved_token_keys]
     if fallback_pool:
-        fallback_pool.sort(key=lambda t: (_distance_sq(t.center, anchor.center), t.y, t.x))
-        tok = fallback_pool[0]
+        scored_pool = [
+            (max(0, _score_answer_text(t.text)), _distance_sq(t.center, anchor.center), t)
+            for t in fallback_pool
+        ]
+        strong = [item for item in scored_pool if item[0] >= _MIN_ANSWER_TEXT_SCORE]
+        use_pool = strong or scored_pool
+        use_pool.sort(key=lambda item: (-item[0], item[1], item[2].y, item[2].x))
+        tok = use_pool[0][2]
         rect = _expand_and_clip(tok.rect, pad_x=10.0, pad_y=8.0, page_w=page_w, page_h=page_h)
         return rect, normalize_answer_text(tok.text), [_token_key(tok)]
 

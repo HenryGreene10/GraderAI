@@ -17,7 +17,7 @@ from ..services import ocr as ocr_service
 from ..services.ocr import normalize_ocr_result
 from ..services.llm_grader import grade_with_llm
 from ..services.answer_extraction import extract_answers_from_ocr
-from ..services.scoring import score_answer_maps
+from ..services.scoring import canonicalize_quotient_remainder, score_answer_maps
 from ..services.template_regions import (
     build_overlay_from_regions,
     extract_answers_from_regions,
@@ -740,14 +740,14 @@ async def run_grade_pipeline(
             key_answers: dict[str, str]
             if template_manifest:
                 key_answers = {
-                    q.question_id: str(q.expected_answer_text or "").strip()
+                    q.question_id: canonicalize_quotient_remainder(str(q.expected_answer_text or "").strip())
                     for q in template_manifest.questions
                 }
             else:
                 key_answers = {}
                 for qid in expected_qids:
                     entry = regions_map.get(qid) or {}
-                    key_answers[qid] = str(entry.get("expected_answer_text") or "").strip()
+                    key_answers[qid] = canonicalize_quotient_remainder(str(entry.get("expected_answer_text") or "").strip())
             filtered_students = _filter_to_expected_qids(expected_qids, student_answers)
             missing = sorted({qid for qid in expected_qids if qid in missing_qids}, key=_qid_sort_key)
             grade_result, answers, answer_rows = score_answer_maps(key_answers, filtered_students)

@@ -178,6 +178,8 @@ Current diagnostic/cleanup titles (this pass):
 • D-13: Add region-level answer candidate scoring fallback (prefer answer-like spans in `region_box_px` over noisy division expressions from misaligned `bbox_px`).
 • D-14: Strengthen anchor span scoring against label-like numerics (`8.`) and add non-adjacent numeric+remainder merge (`127` + `R3`) for noisy OCR lines.
 • D-15: Make template approval state explicit in UI and upload gates (student uploads blocked until `manifest_locked`; add controlled manual-approve endpoint for test unblocking).
+• D-16: Make master-key approval blockers severity-aware (soften `ANCHOR_AMBIGUITY_HIGH`, `BOX_MODE_FALLBACK_APPLIED`, `EXPECTED_TEXT_QUALITY_LOW` when coverage is strong).
+• D-17: Reduce false `needs_review` in quotient/remainder grading (single-integer => `R0`, parse `d)D` division expressions, canonicalize key answers, and strengthen region answer ranking against cross-region bleed).
 
 ## Acceptance Criteria (Phase A)
 • Clean PDFs grade correctly (near-perfect scores).  

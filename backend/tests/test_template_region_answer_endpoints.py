@@ -34,6 +34,33 @@ async def test_assignment_answer_key_prefers_template_regions(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_assignment_answer_key_canonicalizes_division_expression(monkeypatch):
+    async def _should_not_run(*_args, **_kwargs):
+        raise AssertionError("OCR/LLM fallback should not run when template regions exist")
+
+    def fake_get_assignment(_assignment_id, _user_id, columns="*"):
+        return {
+            "id": "a1",
+            "owner_id": "owner-1",
+            "template_storage_path": "submissions/owner-1/templates/a1.png",
+            "template_regions_json": {
+                "regions": [
+                    {"qid": "Q1", "expected_answer_text": "5)588"},
+                ]
+            },
+            "template_uploaded_at": "2026-02-12T00:00:00+00:00",
+        }
+
+    monkeypatch.setattr("backend.api.assignments.get_assignment", fake_get_assignment)
+    monkeypatch.setattr("backend.api.assignments.download_submission_bytes", _should_not_run)
+    monkeypatch.setattr("backend.api.assignments.extract_answers_from_ocr", _should_not_run)
+
+    data = await get_answer_key("a1", user_id="owner-1", include_metadata=False)
+    assert data["prompt_version"] == "template-regions-v1"
+    assert data["answers"] == {"Q1": "117 R3"}
+
+
+@pytest.mark.asyncio
 async def test_upload_student_answers_prefers_template_regions(monkeypatch):
     async def _should_not_run(*_args, **_kwargs):
         raise AssertionError("LLM fallback should not run when template regions exist")
