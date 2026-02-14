@@ -238,17 +238,21 @@ def build_overlay_from_regions(
         page_index = int(region.get("page_index") or meta.get("page_index") or 0)
         page_no = page_index + 1
         page_size_for_mark = _page_size_for_index(page_index)
-        rect = _entry_bbox_to_px(region, (norm_w, norm_h), meta)
-        if not rect:
-            unplaced.append(item.question_id)
-            skipped_missing += 1
-            _fallback_mark(item.question_id, symbol, page_no)
-            continue
-        x0, y0, x1, y1 = rect
-        w = x1 - x0
-        h = y1 - y0
-        anchor_x_px = x0 + w - 18.0
-        anchor_y_px = y0 + 6.0
+        anchor = _entry_mark_anchor_to_px(region, (norm_w, norm_h))
+        if anchor is not None:
+            anchor_x_px, anchor_y_px = anchor
+        else:
+            rect = _entry_bbox_to_px(region, (norm_w, norm_h), meta)
+            if not rect:
+                unplaced.append(item.question_id)
+                skipped_missing += 1
+                _fallback_mark(item.question_id, symbol, page_no)
+                continue
+            x0, y0, x1, y1 = rect
+            w = x1 - x0
+            h = y1 - y0
+            anchor_x_px = x0 + w - 18.0
+            anchor_y_px = y0 + 6.0
         x_pt, y_pt = px_to_pdf(anchor_x_px, anchor_y_px, (norm_w, norm_h), page_size_for_mark)
         if item.low_confidence:
             skipped_needs_review += 1
@@ -318,6 +322,24 @@ def _entry_bbox_to_px(
         sx, sy = size
         return x * sx, y * sy, (x + w) * sx, (y + h) * sy
     return x, y, x + w, y + h
+
+
+def _entry_mark_anchor_to_px(
+    entry: Dict[str, Any],
+    size: Tuple[float, float],
+) -> Optional[Tuple[float, float]]:
+    anchor = entry.get("mark_anchor_px")
+    if not isinstance(anchor, (list, tuple)) or len(anchor) < 2:
+        return None
+    try:
+        x = float(anchor[0] or 0.0)
+        y = float(anchor[1] or 0.0)
+    except Exception:
+        return None
+    if max(abs(x), abs(y)) <= 1.5:
+        sx, sy = size
+        return x * sx, y * sy
+    return x, y
 
 
 def _entry_region_box_to_px(

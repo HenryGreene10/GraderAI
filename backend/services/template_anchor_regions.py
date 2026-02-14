@@ -1024,6 +1024,9 @@ def _pick_answer_box(
     # Keep answer-span search close to the anchor row; large vertical windows caused cross-row steals.
     search_y0 = max(0.0, ay - max(34.0, ah * 1.2))
     search_y1 = min(page_h, ay + max(120.0, ah * 2.6))
+    if anchor_cy >= (page_h * 0.62):
+        # Bottom rows are more vulnerable to footer pulls; use a tighter downward window.
+        search_y1 = min(search_y1, ay + max(74.0, ah * 1.9))
 
     def _within_anchor_band(rect: Tuple[float, float, float, float]) -> bool:
         rx, ry, rw, rh = rect
@@ -1034,6 +1037,8 @@ def _pick_answer_box(
         dx_min = -max(10.0, ah * 0.35)
         dx_max = max(260.0, page_w * 0.52, aw * 8.0)
         dy_max = max(92.0, ah * 2.4)
+        if anchor_cy >= (page_h * 0.62):
+            dy_max = min(dy_max, max(60.0, ah * 1.55))
         return (dx_min <= dx <= dx_max) and (dy <= dy_max)
 
     nearby = []

@@ -77,3 +77,14 @@ def test_overlay_marks_by_page_prefers_meta_payload():
     assert 1 in marks and 2 in marks
     assert marks[1][0].text == "first"
     assert marks[2][0].text == "second"
+
+
+def test_review_note_is_boxed_for_visibility():
+    overlay = Overlay(
+        page=1,
+        marks=[OverlayMark(tool="note", coords=[50.0, 60.0], text="REVIEW")],
+    )
+    canvas = _CanvasSpy()
+    report_mod._draw_marks(canvas, overlay, coords_space="pt")
+    assert any(text == "REVIEW" for _x, _y, text in canvas.draw_calls)
+    assert len(canvas.rect_calls) >= 1

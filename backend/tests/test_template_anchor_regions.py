@@ -435,6 +435,31 @@ def test_anchor_mode_fallback_does_not_steal_footer_k5_text():
     assert float(q8.answer_box[1]) < 1250.0
 
 
+def test_anchor_mode_bottom_row_rejects_far_below_numeric_candidate():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1224,
+                    "height": 1584,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q7.", 105, 1041, 50, 56)]),
+                        _line([_word("76", 534, 1220, 40, 44)]),
+                    ],
+                }
+            ]
+        }
+    }
+    regions, _warnings, _trace = build_anchor_template_regions(ocr_boxes=boxes, image_size=(1224, 1584))
+    assert len(regions) == 1
+    assert str(regions[0].expected_answer_text or "").strip() == ""
+    # Bottom-row fallback should stay near Q7, not drift to a far-lower numeric token.
+    assert float(regions[0].answer_box[1]) < 1125.0
+
+
 def test_anchor_mode_left_column_can_reach_far_right_answer_span():
     boxes = {
         "analyzeResult": {

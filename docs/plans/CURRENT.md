@@ -159,6 +159,8 @@ Status snapshot for this track:
 • A7.4 implemented (manifest mark-count integrity degrades to review)
 • A7.5 implemented (shared master-key approval pipeline used by assignment template upload + scan master-key upload)
 • A7.6 implemented (template overlay integrity gates: mark-count + qid-set validation with fail-closed-to-review on violations)
+• D20 implemented (REVIEW marker visibility increased in renderer; bottom-row anchor band tightened to reduce late-row drift; regressions added)
+• D21 implemented (template-region overlay projected back onto student frame via homography; mark placement can use explicit projected anchor points independent of student handwriting OCR geometry)
 • A7.7–A7.10 pending
 • Execution pause: waiting for manual verification before starting A7.7
 
@@ -182,6 +184,8 @@ Current diagnostic/cleanup titles (this pass):
 • D-17: Reduce false `needs_review` in quotient/remainder grading (single-integer => `R0`, parse `d)D` division expressions, canonicalize key answers, and strengthen region answer ranking against cross-region bleed).
 • D-18: Prevent anchor fallback row drift into footer/adjacent handwriting (enforce anchor-row geometry on selected answer boxes and reject weak fallback text outside band).
 • D-19: Stabilize left-column anchor reach + fallback box size (allow farther-right same-row answer spans; cap missing-answer fallback bbox to avoid oversized/drifting overlay marks).
+• D-20: Improve REVIEW mark legibility and tighten bottom-row vertical candidate windows (larger boxed REVIEW note in PDF overlays + stricter bottom-row anchor banding to limit low-row drift).
+• D-21: Decouple mark placement from student-answer span geometry by projecting template regions/anchors into student-page coordinates using alignment homography and rendering overlays on the student frame.
 
 ## Acceptance Criteria (Phase A)
 • Clean PDFs grade correctly (near-perfect scores).  

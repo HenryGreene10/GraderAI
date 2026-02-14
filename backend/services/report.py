@@ -26,6 +26,8 @@ MISSING_OVERLAY_BANNER = "NO OVERLAY GENERATED — NEEDS REVIEW"
 MARK_DRAW_SIZE_PT = float(os.getenv("OVERLAY_MARK_SIZE_PT", "22"))
 MARK_DRAW_STROKE_PT = float(os.getenv("OVERLAY_MARK_STROKE_PT", "2.2"))
 NOTE_FONT_SIZE_PT = float(os.getenv("OVERLAY_NOTE_FONT_PT", "13"))
+REVIEW_NOTE_FONT_SIZE_PT = float(os.getenv("OVERLAY_REVIEW_NOTE_FONT_PT", "18"))
+REVIEW_NOTE_STROKE_PT = float(os.getenv("OVERLAY_REVIEW_NOTE_STROKE_PT", "1.2"))
 BUBBLE_FONT_SIZE_PT = float(os.getenv("OVERLAY_BUBBLE_FONT_PT", "13"))
 
 
@@ -49,6 +51,19 @@ def _draw_vector_cross(c: canvas.Canvas, x: float, y: float, size: float = MARK_
         pass
     c.line(x, y, x + size * 0.92, y + size * 0.92)
     c.line(x, y + size * 0.92, x + size * 0.92, y)
+
+
+def _draw_review_note(c: canvas.Canvas, x: float, y: float, text: str) -> None:
+    label = "REVIEW" if str(text or "").strip().upper() == "REVIEW" else str(text or "")
+    c.setFont("Helvetica-Bold", REVIEW_NOTE_FONT_SIZE_PT)
+    c.setFillColorRGB(0.8, 0.1, 0.1)
+    c.drawString(x, y, label)
+    est_w = max(44.0, len(label) * REVIEW_NOTE_FONT_SIZE_PT * 0.56)
+    est_h = max(14.0, REVIEW_NOTE_FONT_SIZE_PT * 0.92)
+    c.setStrokeColorRGB(0.8, 0.1, 0.1)
+    c.setLineWidth(REVIEW_NOTE_STROKE_PT)
+    c.rect(x - 2.0, y - 2.0, est_w + 5.0, est_h + 4.0, stroke=1, fill=0)
+    c.setFillColorRGB(0, 0, 0)
 
 
 def build_overlay_basic(result: GradeResult) -> Overlay:
@@ -209,8 +224,12 @@ def _draw_marks(
             x, y = (x_px, y_px)
             if use_px_coords and normalized_size_px and page_size_pt:
                 x, y = _convert_point(x_px, y_px, normalized_size_px, page_size_pt)
-            c.setFont("Helvetica-Bold", NOTE_FONT_SIZE_PT)
-            c.drawString(x, y, mark.text or "")
+            note_text = str(mark.text or "")
+            if note_text.strip().upper().startswith("REVIEW"):
+                _draw_review_note(c, x, y, note_text)
+            else:
+                c.setFont("Helvetica-Bold", NOTE_FONT_SIZE_PT)
+                c.drawString(x, y, note_text)
         elif mark.tool == "bubble":
             c.setFont("Helvetica-Bold", BUBBLE_FONT_SIZE_PT)
             if len(mark.coords) >= 4:

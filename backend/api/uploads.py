@@ -3,7 +3,7 @@ import logging
 import os
 from io import BytesIO
 import re
-from typing import Optional, Literal, Tuple
+from typing import Any, Dict, List, Optional, Literal, Tuple
 
 from PIL import Image
 
@@ -283,6 +283,127 @@ def _entry_bbox_px(entry: dict, size: Tuple[float, float]) -> Optional[Tuple[flo
         sx, sy = size
         return x * sx, y * sy, (x + w) * sx, (y + h) * sy
     return x, y, x + w, y + h
+
+
+def _homography_3x3(values: object) -> Optional[List[List[float]]]:
+    if not isinstance(values, list) or len(values) != 3:
+        return None
+    out: List[List[float]] = []
+    try:
+        for row in values:
+            if not isinstance(row, list) or len(row) != 3:
+                return None
+            out.append([float(row[0]), float(row[1]), float(row[2])])
+    except Exception:
+        return None
+    return out
+
+
+def _invert_3x3(m: List[List[float]]) -> Optional[List[List[float]]]:
+    a, b, c = m[0]
+    d, e, f = m[1]
+    g, h, i = m[2]
+    A = (e * i) - (f * h)
+    B = -((d * i) - (f * g))
+    C = (d * h) - (e * g)
+    D = -((b * i) - (c * h))
+    E = (a * i) - (c * g)
+    F = -((a * h) - (b * g))
+    G = (b * f) - (c * e)
+    H = -((a * f) - (c * d))
+    I = (a * e) - (b * d)
+    det = (a * A) + (b * B) + (c * C)
+    if abs(det) < 1e-9:
+        return None
+    inv_det = 1.0 / det
+    return [
+        [A * inv_det, D * inv_det, G * inv_det],
+        [B * inv_det, E * inv_det, H * inv_det],
+        [C * inv_det, F * inv_det, I * inv_det],
+    ]
+
+
+def _project_point(x: float, y: float, h_mat: List[List[float]]) -> Optional[Tuple[float, float]]:
+    wx = (h_mat[0][0] * x) + (h_mat[0][1] * y) + h_mat[0][2]
+    wy = (h_mat[1][0] * x) + (h_mat[1][1] * y) + h_mat[1][2]
+    wz = (h_mat[2][0] * x) + (h_mat[2][1] * y) + h_mat[2][2]
+    if abs(wz) < 1e-9:
+        return None
+    return wx / wz, wy / wz
+
+
+def _project_template_regions_for_student_overlay(
+    *,
+    regions_payload: object,
+    template_size: Tuple[float, float],
+    student_size: Tuple[float, float],
+    homography: object,
+) -> Optional[Dict[str, Any]]:
+    h_raw = _homography_3x3(homography)
+    if h_raw is None:
+        return None
+    h_inv = _invert_3x3(h_raw)
+    if h_inv is None:
+        return None
+
+    regions_map, meta = parse_regions_payload(regions_payload)
+    if not regions_map:
+        return None
+
+    student_w = max(1.0, float(student_size[0]))
+    student_h = max(1.0, float(student_size[1]))
+    out_regions: List[Dict[str, Any]] = []
+    for qid in sorted((str(key) for key in regions_map.keys()), key=_qid_sort_key):
+        entry = regions_map.get(qid) or {}
+        rect = _entry_bbox_px(entry, template_size)
+        if not rect:
+            return None
+        x0, y0, x1, y1 = rect
+        corners = [
+            _project_point(x0, y0, h_inv),
+            _project_point(x1, y0, h_inv),
+            _project_point(x0, y1, h_inv),
+            _project_point(x1, y1, h_inv),
+        ]
+        if any(p is None for p in corners):
+            return None
+        pts = [(float(p[0]), float(p[1])) for p in corners if p is not None]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        px0 = max(0.0, min(student_w - 1.0, min(xs)))
+        py0 = max(0.0, min(student_h - 1.0, min(ys)))
+        px1 = max(0.0, min(student_w - 1.0, max(xs)))
+        py1 = max(0.0, min(student_h - 1.0, max(ys)))
+        pw = max(1.0, px1 - px0)
+        ph = max(1.0, py1 - py0)
+
+        anchor = _project_point(x1 - 18.0, y0 + 6.0, h_inv)
+        if anchor is None:
+            return None
+        ax = max(0.0, min(student_w - 1.0, float(anchor[0])))
+        ay = max(0.0, min(student_h - 1.0, float(anchor[1])))
+
+        projected_entry: Dict[str, Any] = {
+            "qid": qid,
+            "page_index": int(entry.get("page_index") or meta.get("page_index") or 0),
+            "bbox_px": [px0, py0, pw, ph],
+            "mark_anchor_px": [ax, ay],
+            "source": "template_projected_overlay",
+        }
+        expected = entry.get("expected_answer_text")
+        if expected is not None:
+            projected_entry["expected_answer_text"] = expected
+        out_regions.append(projected_entry)
+
+    if len(out_regions) != len(regions_map):
+        return None
+    return {
+        "version": 1,
+        "page_index": 0,
+        "template_width_px": student_w,
+        "template_height_px": student_h,
+        "regions": out_regions,
+    }
 
 
 def _save_qid_crops_debug(
@@ -629,6 +750,9 @@ async def run_grade_pipeline(
         answers_json = None
         answer_rows = []
         answer_prompt_version = None
+        overlay_regions_payload = template_regions
+        overlay_projected_to_student = False
+        student_size_px: Optional[Tuple[float, float]] = None
         effective_normalized_size = (
             float(row.get("normalized_width_px") or 0.0),
             float(row.get("normalized_height_px") or 0.0),
@@ -666,6 +790,8 @@ async def run_grade_pipeline(
             if row.get("normalized_image_path"):
                 try:
                     student_png = download_submission_bytes(row.get("normalized_image_path"))
+                    with Image.open(BytesIO(student_png)) as img:
+                        student_size_px = (float(img.width), float(img.height))
                 except Exception as exc:
                     region_frame_error = f"student_image_load_failed: {exc}"
 
@@ -685,6 +811,17 @@ async def run_grade_pipeline(
                 if template_alignment.ok:
                     frame_png_bytes = template_alignment.aligned_png
                     debug_image_bytes = frame_png_bytes
+                    if template_size and student_size_px and template_alignment.homography:
+                        projected_regions = _project_template_regions_for_student_overlay(
+                            regions_payload=template_regions,
+                            template_size=template_size,
+                            student_size=student_size_px,
+                            homography=template_alignment.homography,
+                        )
+                        if projected_regions:
+                            overlay_regions_payload = projected_regions
+                            overlay_projected_to_student = True
+                            debug_image_bytes = student_png
                     raw = await ocr_service.extract_text(image_bytes=frame_png_bytes)
                     norm = normalize_ocr_result(raw)
                     frame_ocr_boxes = norm.get("boxes") or {}
@@ -770,7 +907,17 @@ async def run_grade_pipeline(
                 except Exception:
                     logger.exception("Failed to save qid crop debug artifacts for %s", row["id"])
 
-            if frame_png_bytes is not None:
+            if overlay_projected_to_student:
+                pdf_source_path = row.get("normalized_pdf_path") or storage_path
+                pdf_source_key = strip_bucket_prefix(pdf_source_path, SUBMISSIONS_BUCKET)
+                sb = get_supabase()
+                if sb is None:
+                    raise RuntimeError("Supabase client unavailable")
+                pdf_source_bytes = sb.storage.from_(SUBMISSIONS_BUCKET).download(pdf_source_key)
+                if not pdf_source_bytes:
+                    raise RuntimeError(f"Submission not found: {pdf_source_path}")
+                pdf_mime = "application/pdf" if row.get("normalized_pdf_path") else row.get("mime_type")
+            elif frame_png_bytes is not None:
                 pdf_source_bytes = image_bytes_to_pdf(frame_png_bytes)
                 pdf_mime = "application/pdf"
             else:
@@ -786,7 +933,9 @@ async def run_grade_pipeline(
             page_sizes = get_page_sizes(pdf_source_bytes, pdf_mime)
             page_size = page_sizes[0] if page_sizes else (612.0, 792.0)
             normalized_size = effective_normalized_size
-            if frame_png_bytes is not None:
+            if overlay_projected_to_student and student_size_px:
+                normalized_size = (float(student_size_px[0]), float(student_size_px[1]))
+            elif frame_png_bytes is not None:
                 try:
                     with Image.open(BytesIO(frame_png_bytes)) as img:
                         normalized_size = (float(img.width), float(img.height))
@@ -798,7 +947,7 @@ async def run_grade_pipeline(
             effective_normalized_size = normalized_size
             overlay, marks_placed, marks_skipped_missing, marks_skipped_needs_review, unplaced_items = build_overlay_from_regions(
                 grade_result,
-                template_regions,
+                overlay_regions_payload,
                 normalized_size,
                 page_size,
                 page_sizes_pt=page_sizes,
@@ -1063,6 +1212,9 @@ async def run_grade_pipeline(
                 grade_json["template_degraded_reasons"] = sorted(set(template_degraded_reasons))
             if region_frame_source:
                 grade_json["template_region_frame"] = region_frame_source
+            grade_json["template_overlay_frame"] = (
+                "student_projected_homography" if overlay_projected_to_student else "template_frame"
+            )
             if region_frame_error:
                 grade_json["template_region_frame_error"] = region_frame_error
             if template_alignment:

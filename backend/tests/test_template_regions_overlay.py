@@ -84,3 +84,43 @@ def test_template_regions_overlay_uses_page_specific_sizes():
     x_pt, y_pt = check["coords"][0], check["coords"][1]
     assert round(x_pt, 1) == 54.6
     assert round(y_pt, 1) == 268.2
+
+
+def test_template_regions_overlay_prefers_explicit_mark_anchor():
+    payload = {
+        "version": 1,
+        "page_index": 0,
+        "template_width_px": 1000,
+        "template_height_px": 1000,
+        "regions": [
+            {
+                "qid": "Q1",
+                "bbox_px": [900, 900, 60, 40],
+                "mark_anchor_px": [100, 200],
+            },
+        ],
+    }
+    grade = GradeResult(
+        submission_id="s3",
+        total_score=1.0,
+        total_max=1.0,
+        rubric_version="test",
+        prompt_version="test",
+        items=[_question("Q1", 1.0)],
+    )
+
+    overlay, placed, skipped_missing, skipped_review, unplaced = build_overlay_from_regions(
+        grade,
+        payload,
+        (1000.0, 1000.0),
+        (612.0, 792.0),
+    )
+
+    assert placed == 1
+    assert skipped_missing == 0
+    assert skipped_review == 0
+    assert unplaced == []
+    check = next((m for m in overlay.marks if m.tool in {"check", "cross", "note"}), None)
+    assert check is not None
+    assert round(float(check.coords[0]), 1) == 61.2
+    assert round(float(check.coords[1]), 1) == 633.6
