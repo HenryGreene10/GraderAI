@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
@@ -6,6 +6,7 @@ import { apiBase } from "../lib/apiBase";
 
 const OPENCV_URL = "https://docs.opencv.org/4.x/opencv.js";
 const PDF_LIB_URL = "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js";
+const ENABLE_OPENCV = String(import.meta.env.VITE_ENABLE_OPENCV || "").trim() === "1";
 let opencvPromise;
 let pdfLibPromise;
 
@@ -104,7 +105,7 @@ async function canvasToBlob(canvas, type = "image/jpeg", quality = 0.92) {
   });
 }
 
-async function rectifyWithOpenCv(canvas, cv) {
+async function rectifyWithOpenCv(canvas, cv, { preferPng = false } = {}) {
   const src = cv.imread(canvas);
   const gray = new cv.Mat();
   const blurred = new cv.Mat();
@@ -181,7 +182,11 @@ async function rectifyWithOpenCv(canvas, cv) {
     outCanvas.height = result.rows;
     cv.imshow(outCanvas, result);
     if (warped) warped.delete();
-    const blob = await canvasToBlob(outCanvas);
+    const blob = await canvasToBlob(
+      outCanvas,
+      preferPng ? "image/png" : "image/jpeg",
+      preferPng ? undefined : 0.98,
+    );
     return {
       blob,
       width: outCanvas.width,
@@ -200,7 +205,7 @@ async function rectifyWithOpenCv(canvas, cv) {
   }
 }
 
-async function captureFromVideo(video, cvReady) {
+async function captureFromVideo(video, cvReady, { preferPng = false } = {}) {
   const canvas = document.createElement("canvas");
   canvas.width = video.videoWidth || 0;
   canvas.height = video.videoHeight || 0;
@@ -210,19 +215,41 @@ async function captureFromVideo(video, cvReady) {
   if (cvReady) {
     try {
       const cv = await loadOpenCv();
-      return await rectifyWithOpenCv(canvas, cv);
+      return await rectifyWithOpenCv(canvas, cv, { preferPng });
     } catch (err) {
       console.error("OpenCV rectification failed", err);
     }
   }
 
-  const blob = await canvasToBlob(canvas);
+  const blob = await canvasToBlob(
+    canvas,
+    preferPng ? "image/png" : "image/jpeg",
+    preferPng ? undefined : 0.98,
+  );
   return {
     blob,
     width: canvas.width,
     height: canvas.height,
     previewUrl: blob ? URL.createObjectURL(blob) : "",
   };
+}
+
+async function maximizeTrackQuality(track) {
+  if (!track?.getCapabilities || !track?.applyConstraints) return;
+  try {
+    const capabilities = track.getCapabilities();
+    const advanced = {};
+    if (capabilities?.width?.max) advanced.width = capabilities.width.max;
+    if (capabilities?.height?.max) advanced.height = capabilities.height.max;
+    if (Array.isArray(capabilities?.focusMode) && capabilities.focusMode.includes("continuous")) {
+      advanced.focusMode = "continuous";
+    }
+    if (Object.keys(advanced).length > 0) {
+      await track.applyConstraints({ advanced: [advanced] });
+    }
+  } catch {
+    // ignore unsupported capability tuning on some mobile browsers
+  }
 }
 
 export default function ScanCapturePage() {
@@ -236,6 +263,7 @@ export default function ScanCapturePage() {
   const [uploading, setUploading] = useState(false);
   const [cameraError, setCameraError] = useState("");
   const [cameraNotice, setCameraNotice] = useState("");
+  const [cameraStarting, setCameraStarting] = useState(false);
   const [cvReady, setCvReady] = useState(false);
   const [cvError, setCvError] = useState("");
   const [captured, setCaptured] = useState(null);
@@ -243,21 +271,84 @@ export default function ScanCapturePage() {
   const pagesRef = useRef([]);
   const capturedRef = useRef(null);
 
-  useEffect(() => {
-    let active = true;
-    loadOpenCv()
-      .then(() => {
-        if (!active) return;
-        setCvReady(true);
-      })
-      .catch((err) => {
-        if (!active) return;
-        setCvError(err?.message || "OpenCV failed to load");
-      });
-    return () => {
-      active = false;
-    };
+  const stopCamera = useCallback(() => {
+    if (!streamRef.current) return;
+    streamRef.current.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
   }, []);
+
+  const startCamera = useCallback(async () => {
+    if (!token || status === "expired") return;
+    if (!window.isSecureContext) {
+      setCameraError("");
+      setCameraNotice("Camera requires HTTPS on iPhone. Open the https:// link.");
+      return;
+    }
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      setCameraError("");
+      setCameraNotice("Camera is unavailable in this browser.");
+      return;
+    }
+    setCameraStarting(true);
+    setCameraError("");
+    setCameraNotice("Starting camera...");
+    stopCamera();
+    const attempts = [
+      {
+        video: {
+          facingMode: { exact: "environment" },
+          width: { ideal: 3024 },
+          height: { ideal: 4032 },
+        },
+        audio: false,
+      },
+      {
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 24, max: 30 },
+        },
+        audio: false,
+      },
+      { video: true, audio: false },
+    ];
+    let lastError = null;
+    for (const constraints of attempts) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        const track = stream.getVideoTracks()[0];
+        if (track) {
+          await maximizeTrackQuality(track);
+        }
+        streamRef.current = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.setAttribute("playsinline", "true");
+          videoRef.current.muted = true;
+          try {
+            await videoRef.current.play();
+          } catch {
+            // iOS can reject autoplay even after permission; keep stream attached and allow manual retry.
+          }
+        }
+        const settings = track?.getSettings ? track.getSettings() : {};
+        const sw = settings?.width || videoRef.current?.videoWidth || "";
+        const sh = settings?.height || videoRef.current?.videoHeight || "";
+        setCameraNotice(sw && sh ? `Camera ready (${sw}x${sh}).` : "Camera ready.");
+        setCameraStarting(false);
+        return;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    setCameraError(lastError?.message || "Camera unavailable");
+    setCameraNotice("");
+    setCameraStarting(false);
+  }, [token, status, stopCamera]);
 
   useEffect(() => {
     if (!token) return;
@@ -276,45 +367,11 @@ export default function ScanCapturePage() {
   }, [token]);
 
   useEffect(() => {
-    if (!token || status === "expired") return undefined;
-    if (!window.isSecureContext) {
-      setCameraError("");
-      setCameraNotice("Camera requires HTTPS on iPhone. Open the https:// link.");
-      return undefined;
-    }
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      setCameraError("");
-      setCameraNotice("Camera requires HTTPS on iPhone. Open the https:// link.");
-      return undefined;
-    }
-    let cancelled = false;
-    const startCamera = async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" } },
-          audio: false,
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((track) => track.stop());
-          return;
-        }
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
-      } catch (err) {
-        setCameraError(err?.message || "Camera unavailable");
-      }
-    };
     startCamera();
     return () => {
-      cancelled = true;
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
-        streamRef.current = null;
-      }
+      stopCamera();
     };
-  }, [token, status]);
+  }, [startCamera, stopCamera]);
 
   useEffect(() => {
     pagesRef.current = pages;
@@ -340,7 +397,19 @@ export default function ScanCapturePage() {
       return;
     }
     setMessage("Processing scan...");
-    const result = await captureFromVideo(videoRef.current, cvReady);
+    let useCv = false;
+    if (ENABLE_OPENCV) {
+      if (!cvReady) {
+        try {
+          await loadOpenCv();
+          setCvReady(true);
+        } catch (err) {
+          setCvError(err?.message || "OpenCV failed to load");
+        }
+      }
+      useCv = cvReady || Boolean(window.cv?.Mat);
+    }
+    const result = await captureFromVideo(videoRef.current, useCv, { preferPng: mode === "master_key" });
     if (!result?.blob) {
       setMessage("Capture failed. Try again.");
       return;
@@ -415,7 +484,8 @@ export default function ScanCapturePage() {
     try {
       const form = new FormData();
       const first = pages[0];
-      form.append("file", first.blob, "scan.jpg");
+      const fileName = first.blob?.type === "image/png" ? "scan.png" : "scan.jpg";
+      form.append("file", first.blob, fileName);
       const uploadUrl = `${apiBase()}/api/scan/${token}/upload`;
       const resp = await fetch(uploadUrl, { method: "POST", body: form });
       const data = await resp.json().catch(() => ({}));
@@ -459,6 +529,12 @@ export default function ScanCapturePage() {
       }));
       const form = new FormData();
       form.append("file", pdfBlob, "scan.pdf");
+      if (pages[0]?.blob) {
+        const normalizedName = pages[0].blob?.type === "image/png"
+          ? "normalized-page-1.png"
+          : "normalized-page-1.jpg";
+        form.append("normalized_image", pages[0].blob, normalizedName);
+      }
       form.append("page_count", String(pages.length));
       form.append("page_sizes", JSON.stringify(sizes));
       const uploadUrl = `${apiBase()}/api/scan/${token}/upload`;
@@ -503,6 +579,9 @@ export default function ScanCapturePage() {
         {cameraError && (
           <p className="text-sm text-red-600 mt-2">Camera error: {cameraError}</p>
         )}
+          {!cameraError && cameraStarting && (
+            <p className="text-xs text-slate-500 mt-1">Starting camera...</p>
+          )}
           {cvError && (
             <p className="text-xs text-slate-500 mt-1">OpenCV disabled: {cvError}</p>
           )}
@@ -546,6 +625,11 @@ export default function ScanCapturePage() {
               <Button variant="secondary" onClick={handleCapture} disabled={!canCapture}>
                 {uploading ? "Working..." : "Capture page"}
               </Button>
+              {(cameraError || cameraNotice) && (
+                <Button variant="outline" onClick={startCamera} disabled={uploading || status === "expired"}>
+                  Retry camera
+                </Button>
+              )}
               {mode === "student" && pages.length > 0 && (
                 <Button variant="outline" onClick={resetPages} disabled={uploading}>
                   Clear packet
