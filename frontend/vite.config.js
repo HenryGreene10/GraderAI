@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import fs from "fs";
 import path from "path";
@@ -6,25 +6,23 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultCertDir = path.resolve(__dirname, ".cert");
-const certPath =
-  process.env.VITE_HTTPS_CERT_FILE || path.join(defaultCertDir, "localhost.pem");
-const keyPath =
-  process.env.VITE_HTTPS_KEY_FILE || path.join(defaultCertDir, "localhost-key.pem");
-const useHttps = String(process.env.VITE_DEV_HTTPS || "").toLowerCase() === "true"
-  || process.env.VITE_DEV_HTTPS === "1";
 
-function resolveDevPort(defaultPort) {
+function resolveDevPort(defaultPort, env) {
   const portFlagIndex = process.argv.findIndex((arg) => arg === "--port" || arg === "-p");
   if (portFlagIndex !== -1) {
     const value = Number(process.argv[portFlagIndex + 1]);
     if (Number.isFinite(value) && value > 0) return value;
   }
-  const envPort = Number(process.env.VITE_PORT || process.env.PORT);
+  const envPort = Number(env.VITE_PORT || env.PORT);
   if (Number.isFinite(envPort) && envPort > 0) return envPort;
   return defaultPort;
 }
 
-function resolveHttpsConfig() {
+function resolveHttpsConfig(env) {
+  const certPath = env.VITE_HTTPS_CERT_FILE || path.join(defaultCertDir, "localhost.pem");
+  const keyPath = env.VITE_HTTPS_KEY_FILE || path.join(defaultCertDir, "localhost-key.pem");
+  const useHttps = String(env.VITE_DEV_HTTPS || "").toLowerCase() === "true"
+    || env.VITE_DEV_HTTPS === "1";
   if (!useHttps) return false;
   const hasCert = fs.existsSync(certPath);
   const hasKey = fs.existsSync(keyPath);
@@ -42,10 +40,11 @@ function resolveHttpsConfig() {
   };
 }
 
-export default defineConfig(() => {
-  const httpsConfig = resolveHttpsConfig();
-  const devPort = resolveDevPort(5173);
-  const apiBaseUrl = String(process.env.VITE_API_BASE_URL || "").trim().replace(/\/+$/, "");
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), "");
+  const httpsConfig = resolveHttpsConfig(env);
+  const devPort = resolveDevPort(5173, env);
+  const apiBaseUrl = String(env.VITE_API_BASE_URL || "").trim().replace(/\/+$/, "");
   if (!apiBaseUrl) {
     throw new Error("VITE_API_BASE_URL is required for frontend dev proxy target");
   }
