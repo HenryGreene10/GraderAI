@@ -58,13 +58,13 @@ mkcert -key-file frontend/.cert/localhost-key.pem -cert-file frontend/.cert/loca
 ```bash
 npm --prefix frontend run dev:https -- --host 0.0.0.0 --port 5173
 ```
-Optional for QR links:
+Set frontend origins:
 ```
 VITE_PUBLIC_BASE_URL=https://$LAN_IP:5173
+VITE_API_BASE_URL=https://$LAN_IP:8000
 ```
-If unset, the scan/QR links fall back to `window.location.origin`. During `npm run dev`, the
-frontend auto-populates `VITE_PUBLIC_BASE_URL` with the current LAN IP when available so QR links
-match the Vite Network address.
+`VITE_PUBLIC_BASE_URL` is required for scan/QR links and must be reachable by your phone.
+`VITE_API_BASE_URL` is required for API calls.
 
 4) iPhone trust steps:
    - Find the mkcert CA with `mkcert -CAROOT`, copy `rootCA.pem` to the iPhone and install it.
@@ -82,7 +82,8 @@ Frontend:
 - `VITE_BACKEND_URL`
 - `VITE_SUPABASE_URL`
 - `VITE_SUPABASE_ANON_KEY`
-- `VITE_PUBLIC_BASE_URL` (optional; defaults to `window.location.origin`)
+- `VITE_PUBLIC_BASE_URL` (required for scan QR origin)
+- `VITE_API_BASE_URL` (required for API calls)
 
 ## Sample flow (developer)
 1) Create assignment.

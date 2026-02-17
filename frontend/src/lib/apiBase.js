@@ -9,11 +9,13 @@ function normalizeBaseUrl(value) {
 export function publicBase() {
   const envBase = normalizeBaseUrl(import.meta.env.VITE_PUBLIC_BASE_URL);
   if (envBase) return envBase;
-  return window.location.origin;
+  throw new Error("VITE_PUBLIC_BASE_URL is required for scan QR links");
 }
 
 export function apiBase() {
-  return window.location.origin;
+  const envBase = normalizeBaseUrl(import.meta.env.VITE_API_BASE_URL);
+  if (envBase) return envBase;
+  throw new Error("VITE_API_BASE_URL is required for API calls");
 }
 
 export async function getAuthHeaders() {

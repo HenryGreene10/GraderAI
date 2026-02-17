@@ -1,7 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import fs from "fs";
-import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -13,29 +12,6 @@ const keyPath =
   process.env.VITE_HTTPS_KEY_FILE || path.join(defaultCertDir, "localhost-key.pem");
 const useHttps = String(process.env.VITE_DEV_HTTPS || "").toLowerCase() === "true"
   || process.env.VITE_DEV_HTTPS === "1";
-
-function isPrivateIpv4(address) {
-  if (address.startsWith("10.")) return true;
-  if (address.startsWith("192.168.")) return true;
-  const match = address.match(/^172\\.(\\d+)\\./);
-  if (!match) return false;
-  const segment = Number(match[1]);
-  return segment >= 16 && segment <= 31;
-}
-
-function resolveLanHost() {
-  const interfaces = os.networkInterfaces();
-  let fallback = "";
-  for (const entries of Object.values(interfaces)) {
-    for (const net of entries || []) {
-      const isIpv4 = net?.family === "IPv4" || net?.family === 4;
-      if (!net || !isIpv4 || net.internal) continue;
-      if (isPrivateIpv4(net.address)) return net.address;
-      if (!fallback) fallback = net.address;
-    }
-  }
-  return fallback;
-}
 
 function resolveDevPort(defaultPort) {
   const portFlagIndex = process.argv.findIndex((arg) => arg === "--port" || arg === "-p");
@@ -66,17 +42,12 @@ function resolveHttpsConfig() {
   };
 }
 
-export default defineConfig(({ command }) => {
+export default defineConfig(() => {
   const httpsConfig = resolveHttpsConfig();
   const devPort = resolveDevPort(5173);
-  const publicBaseEnv = String(process.env.VITE_PUBLIC_BASE_URL || "").trim();
-
-  if (command === "serve" && !publicBaseEnv) {
-    const lanHost = resolveLanHost();
-    if (lanHost) {
-      const protocol = httpsConfig ? "https" : "http";
-      process.env.VITE_PUBLIC_BASE_URL = `${protocol}://${lanHost}:${devPort}`;
-    }
+  const apiBaseUrl = String(process.env.VITE_API_BASE_URL || "").trim().replace(/\/+$/, "");
+  if (!apiBaseUrl) {
+    throw new Error("VITE_API_BASE_URL is required for frontend dev proxy target");
   }
 
   return {
@@ -92,7 +63,7 @@ export default defineConfig(({ command }) => {
       https: httpsConfig || false,
       proxy: {
         "/api": {
-          target: "http://127.0.0.1:8000",
+          target: apiBaseUrl,
           changeOrigin: true,
           secure: false,
         },
