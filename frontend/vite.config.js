@@ -44,10 +44,9 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const httpsConfig = resolveHttpsConfig(env);
   const devPort = resolveDevPort(5173, env);
-  const apiBaseUrl = String(env.VITE_API_BASE_URL || "").trim().replace(/\/+$/, "");
-  if (!apiBaseUrl) {
-    throw new Error("VITE_API_BASE_URL is required for frontend dev proxy target");
-  }
+  const devProxyTarget = String(env.VITE_DEV_PROXY_TARGET || "http://127.0.0.1:8000")
+    .trim()
+    .replace(/\/+$/, "");
 
   return {
     plugins: [react()],
@@ -62,7 +61,7 @@ export default defineConfig(({ mode }) => {
       https: httpsConfig || false,
       proxy: {
         "/api": {
-          target: apiBaseUrl,
+          target: devProxyTarget,
           changeOrigin: true,
           secure: false,
         },
