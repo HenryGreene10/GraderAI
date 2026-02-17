@@ -50,7 +50,7 @@ mkcert -install
 ```bash
 mkdir -p frontend/.cert
 LAN_IP=$(hostname -I | awk '{print $1}')
-mkcert -key-file frontend/.cert/localhost-key.pem -cert-file frontend/.cert/localhost.pem \
+mkcert -key-file frontend/.cert/key.pem -cert-file frontend/.cert/cert.pem \
   localhost 127.0.0.1 ::1 "$LAN_IP"
 ```
 
@@ -62,9 +62,12 @@ Set frontend origins:
 ```
 VITE_PUBLIC_BASE_URL=https://$LAN_IP:5173
 VITE_API_BASE_URL=https://$LAN_IP:8000
+VITE_DEV_PROXY_TARGET=http://127.0.0.1:8000
 ```
 `VITE_PUBLIC_BASE_URL` is required for scan/QR links and must be reachable by your phone.
 `VITE_API_BASE_URL` is required for API calls.
+`VITE_DEV_PROXY_TARGET` is used only by Vite dev server proxy (WSL/local hop).
+`frontend/.cert/` is ignored by git.
 
 4) iPhone trust steps:
    - Find the mkcert CA with `mkcert -CAROOT`, copy `rootCA.pem` to the iPhone and install it.
@@ -84,6 +87,7 @@ Frontend:
 - `VITE_SUPABASE_ANON_KEY`
 - `VITE_PUBLIC_BASE_URL` (required for scan QR origin)
 - `VITE_API_BASE_URL` (required for API calls)
+- `VITE_DEV_PROXY_TARGET` (dev proxy target; default `http://127.0.0.1:8000`)
 
 ## Sample flow (developer)
 1) Create assignment.
