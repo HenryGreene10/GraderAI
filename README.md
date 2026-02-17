@@ -88,6 +88,7 @@ Frontend:
 - `VITE_PUBLIC_BASE_URL` (required for scan QR origin)
 - `VITE_API_BASE_URL` (required for API calls)
 - `VITE_DEV_PROXY_TARGET` (dev proxy target; default `http://127.0.0.1:8000`)
+- `VITE_DEV_BYPASS_AUTH` (optional; set `1` for DEV localhost-only auth bypass on scan paths)
 
 ## Sample flow (developer)
 1) Create assignment.

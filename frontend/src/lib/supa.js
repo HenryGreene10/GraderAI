@@ -28,6 +28,7 @@ if (!supa) {
     async signOut() { return { error: null }; },
     async signInWithPassword() { return { data: null, error: { message: "Missing Supabase env" } }; },
     async signUp() { return { data: null, error: { message: "Missing Supabase env" } }; },
+    async signInWithOtp() { return { data: null, error: { message: "Missing Supabase env" } }; },
   };
   const chain = () => ({
     select() { return Promise.resolve({ data: [], error: null }); },
