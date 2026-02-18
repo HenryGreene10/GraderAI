@@ -76,3 +76,36 @@ def test_extract_pdf_page_raster_png_renders_or_falls_back_to_fixed_dpi_size(mon
     assert blank_source == "blank_page_fallback"
     with Image.open(BytesIO(blank_png)) as img:
         assert (img.width, img.height) == (100, 200)
+
+
+def test_extract_pdf_page_raster_png_prefer_switches_source(monkeypatch):
+    image = SimpleNamespace(data=_png_bytes(220, 140, (200, 20, 20)))
+    page = _FakePage(width_pt=72, height_pt=72, images=[image], rotate=0)
+    monkeypatch.setattr(pdf_raster, "PdfReader", lambda *_args, **_kwargs: _FakeReader([page]))
+
+    def fake_render(_payload, *, page_index: int, target_size: tuple[int, int], rotation_deg: int):
+        assert page_index == 0
+        assert rotation_deg == 0
+        return _png_bytes(100, 100, (20, 20, 200))
+
+    monkeypatch.setattr(pdf_raster, "_render_page_with_pillow", fake_render)
+
+    embedded_png, embedded_source = pdf_raster.extract_pdf_page_raster_png(
+        b"fake-pdf",
+        page_index=0,
+        dpi=100,
+        prefer="embedded",
+    )
+    assert embedded_source == "largest_embedded_raster"
+    with Image.open(BytesIO(embedded_png)) as img:
+        assert (img.width, img.height) == (220, 140)
+
+    rendered_png, rendered_source = pdf_raster.extract_pdf_page_raster_png(
+        b"fake-pdf",
+        page_index=0,
+        dpi=100,
+        prefer="rendered",
+    )
+    assert rendered_source == "rendered_page"
+    with Image.open(BytesIO(rendered_png)) as img:
+        assert (img.width, img.height) == (100, 100)

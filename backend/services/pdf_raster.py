@@ -93,6 +93,7 @@ def extract_pdf_page_raster_png(
     *,
     page_index: int = 0,
     dpi: float = 300.0,
+    prefer: Literal["auto", "embedded", "rendered"] = "auto",
 ) -> tuple[bytes, Literal["largest_embedded_raster", "rendered_page", "blank_page_fallback"]]:
     reader = PdfReader(BytesIO(payload))
     if not reader.pages:
@@ -102,33 +103,48 @@ def extract_pdf_page_raster_png(
     page = reader.pages[page_index]
     rotation_deg = _page_rotation_degrees(page)
 
-    # Deterministic master-key/student-frame selection: largest pixel-area raster on page.
-    best_png: bytes | None = None
-    best_key: tuple[int, int, int] | None = None
-    for idx, image_obj in enumerate(list(page.images or [])):
-        data = bytes(getattr(image_obj, "data", b""))
-        if not data:
-            continue
-        try:
-            candidate_png, area = _decode_embedded_image_png(data, rotation_deg)
-        except Exception:
-            continue
-        key = (area, len(data), -idx)
-        if best_key is None or key > best_key:
-            best_key = key
-            best_png = candidate_png
-    if best_png:
-        return best_png, "largest_embedded_raster"
+    def _best_embedded_png() -> bytes | None:
+        # Deterministic embedded-raster selection: largest pixel-area image on page.
+        best_png: bytes | None = None
+        best_key: tuple[int, int, int] | None = None
+        for idx, image_obj in enumerate(list(page.images or [])):
+            data = bytes(getattr(image_obj, "data", b""))
+            if not data:
+                continue
+            try:
+                candidate_png, area = _decode_embedded_image_png(data, rotation_deg)
+            except Exception:
+                continue
+            key = (area, len(data), -idx)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_png = candidate_png
+        return best_png
 
     target_size = _target_page_size_px(page, dpi=dpi, rotation_deg=rotation_deg)
-    rendered = _render_page_with_pillow(
+    embedded_png = _best_embedded_png()
+    rendered_png = _render_page_with_pillow(
         payload,
         page_index=page_index,
         target_size=target_size,
         rotation_deg=rotation_deg,
     )
-    if rendered:
-        return rendered, "rendered_page"
+
+    if prefer == "embedded":
+        if embedded_png:
+            return embedded_png, "largest_embedded_raster"
+        if rendered_png:
+            return rendered_png, "rendered_page"
+    elif prefer == "rendered":
+        if rendered_png:
+            return rendered_png, "rendered_page"
+        if embedded_png:
+            return embedded_png, "largest_embedded_raster"
+    else:
+        if embedded_png:
+            return embedded_png, "largest_embedded_raster"
+        if rendered_png:
+            return rendered_png, "rendered_page"
 
     # Last-resort deterministic fallback at fixed DPI. This will fail key extraction quality gate.
     blank = Image.new("RGB", target_size, color=(255, 255, 255))
