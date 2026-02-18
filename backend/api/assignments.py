@@ -168,74 +168,20 @@ def _extract_master_key_image_bytes(payload: bytes, ext: str, content_type: str 
         raise HTTPException(status_code=400, detail=f"template_pdf_invalid: {exc}")
     if not reader.pages:
         raise HTTPException(status_code=400, detail="template_pdf_empty")
-
-    def _raster_signal_score(png_bytes: bytes) -> tuple[int, int]:
-        box_count = 0
-        area_px = 0
-        try:
-            hints = detect_answer_boxes(png_bytes) or []
-            box_count = len(hints)
-        except Exception:
-            box_count = 0
-        try:
-            with Image.open(BytesIO(png_bytes)) as img:
-                area_px = int(max(1, img.width) * max(1, img.height))
-        except Exception:
-            area_px = 0
-        return box_count, area_px
-
-    candidates: list[tuple[bytes, str, int, int]] = []
-    for prefer in ("embedded", "rendered"):
-        try:
-            raster_png, raster_source = extract_pdf_page_raster_png(
-                payload,
-                page_index=0,
-                dpi=float(PDF_DPI),
-                prefer=prefer,  # type: ignore[arg-type]
-            )
-        except Exception:
-            continue
-        if not raster_png:
-            continue
-        boxes, area = _raster_signal_score(raster_png)
-        candidates.append((raster_png, raster_source, boxes, area))
-
-    if not candidates:
+    try:
+        raster_png, raster_source = extract_pdf_page_raster_png(
+            payload,
+            page_index=0,
+            dpi=float(PDF_DPI),
+        )
+    except Exception as exc:
         raise HTTPException(
             status_code=400,
-            detail="template_pdf_raster_failed: could not decode page raster. Upload a scanned PDF (or PNG/JPG).",
+            detail=f"template_pdf_raster_failed: {exc}. Upload a scanned PDF (or PNG/JPG).",
         )
-
-    unique_candidates: list[tuple[bytes, str, int, int]] = []
-    seen_payloads: set[bytes] = set()
-    for candidate in candidates:
-        if candidate[0] in seen_payloads:
-            continue
-        seen_payloads.add(candidate[0])
-        unique_candidates.append(candidate)
-
-    source_rank = {"rendered_page": 2, "largest_embedded_raster": 1, "blank_page_fallback": 0}
-    chosen = max(
-        unique_candidates,
-        key=lambda item: (int(item[2]), int(item[3]), int(source_rank.get(item[1], 0))),
-    )
-    raster_png, raster_source, box_count, area_px = chosen
-    logger.info(
-        "master_key_pdf_raster_selected source=%s answer_box_hints=%s area_px=%s candidates=%s",
-        raster_source,
-        box_count,
-        area_px,
-        [
-            {
-                "source": src,
-                "answer_box_hints": boxes,
-                "area_px": area,
-            }
-            for _png, src, boxes, area in unique_candidates
-        ],
-    )
-    if raster_source == "blank_page_fallback":
+    if not raster_png:
         raise HTTPException(status_code=400, detail="template_pdf_raster_failed: Upload a scanned PDF.")
+    logger.info("master_key_pdf_raster_source source=%s", raster_source)
     return raster_png
 
 
