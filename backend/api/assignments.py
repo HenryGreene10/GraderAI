@@ -11,7 +11,6 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
-from pypdf import PdfReader
 
 from ..auth import get_current_user_id
 from ..config import GRADED_BUCKET, OVERLAYS_BUCKET, SUBMISSIONS_BUCKET
@@ -25,7 +24,6 @@ from ..services import ocr as ocr_service
 from ..services.ocr import normalize_ocr_result
 from ..services.answer_extraction import extract_answers_from_ocr
 from ..services.master_key_pipeline import run_master_key_approval_pipeline
-from ..services.scanner import PDF_DPI
 from ..services.template import detect_answer_boxes, detect_question_regions
 from ..services.template_manifest import load_template_manifest, with_approved_manifest
 from ..services.template_regions import expected_answers_from_regions, parse_regions_payload
@@ -46,8 +44,6 @@ ALLOWED_MIME = {
     "image/jpeg": ".jpg",
     "application/pdf": ".pdf",
 }
-STUDENT_UPLOAD_EXTS = {".pdf"}
-MASTER_KEY_EXTS = {".png", ".jpg", ".jpeg", ".pdf"}
 
 
 def _qid_sort_key(qid: str) -> tuple[int, str]:
@@ -119,93 +115,6 @@ def _template_approval_reasons(payload: object) -> list[str]:
     return sorted(set(reasons))
 
 
-def _template_regions_count(payload: object) -> int:
-    regions_map, _ = parse_regions_payload(payload)
-    return len(regions_map)
-
-
-def _master_key_status_for_assignment(row: dict, regions_payload: object) -> tuple[str, list[str]]:
-    if not row.get("template_storage_path"):
-        return "DRAFT", []
-
-    regions_dict = regions_payload if isinstance(regions_payload, dict) else {}
-    reasons = _template_approval_reasons(regions_dict)
-    regions_count = _template_regions_count(regions_payload)
-    manifest_locked = bool(regions_dict.get("manifest_locked"))
-    manifest_approved_at = str(regions_dict.get("manifest_approved_at") or "").strip()
-    approval_blocked = bool(regions_dict.get("manifest_approval_blocked"))
-
-    status_from_payload = str(regions_dict.get("master_key_status") or "").strip().upper()
-    if status_from_payload in {"DRAFT", "PROCESSING", "NEEDS_REUPLOAD", "READY"}:
-        status = status_from_payload
-    elif manifest_locked and manifest_approved_at and not approval_blocked and not reasons and regions_count > 0:
-        status = "READY"
-    elif approval_blocked or reasons or regions_count <= 0:
-        status = "NEEDS_REUPLOAD"
-    else:
-        status = "PROCESSING"
-
-    if status == "READY":
-        return status, []
-    if reasons:
-        return status, reasons
-    if regions_count <= 0:
-        return status, ["TEMPLATE_REGIONS_EMPTY"]
-    if not manifest_locked or not manifest_approved_at:
-        return status, ["TEMPLATE_MANIFEST_NOT_APPROVED"]
-    return status, []
-
-
-def _pdf_page_sizes_px(pdf_bytes: bytes) -> list[dict]:
-    reader = PdfReader(BytesIO(pdf_bytes))
-    out: list[dict] = []
-    for page in reader.pages:
-        box = page.mediabox
-        try:
-            width_pt = float(box.width)
-            height_pt = float(box.height)
-        except Exception:
-            continue
-        width_px = max(1, int(round((width_pt / 72.0) * float(PDF_DPI))))
-        height_px = max(1, int(round((height_pt / 72.0) * float(PDF_DPI))))
-        out.append({"width_px": width_px, "height_px": height_px})
-    return out
-
-
-def _extract_master_key_image_bytes(payload: bytes, ext: str, content_type: str | None) -> bytes:
-    if ext in {".png", ".jpg", ".jpeg"} or str(content_type or "").lower().startswith("image/"):
-        return payload
-    if ext != ".pdf" and "pdf" not in str(content_type or "").lower():
-        raise HTTPException(status_code=400, detail="template_image_or_pdf_required")
-    try:
-        reader = PdfReader(BytesIO(payload))
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"template_pdf_invalid: {exc}")
-    if not reader.pages:
-        raise HTTPException(status_code=400, detail="template_pdf_empty")
-    images = list(reader.pages[0].images or [])
-    if not images:
-        raise HTTPException(
-            status_code=400,
-            detail="template_pdf_image_missing: upload a scanned PDF (or PNG/JPG) where page 1 contains the master-key scan image",
-        )
-    best = max(images, key=lambda img: len(getattr(img, "data", b"") or b""))
-    blob = bytes(getattr(best, "data", b""))
-    if not blob:
-        raise HTTPException(status_code=400, detail="template_pdf_image_missing")
-    try:
-        with Image.open(BytesIO(blob)) as img:
-            rgb = img.convert("RGB")
-            out = BytesIO()
-            rgb.save(out, format="PNG")
-            converted = out.getvalue()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"template_pdf_image_invalid: {exc}")
-    if not converted:
-        raise HTTPException(status_code=400, detail="template_pdf_image_invalid")
-    return converted
-
-
 def _assignment_detail_payload(row: dict) -> dict:
     base = _assignment_payload(row, uploads_count=0)
     regions = _template_regions_payload(row.get("template_regions_json") or {})
@@ -216,7 +125,6 @@ def _assignment_detail_payload(row: dict) -> dict:
     manifest_approved_at = str(regions_dict.get("manifest_approved_at") or "").strip() or None
     approval_blocked = bool(regions_dict.get("manifest_approval_blocked"))
     approval_reasons = _template_approval_reasons(regions_dict)
-    master_key_status, master_key_status_reasons = _master_key_status_for_assignment(row, regions)
     try:
         manifest, _embedded = load_template_manifest(
             regions,
@@ -246,10 +154,7 @@ def _assignment_detail_payload(row: dict) -> dict:
             "template_manifest_approved_at": manifest_approved_at,
             "template_approval_blocked": approval_blocked,
             "template_approval_block_reasons": approval_reasons,
-            "template_ready_for_grading": master_key_status == "READY",
-            "master_key_status": master_key_status,
-            "master_key_status_reasons": master_key_status_reasons,
-            "master_key_ready": master_key_status == "READY",
+            "template_ready_for_grading": bool(row.get("template_storage_path") and manifest_locked and manifest_approved_at),
         }
     )
     return base
@@ -651,13 +556,12 @@ async def upload_template(
     user_id: str = Depends(get_current_user_id),
 ):
     ext = _file_extension(file.filename, file.content_type)
-    if ext not in MASTER_KEY_EXTS:
-        raise HTTPException(status_code=400, detail="template_image_or_pdf_only")
+    if ext not in {".png", ".jpg", ".jpeg"}:
+        raise HTTPException(status_code=400, detail="template_image_only")
 
     payload = await file.read()
     if not payload:
         raise HTTPException(status_code=400, detail="template_empty")
-    payload = _extract_master_key_image_bytes(payload, ext, file.content_type)
 
     def _debug_hook(template_png: bytes, aid: str) -> None:
         if not _template_debug_enabled():
@@ -695,7 +599,6 @@ async def upload_template(
         "anchor_trace": result.anchor_trace,
         "approval_blocked": result.approval_blocked,
         "approval_warning": result.approval_warning,
-        "master_key_status": "NEEDS_REUPLOAD" if result.approval_blocked else "READY",
     }
 
 
@@ -798,10 +701,7 @@ async def upload_assignment_files(
     except Exception as exc:
         reasons = _template_approval_reasons(template_regions)
         reasons_txt = f" ({', '.join(reasons)})" if reasons else ""
-        raise HTTPException(
-            status_code=409,
-            detail=f"Master key is not READY. Reupload a clean scanned PDF. {exc}{reasons_txt}",
-        )
+        raise HTTPException(status_code=409, detail=f"Master key pending approval: {exc}{reasons_txt}")
 
     if not files:
         raise HTTPException(status_code=400, detail="files_required")
@@ -812,10 +712,10 @@ async def upload_assignment_files(
 
     for file in files:
         ext = _file_extension(file.filename, file.content_type)
-        if ext not in STUDENT_UPLOAD_EXTS:
+        if ext not in ALLOWED_EXTS:
             raise HTTPException(
                 status_code=400,
-                detail=f"student_upload_pdf_required: {file.filename}",
+                detail=f"unsupported_file_type: {file.filename}",
             )
         upload_id = str(uuid4())
         rel_key = f"{user_id}/{assignment_id}/{upload_id}{ext}"
@@ -828,13 +728,6 @@ async def upload_assignment_files(
                 status_code=400,
                 detail=f"empty_file: {file.filename}",
             )
-        try:
-            page_sizes = _pdf_page_sizes_px(blob)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"invalid_pdf: {file.filename}: {exc}")
-        first_page = page_sizes[0] if page_sizes else {}
-        normalized_width_px = int(first_page.get("width_px") or 0) or None
-        normalized_height_px = int(first_page.get("height_px") or 0) or None
 
         try:
             upload_bytes(
@@ -858,11 +751,6 @@ async def upload_assignment_files(
                 "size_bytes": size_bytes,
                 "status": "uploading",
                 "ocr_status": "pending",
-                "page_count": len(page_sizes) if page_sizes else None,
-                "page_sizes_json": page_sizes or None,
-                "normalized_pdf_path": storage_path,
-                "normalized_width_px": normalized_width_px,
-                "normalized_height_px": normalized_height_px,
             }
         )
 

@@ -3,19 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from io import BytesIO
 from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from PIL import Image
 from pypdf import PdfReader
 
 from ..config import SUBMISSIONS_BUCKET
 from ..services.db import require_supabase
 from ..services.master_key_pipeline import run_master_key_approval_pipeline
-from ..services.scanner import PDF_DPI
 from ..services.storage import upload_bytes
 
 router = APIRouter(prefix="/api/scan", tags=["scan"])
@@ -123,13 +120,11 @@ def _page_sizes_from_pdf(pdf_bytes: bytes) -> list[dict]:
     for page in reader.pages:
         box = page.mediabox
         try:
-            width_pt = float(box.width)
-            height_pt = float(box.height)
+            width = float(box.width)
+            height = float(box.height)
         except Exception:
             continue
-        width_px = max(1, int(round((width_pt / 72.0) * float(PDF_DPI))))
-        height_px = max(1, int(round((height_pt / 72.0) * float(PDF_DPI))))
-        sizes.append({"width_px": width_px, "height_px": height_px})
+        sizes.append({"width_px": int(round(width)), "height_px": int(round(height))})
     return sizes
 
 
@@ -137,7 +132,6 @@ def _page_sizes_from_pdf(pdf_bytes: bytes) -> list[dict]:
 async def scan_upload(
     token: str,
     file: UploadFile = File(...),
-    normalized_image: UploadFile | None = File(None),
     page_count: int | None = Form(None),
     page_sizes: str | None = Form(None),
 ):
@@ -203,55 +197,10 @@ async def scan_upload(
                 parsed_sizes = []
         if page_count is None:
             page_count = len(parsed_sizes) if parsed_sizes else None
-        require_normalized_image = os.getenv("SCAN_REQUIRE_NORMALIZED_IMAGE", "1") == "1"
-        if require_normalized_image and normalized_image is None:
-            raise HTTPException(status_code=400, detail="scan_normalized_image_required")
-
         upload_id = str(uuid4())
-        normalized_image_path = None
-        normalized_width_px = None
-        normalized_height_px = None
-        scan_status = "fallback"
-        scan_error = None
-        normalized_png: bytes | None = None
-
-        if normalized_image is not None:
-            try:
-                image_blob = await normalized_image.read()
-                if not image_blob:
-                    raise ValueError("normalized_image_empty")
-                with Image.open(BytesIO(image_blob)) as img:
-                    rgb = img.convert("RGB")
-                    normalized_width_px = int(rgb.width)
-                    normalized_height_px = int(rgb.height)
-                    out = BytesIO()
-                    rgb.save(out, format="PNG")
-                    normalized_png = out.getvalue()
-                    if not normalized_png:
-                        raise ValueError("normalized_image_convert_failed")
-                    scan_status = "normalized"
-            except HTTPException:
-                raise
-            except Exception as exc:
-                if require_normalized_image:
-                    raise HTTPException(status_code=400, detail=f"scan_normalized_image_invalid:{exc}")
-                scan_error = f"normalized_image_invalid:{exc}"
-
-        if require_normalized_image and normalized_png is None:
-            raise HTTPException(status_code=400, detail="scan_normalized_image_required")
-        if parsed_sizes and normalized_width_px and normalized_height_px:
-            parsed_sizes[0] = {
-                "width_px": int(normalized_width_px),
-                "height_px": int(normalized_height_px),
-            }
-
         key = f"{owner_id}/{upload_id}.pdf"
         upload_bytes(SUBMISSIONS_BUCKET, key, blob, "application/pdf")
         storage_path = f"{SUBMISSIONS_BUCKET}/{key}"
-        if normalized_png:
-            normalized_key = f"{owner_id}/normalized/{upload_id}.png"
-            upload_bytes(SUBMISSIONS_BUCKET, normalized_key, normalized_png, "image/png")
-            normalized_image_path = f"{SUBMISSIONS_BUCKET}/{normalized_key}"
         now = _utc_iso()
         sb.table("uploads").insert(
             {
@@ -266,12 +215,6 @@ async def scan_upload(
                 "ocr_status": "pending",
                 "page_count": page_count,
                 "page_sizes_json": parsed_sizes or None,
-                "normalized_image_path": normalized_image_path,
-                "normalized_pdf_path": storage_path,
-                "normalized_width_px": normalized_width_px,
-                "normalized_height_px": normalized_height_px,
-                "scan_status": scan_status,
-                "scan_error": scan_error,
                 "created_at": now,
                 "updated_at": now,
             }

@@ -46,29 +46,6 @@ def _log_ocr_image_size(tag: str, image_bytes: bytes) -> None:
         return
 
 
-def _canonical_upload_size(row: dict, inferred_w: float, inferred_h: float) -> tuple[float, float]:
-    try:
-        w = float(row.get("normalized_width_px") or 0.0)
-        h = float(row.get("normalized_height_px") or 0.0)
-    except Exception:
-        w, h = 0.0, 0.0
-    if w > 0 and h > 0:
-        return w, h
-    page_sizes = row.get("page_sizes_json")
-    if isinstance(page_sizes, list) and page_sizes:
-        first = page_sizes[0] if isinstance(page_sizes[0], dict) else {}
-        try:
-            w = float(first.get("width_px") or 0.0)
-            h = float(first.get("height_px") or 0.0)
-        except Exception:
-            w, h = 0.0, 0.0
-        if w > 0 and h > 0:
-            return w, h
-    if inferred_w > 0 and inferred_h > 0:
-        return inferred_w, inferred_h
-    return 0.0, 0.0
-
-
 async def run_ocr_for_upload(
     upload_id: str,
     user_id: str,
@@ -79,10 +56,7 @@ async def run_ocr_for_upload(
     row = get_upload(
         upload_id,
         user_id,
-        columns=(
-            "id,owner_id,storage_path,mime_type,needs_review,normalized_image_path,"
-            "normalized_width_px,normalized_height_px,page_sizes_json"
-        ),
+        columns="id,owner_id,storage_path,mime_type,needs_review,normalized_image_path",
     )
     storage_path = row.get("storage_path")
     if not storage_path:
@@ -147,7 +121,6 @@ async def run_ocr_for_upload(
         scan_failed = bool(scan_artifacts and not scan_artifacts.scan_ok) or bool(scan_error)
         needs_review = bool(row.get("needs_review")) or scan_failed
         frame_w, frame_h = infer_primary_page_size_px(norm.get("boxes"))
-        canonical_w, canonical_h = _canonical_upload_size(row, frame_w, frame_h)
         payload = {
             "ocr_status": OCR_DONE,
             "status": "ocr_done",
@@ -157,8 +130,8 @@ async def run_ocr_for_upload(
             "ocr_confidence": norm.get("confidence"),
             "ocr_error": None,
             "updated_at": _utc_iso(),
-            "normalized_width_px": int(round(canonical_w)) if canonical_w > 0 else None,
-            "normalized_height_px": int(round(canonical_h)) if canonical_h > 0 else None,
+            "normalized_width_px": int(round(frame_w)) if frame_w > 0 else None,
+            "normalized_height_px": int(round(frame_h)) if frame_h > 0 else None,
         }
         if scan_artifacts:
             payload.update(

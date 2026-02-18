@@ -783,18 +783,7 @@ async def run_grade_pipeline(
                 expected_qids = [q.question_id for q in template_manifest.questions]
             else:
                 expected_qids = sorted((str(qid) for qid in regions_map.keys()), key=_qid_sort_key)
-            allow_frame_fallback = os.getenv("ALLOW_TEMPLATE_FRAME_FALLBACK") == "1"
             allow_unaligned_fallback = os.getenv("ALLOW_UNALIGNED_REGION_FALLBACK") == "1"
-            try:
-                min_alignment_matches = max(1, int(os.getenv("TEMPLATE_ALIGNMENT_MIN_MATCHES", "25")))
-            except Exception:
-                min_alignment_matches = 25
-            try:
-                min_alignment_inlier_ratio = max(
-                    0.0, float(os.getenv("TEMPLATE_ALIGNMENT_MIN_INLIER_RATIO", "0.35"))
-                )
-            except Exception:
-                min_alignment_inlier_ratio = 0.35
             template_size = _template_size_px(template_width_px, template_height_px, regions_meta)
 
             student_png = None
@@ -816,53 +805,34 @@ async def run_grade_pipeline(
 
             frame_ocr_boxes = None
             frame_png_bytes = None
-            has_student_alignment_frame = bool(template_png and student_png)
 
-            if has_student_alignment_frame:
+            if template_png and student_png:
                 template_alignment = align_student_to_template(student_png, template_png)
                 if template_alignment.ok:
-                    match_count = int(template_alignment.match_count or 0)
-                    inliers = int(template_alignment.inliers or 0)
-                    inlier_ratio = (float(inliers) / float(match_count)) if match_count > 0 else 0.0
-                    if (match_count < min_alignment_matches) or (inlier_ratio < min_alignment_inlier_ratio):
-                        region_frame_error = (
-                            f"alignment_quality_low: matches={match_count} inliers={inliers} "
-                            f"ratio={inlier_ratio:.3f} thresholds=({min_alignment_matches},{min_alignment_inlier_ratio:.3f})"
+                    frame_png_bytes = template_alignment.aligned_png
+                    debug_image_bytes = frame_png_bytes
+                    if template_size and student_size_px and template_alignment.homography:
+                        projected_regions = _project_template_regions_for_student_overlay(
+                            regions_payload=template_regions,
+                            template_size=template_size,
+                            student_size=student_size_px,
+                            homography=template_alignment.homography,
                         )
-                        needs_review_from_overlay = True
-                    else:
-                        frame_png_bytes = template_alignment.aligned_png
-                        debug_image_bytes = frame_png_bytes
-                        if template_size and student_size_px and template_alignment.homography:
-                            projected_regions = _project_template_regions_for_student_overlay(
-                                regions_payload=template_regions,
-                                template_size=template_size,
-                                student_size=student_size_px,
-                                homography=template_alignment.homography,
-                            )
-                            if projected_regions:
-                                overlay_regions_payload = projected_regions
-                                overlay_projected_to_student = True
-                                debug_image_bytes = student_png
-                        raw = await ocr_service.extract_text(image_bytes=frame_png_bytes)
-                        norm = normalize_ocr_result(raw)
-                        frame_ocr_boxes = norm.get("boxes") or {}
-                        region_frame_source = "aligned_image_ocr"
-                        template_alignment_used = True
-                        template_ocr_rects = []
+                        if projected_regions:
+                            overlay_regions_payload = projected_regions
+                            overlay_projected_to_student = True
+                            debug_image_bytes = student_png
+                    raw = await ocr_service.extract_text(image_bytes=frame_png_bytes)
+                    norm = normalize_ocr_result(raw)
+                    frame_ocr_boxes = norm.get("boxes") or {}
+                    region_frame_source = "aligned_image_ocr"
+                    template_alignment_used = True
+                    template_ocr_rects = []
                 else:
                     region_frame_error = template_alignment.error or "alignment_failed"
                     needs_review_from_overlay = True
 
-            if frame_ocr_boxes is None and template_size and not student_png:
-                scaled_boxes, scaled_ok = _scale_ocr_boxes_to_size(ocr_boxes, template_size)
-                if scaled_ok:
-                    frame_ocr_boxes = scaled_boxes
-                    region_frame_source = "template_canonical_scaled_ocr_boxes"
-                else:
-                    region_frame_error = "template_canonical_scale_failed"
-
-            if frame_ocr_boxes is None and allow_frame_fallback and student_png and template_size:
+            if frame_ocr_boxes is None and student_png and template_size:
                 try:
                     frame_png_bytes = _scale_png_to_size(student_png, template_size)
                     debug_image_bytes = frame_png_bytes
@@ -874,7 +844,7 @@ async def run_grade_pipeline(
                 except Exception as exc:
                     region_frame_error = f"scaled_image_ocr_failed: {exc}"
 
-            if frame_ocr_boxes is None and allow_frame_fallback and template_size:
+            if frame_ocr_boxes is None and template_size:
                 scaled_boxes, scaled_ok = _scale_ocr_boxes_to_size(ocr_boxes, template_size)
                 if scaled_ok:
                     frame_ocr_boxes = scaled_boxes
@@ -882,7 +852,7 @@ async def run_grade_pipeline(
                     needs_review_from_overlay = True
 
             if frame_ocr_boxes is None:
-                if allow_unaligned_fallback and allow_frame_fallback:
+                if allow_unaligned_fallback:
                     frame_ocr_boxes = ocr_boxes
                     region_frame_source = "explicit_unaligned_fallback"
                     needs_review_from_overlay = True
@@ -891,40 +861,13 @@ async def run_grade_pipeline(
                         row["id"],
                     )
                 else:
-                    detail = (
-                        "template_frame_unavailable: projected aligned frame required for template grading"
-                    )
-                    if region_frame_error:
-                        detail = f"{detail}; error={region_frame_error}"
-                    update_upload(
-                        row["id"],
-                        {
-                            "status": "error",
-                            "needs_review": True,
-                            "ocr_error": detail,
-                            "updated_at": _utc_iso(),
-                        },
-                    )
                     raise HTTPException(
                         status_code=422,
-                        detail=detail,
+                        detail=(
+                            "template_frame_unavailable: aligned/scaled frame required; "
+                            "set ALLOW_UNALIGNED_REGION_FALLBACK=1 to force fallback"
+                        ),
                     )
-            if not overlay_projected_to_student and not allow_frame_fallback:
-                if has_student_alignment_frame:
-                    detail = (
-                        "template_overlay_projection_required: homography projection "
-                        "did not produce student-frame anchors"
-                    )
-                    update_upload(
-                        row["id"],
-                        {
-                            "status": "error",
-                            "needs_review": True,
-                            "ocr_error": detail,
-                            "updated_at": _utc_iso(),
-                        },
-                    )
-                    raise HTTPException(status_code=422, detail=detail)
 
             student_answers, missing_qids = extract_answers_from_regions(
                 frame_ocr_boxes,
@@ -992,14 +935,15 @@ async def run_grade_pipeline(
             normalized_size = effective_normalized_size
             if overlay_projected_to_student and student_size_px:
                 normalized_size = (float(student_size_px[0]), float(student_size_px[1]))
-            elif template_size:
-                normalized_size = (float(template_size[0]), float(template_size[1]))
             elif frame_png_bytes is not None:
                 try:
                     with Image.open(BytesIO(frame_png_bytes)) as img:
                         normalized_size = (float(img.width), float(img.height))
                 except Exception:
-                    pass
+                    if template_size:
+                        normalized_size = (float(template_size[0]), float(template_size[1]))
+            elif template_size:
+                normalized_size = (float(template_size[0]), float(template_size[1]))
             effective_normalized_size = normalized_size
             overlay, marks_placed, marks_skipped_missing, marks_skipped_needs_review, unplaced_items = build_overlay_from_regions(
                 grade_result,
