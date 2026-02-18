@@ -289,53 +289,14 @@ def create_scan_session(
     body: ScanSessionCreate,
     user_id: str = Depends(get_current_user_id),
 ):
-    assignment = get_assignment(assignment_id, user_id, columns="id,owner_id")
-    owner_id = assignment.get("owner_id") or user_id
-    token = secrets.token_urlsafe(16)
-    session_id = str(uuid4())
-    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).replace(microsecond=0)
-    expires_at_iso = expires_at.isoformat().replace("+00:00", "Z")
-    payload = {
-        "id": session_id,
-        "token": token,
-        "owner_id": owner_id,
-        "assignment_id": assignment_id,
-        "mode": body.mode,
-        "status": "pending",
-        "expires_at": expires_at_iso,
-    }
-    sb = require_supabase()
-    try:
-        sb.table("scan_sessions").insert(payload).execute()
-    except APIError as exc:
-        if _scan_sessions_missing(exc):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "scan_sessions table missing. Apply migrations/2026-01-30_add_scan_sessions.sql "
-                    "to your Supabase project and reload schema cache."
-                ),
-            )
-        raise HTTPException(status_code=500, detail=f"scan_session_create_failed: {exc}")
-    except Exception as exc:
-        if _scan_sessions_missing(exc):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "scan_sessions table missing. Apply migrations/2026-01-30_add_scan_sessions.sql "
-                    "to your Supabase project and reload schema cache."
-                ),
-            )
-        raise HTTPException(status_code=500, detail=f"scan_session_create_failed: {exc}")
-    logger.info(
-        "scan_session_created assignment_id=%s owner_id=%s mode=%s session_id=%s expires_at=%s",
-        assignment_id,
-        owner_id,
-        body.mode,
-        session_id,
-        expires_at_iso,
+    _ = (assignment_id, body, user_id)
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "scan_workflow_deprecated: Scanner sessions are disabled for beta. "
+            "Use assignment upload endpoints and upload scanned PDFs."
+        ),
     )
-    return {"token": token, "expires_at": expires_at_iso}
 
 
 @router.get("/{assignment_id}/uploads")

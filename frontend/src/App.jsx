@@ -4,7 +4,6 @@ import AuthPage from "./pages/AuthPage.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
 import ClassesPage from "./pages/ClassesPage.jsx";
 import AssignmentsPage from "./pages/AssignmentsPage.jsx";
-import ScanCapturePage from "./pages/ScanCapturePage.jsx";
 import { Toaster } from "@/components/ui/toaster";
 
 export default function App() {
@@ -21,7 +20,6 @@ export default function App() {
         <Route path="/" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
         <Route path="/classes" element={<ProtectedRoute><ClassesPage /></ProtectedRoute>} />
         <Route path="/assignments" element={<ProtectedRoute><AssignmentsPage /></ProtectedRoute>} />
-        <Route path="/scan/:token" element={<ScanCapturePage />} />
       </Routes>
       <Toaster />
     </>
