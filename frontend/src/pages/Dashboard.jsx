@@ -147,11 +147,11 @@ export default function Dashboard() {
 
       toast({
         title: "Assignment created",
-        description: "Upload the master key PDF to continue.",
+        description: "Scan the master key to continue.",
       });
       setDialogOpen(false);
       await loadAssignments();
-      navigate(`/assignments?assignmentId=${assignmentId}`);
+      navigate(`/assignments?assignmentId=${assignmentId}&scan=master_key`);
     } catch (err) {
       toast({
         variant: "destructive",
@@ -219,7 +219,7 @@ export default function Dashboard() {
             <DialogHeader>
               <DialogTitle>Create assignment</DialogTitle>
               <DialogDescription>
-                Name the assignment, then upload the master key PDF.
+                Name the assignment, then scan the master key.
               </DialogDescription>
             </DialogHeader>
 
@@ -281,7 +281,7 @@ export default function Dashboard() {
             {assignments.length === 0 && !loading && (
               <TableRow>
                 <TableCell colSpan={4} className="text-center text-muted-foreground">
-                  No assignments yet. Create one to start grading.
+                  No assignments yet. Create one to start scanning.
                 </TableCell>
               </TableRow>
             )}
