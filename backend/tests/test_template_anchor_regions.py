@@ -1,4 +1,4 @@
-from backend.services.template_anchor_regions import build_anchor_template_regions
+from backend.services.template_anchor_regions import _anchor_fallback_is_reliable, build_anchor_template_regions
 from backend.services.template_manifest import with_approved_manifest
 from backend.services.template_regions import build_template_regions_payload
 
@@ -685,6 +685,64 @@ def test_box_driven_mode_falls_back_to_anchor_mode_on_low_coverage():
     codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
     assert "BOX_MODE_FALLBACK_APPLIED" in codes
     assert isinstance(anchor_trace.get("box_mode_discarded"), dict)
+
+
+def test_anchor_fallback_reliability_flags_duplicate_and_fallback_numbering():
+    assert _anchor_fallback_is_reliable([]) is True
+    assert (
+        _anchor_fallback_is_reliable(
+            [
+                {"code": "ANCHOR_DUPLICATE_NUMBERS"},
+            ]
+        )
+        is False
+    )
+    assert (
+        _anchor_fallback_is_reliable(
+            [
+                {"code": "ANCHOR_NUMBER_FALLBACK_ORDER"},
+            ]
+        )
+        is False
+    )
+
+
+def test_box_driven_mode_keeps_box_regions_when_anchor_fallback_is_ambiguous():
+    boxes = {
+        "analyzeResult": {
+            "readResults": [
+                {
+                    "page": 1,
+                    "angle": 0.0,
+                    "width": 1200,
+                    "height": 1600,
+                    "unit": "pixel",
+                    "lines": [
+                        _line([_word("Q1.", 96, 220, 70, 30), _word("12", 480, 222, 46, 30)]),
+                        _line([_word("Q1.", 96, 360, 70, 30), _word("14", 480, 362, 46, 30)]),
+                        _line([_word("Q.", 96, 500, 50, 30), _word("16", 480, 502, 46, 30)]),
+                        _line([_word("Q4.", 96, 640, 70, 30), _word("18", 480, 642, 46, 30)]),
+                    ],
+                }
+            ]
+        }
+    }
+    hints = [
+        (460.0, 210.0, 74.0, 38.0),
+        (460.0, 350.0, 74.0, 38.0),
+    ]
+    regions, warnings, anchor_trace = build_anchor_template_regions(
+        ocr_boxes=boxes,
+        image_size=(1200, 1600),
+        answer_box_hints=hints,
+    )
+
+    assert len(regions) == 2
+    codes = {str(w.get("code")) for w in warnings if isinstance(w, dict)}
+    assert "BOX_MODE_FALLBACK_APPLIED" not in codes
+    rejected = anchor_trace.get("anchor_mode_rejected") or {}
+    assert rejected.get("reason") == "anchor_fallback_not_reliable"
+    assert "ANCHOR_DUPLICATE_NUMBERS" in (rejected.get("anchor_warning_codes") or [])
 
 
 def test_box_driven_mode_reserves_anchor_token_across_rows():

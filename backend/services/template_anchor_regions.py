@@ -71,6 +71,13 @@ _ANSWER_ANY_DIGIT_RE = re.compile(r"\d")
 _DIVISION_EXPRESSION_RE = re.compile(r"^\d+\)\d+$")
 _EXPLICIT_COVERAGE_THRESHOLD = 0.95
 _MIN_ANSWER_TEXT_SCORE = 50
+_ANCHOR_FALLBACK_DISQUALIFY_CODES = {
+    "ANCHOR_AMBIGUITY_HIGH",
+    "ANCHOR_DUPLICATE_NUMBERS",
+    "ANCHOR_NUMBER_FALLBACK_ORDER",
+    "ANCHOR_OUT_OF_RANGE_NUMBERS",
+    "ANCHOR_HARD_GATE_RELAXED",
+}
 
 
 def _anchor_trace_key(anchor: _Anchor) -> str:
@@ -82,6 +89,22 @@ def _anchor_trace_key(anchor: _Anchor) -> str:
 
 def _anchor_bbox_list(anchor: _Anchor) -> List[float]:
     return [float(anchor.x), float(anchor.y), float(anchor.w), float(anchor.h)]
+
+
+def _warning_codes(warnings: List[Dict[str, object]]) -> set[str]:
+    out: set[str] = set()
+    for item in warnings or []:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip().upper()
+        if code:
+            out.add(code)
+    return out
+
+
+def _anchor_fallback_is_reliable(anchor_warnings: List[Dict[str, object]]) -> bool:
+    codes = _warning_codes(anchor_warnings)
+    return not bool(codes.intersection(_ANCHOR_FALLBACK_DISQUALIFY_CODES))
 
 
 def _as_float(value: object) -> Optional[float]:
@@ -1714,7 +1737,8 @@ def build_anchor_template_regions(
             anchor_parsed_count = len(
                 [str(r.qid) for r in anchor_regions if str(r.qid).startswith("Q") and not str(r.qid).startswith("QROW")]
             )
-            if (anchor_parsed_count > box_parsed_count) or (len(anchor_regions) > len(box_regions)):
+            anchor_reliable = _anchor_fallback_is_reliable(anchor_warnings or [])
+            if anchor_reliable and ((anchor_parsed_count > box_parsed_count) or (len(anchor_regions) > len(box_regions))):
                 fallback_warning = {
                     "code": "BOX_MODE_FALLBACK_APPLIED",
                     "message": "Box-driven extraction had low coverage; anchor-driven fallback selected.",
@@ -1732,6 +1756,15 @@ def build_anchor_template_regions(
                         "parsed_qids": parsed_qids,
                     }
                 return anchor_regions, warnings, anchor_trace
+            if isinstance(box_trace, dict):
+                box_trace["anchor_mode_rejected"] = {
+                    "reason": "anchor_fallback_not_reliable" if not anchor_reliable else "anchor_not_better_than_box",
+                    "anchor_regions": len(anchor_regions),
+                    "box_regions": len(box_regions),
+                    "anchor_parsed_count": anchor_parsed_count,
+                    "box_parsed_count": box_parsed_count,
+                    "anchor_warning_codes": sorted(_warning_codes(anchor_warnings or [])),
+                }
         return box_regions, box_warnings, box_trace
 
     warnings: List[Dict[str, object]] = []
