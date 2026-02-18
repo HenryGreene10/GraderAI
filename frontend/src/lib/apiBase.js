@@ -9,7 +9,10 @@ function normalizeBaseUrl(value) {
 export function publicBase() {
   const envBase = normalizeBaseUrl(import.meta.env.VITE_PUBLIC_BASE_URL);
   if (envBase) return envBase;
-  throw new Error("VITE_PUBLIC_BASE_URL is required for scan QR links");
+  if (typeof window !== "undefined" && window.location?.origin) {
+    return normalizeBaseUrl(window.location.origin);
+  }
+  throw new Error("Unable to determine public base URL");
 }
 
 export function apiBase() {

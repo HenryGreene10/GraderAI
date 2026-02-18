@@ -1,4 +1,19 @@
-# Current Plan (GraderAI) — Two-Phase Execution
+# Current Plan (GraderAI) — PDF-First Beta
+
+## Live Execution Status (2026-02-18)
+
+Current objective: ship stable beta on the existing upload workflow (master key PDF + student PDF uploads).  
+Scanner/QR/mobile networking work is explicitly deferred for this sprint.
+
+Active scope:
+• Promote desktop PDF upload flow to primary production UX (remove DEV framing).  
+• Enforce strict master-key quality gate (`DRAFT → PROCESSING → NEEDS_REUPLOAD → READY`).  
+• Block grading unless master key is `READY`.  
+• Keep one coordinate/size contract for overlay math and stop OCR-downscaled dimension overrides.
+
+Deferred scope:
+• Web camera capture UX (`/scan/:token`, QR flows).  
+• LAN/IP/WSL/iPhone networking hardening.
 
 ## Why this plan is changing
 
@@ -207,6 +222,39 @@ Scan improvements should enhance OCR quality, but **scan correctness does not fi
 • Page-aware OCR and overlays  
 • Quality gates (blur / edge detection)
 
+## Phase B Execution (Current Pass)
+
+### B1 — Packet Upload Contract (implemented)
+• Student packet upload always targets scan session endpoint (`/api/scan/{token}/upload`).  
+• Upload payload includes canonical student PDF and normalized first-page image.  
+• Backend persists normalized metadata needed for alignment/projection.
+
+### B2 — DEV/Scanner Parity (implemented)
+• DEV quick-upload now reuses scan-session APIs and normalization shape so grading behavior matches mobile scanner runs.
+
+### B3 — Placement Contract Enforcement (implemented, strict-by-default)
+• Template mode grading requires aligned/projected frame for mark placement.  
+• Silent fallback to unaligned/scaled OCR boxes is disabled by default.  
+• If contract is not met, grading fail-closes to `status=error` + `needs_review=true` with explicit error detail.
+
+### B4 — Manual Validation Loop (in progress)
+Run this exact flow for each verification pass:
+1. Create assignment.  
+2. Upload master key through scan flow (or DEV scan-session master key path).  
+3. Upload student packet through scan flow (PDF + normalized page image).  
+4. Verify `uploads` row fields:  
+   – `status`, `ocr_status`, `needs_review`  
+   – `normalized_image_path`, `normalized_width_px`, `normalized_height_px`  
+5. Verify `grade_json` fields:  
+   – `pipeline.template_used=true`  
+   – `template_overlay_frame=student_projected_homography`  
+   – `template_region_frame` is not fallback unless explicitly enabled  
+6. Verify graded PDF marks for bottom-row questions (Q7/Q8/Q9) and compare against answer-key anchors.
+
+### B5 — Remaining implementation in this pass
+• Complete any missing scan-path UX/contract polish discovered during manual run.  
+• Keep fallback behavior opt-in only; default remains deterministic/fail-closed.
+
 ## Policy: Scan-Required
 • All production capture must go through **QR → mobile scanner page**.  
 • The mobile page behaves like a **document scanner**, not a photo uploader.  
@@ -285,8 +333,10 @@ No individual photo uploads. No per-page upload rows.
 • Start Vite (LAN reachable):
   npm --prefix frontend run dev -- --host 0.0.0.0 --port 5173  
 • Set `VITE_PUBLIC_BASE_URL=http://<LAN_IP>:5173` in `frontend/.env.local`.  
+• Set `VITE_API_BASE_URL=http://<LAN_IP>:8000` in `frontend/.env.local`.  
+• Set `VITE_DEV_PROXY_TARGET=http://127.0.0.1:8000` in `frontend/.env.local`.  
 • Phone opens `http://<LAN_IP>:5173/scan/<token>`.  
-• Vite proxies `/api/*` to `http://127.0.0.1:8000`, so backend stays off-LAN.
+• Vite proxies `/api/*` to `VITE_DEV_PROXY_TARGET` (server-side only).
 
 ## Debug protocol (page-aware)
 For any failing submission, record:
