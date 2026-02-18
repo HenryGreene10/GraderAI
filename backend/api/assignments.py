@@ -25,7 +25,6 @@ from ..services import ocr as ocr_service
 from ..services.ocr import normalize_ocr_result
 from ..services.answer_extraction import extract_answers_from_ocr
 from ..services.master_key_pipeline import run_master_key_approval_pipeline
-from ..services.pdf_raster import extract_pdf_page_raster_png, pdf_page_sizes_px
 from ..services.scanner import PDF_DPI
 from ..services.template import detect_answer_boxes, detect_question_regions
 from ..services.template_manifest import load_template_manifest, with_approved_manifest
@@ -157,6 +156,22 @@ def _master_key_status_for_assignment(row: dict, regions_payload: object) -> tup
     return status, []
 
 
+def _pdf_page_sizes_px(pdf_bytes: bytes) -> list[dict]:
+    reader = PdfReader(BytesIO(pdf_bytes))
+    out: list[dict] = []
+    for page in reader.pages:
+        box = page.mediabox
+        try:
+            width_pt = float(box.width)
+            height_pt = float(box.height)
+        except Exception:
+            continue
+        width_px = max(1, int(round((width_pt / 72.0) * float(PDF_DPI))))
+        height_px = max(1, int(round((height_pt / 72.0) * float(PDF_DPI))))
+        out.append({"width_px": width_px, "height_px": height_px})
+    return out
+
+
 def _extract_master_key_image_bytes(payload: bytes, ext: str, content_type: str | None) -> bytes:
     if ext in {".png", ".jpg", ".jpeg"} or str(content_type or "").lower().startswith("image/"):
         return payload
@@ -168,21 +183,27 @@ def _extract_master_key_image_bytes(payload: bytes, ext: str, content_type: str 
         raise HTTPException(status_code=400, detail=f"template_pdf_invalid: {exc}")
     if not reader.pages:
         raise HTTPException(status_code=400, detail="template_pdf_empty")
-    try:
-        raster_png, raster_source = extract_pdf_page_raster_png(
-            payload,
-            page_index=0,
-            dpi=float(PDF_DPI),
-        )
-    except Exception as exc:
+    images = list(reader.pages[0].images or [])
+    if not images:
         raise HTTPException(
             status_code=400,
-            detail=f"template_pdf_raster_failed: {exc}. Upload a scanned PDF (or PNG/JPG).",
+            detail="template_pdf_image_missing: upload a scanned PDF (or PNG/JPG) where page 1 contains the master-key scan image",
         )
-    if not raster_png:
-        raise HTTPException(status_code=400, detail="template_pdf_raster_failed: Upload a scanned PDF.")
-    logger.info("master_key_pdf_raster_source source=%s", raster_source)
-    return raster_png
+    best = max(images, key=lambda img: len(getattr(img, "data", b"") or b""))
+    blob = bytes(getattr(best, "data", b""))
+    if not blob:
+        raise HTTPException(status_code=400, detail="template_pdf_image_missing")
+    try:
+        with Image.open(BytesIO(blob)) as img:
+            rgb = img.convert("RGB")
+            out = BytesIO()
+            rgb.save(out, format="PNG")
+            converted = out.getvalue()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"template_pdf_image_invalid: {exc}")
+    if not converted:
+        raise HTTPException(status_code=400, detail="template_pdf_image_invalid")
+    return converted
 
 
 def _assignment_detail_payload(row: dict) -> dict:
@@ -808,7 +829,7 @@ async def upload_assignment_files(
                 detail=f"empty_file: {file.filename}",
             )
         try:
-            page_sizes = pdf_page_sizes_px(blob, dpi=float(PDF_DPI))
+            page_sizes = _pdf_page_sizes_px(blob)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"invalid_pdf: {file.filename}: {exc}")
         first_page = page_sizes[0] if page_sizes else {}
