@@ -36,7 +36,7 @@ def test_blocking_reasons_include_fallback_and_quality_low():
     assert "EXPECTED_TEXT_QUALITY_LOW" in reasons
 
 
-def test_soft_blockers_are_tolerated_when_coverage_is_strong():
+def test_degraded_warning_codes_always_block_reapproval():
     warning_codes = {"BOX_MODE_FALLBACK_APPLIED", "ANCHOR_AMBIGUITY_HIGH", "EXPECTED_TEXT_QUALITY_LOW"}
     warnings = [
         {
@@ -62,12 +62,12 @@ def test_soft_blockers_are_tolerated_when_coverage_is_strong():
         warnings=warnings,
         regions_total=9,
     )
-    assert blocked == []
-    assert softened == [
+    assert blocked == [
         "ANCHOR_AMBIGUITY_HIGH",
         "BOX_MODE_FALLBACK_APPLIED",
         "EXPECTED_TEXT_QUALITY_LOW",
     ]
+    assert softened == []
 
 
 def test_soft_blockers_still_block_when_severity_is_high():
@@ -101,4 +101,10 @@ def test_soft_blockers_still_block_when_severity_is_high():
         "BOX_MODE_FALLBACK_APPLIED",
         "EXPECTED_TEXT_QUALITY_LOW",
     ]
+    assert softened == []
+
+
+def test_empty_template_regions_are_blocked():
+    blocked, softened = _blocking_and_softened_reasons(set(), regions_total=0)
+    assert blocked == ["TEMPLATE_REGIONS_EMPTY"]
     assert softened == []
