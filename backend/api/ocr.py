@@ -148,6 +148,7 @@ async def run_ocr_for_upload(
         needs_review = bool(row.get("needs_review")) or scan_failed
         frame_w, frame_h = infer_primary_page_size_px(norm.get("boxes"))
         canonical_w, canonical_h = _canonical_upload_size(row, frame_w, frame_h)
+        canonical_locked = canonical_w > 0 and canonical_h > 0
         payload = {
             "ocr_status": OCR_DONE,
             "status": "ocr_done",
@@ -165,13 +166,26 @@ async def run_ocr_for_upload(
                 {
                     "normalized_image_path": scan_artifacts.normalized_image_path,
                     "normalized_pdf_path": scan_artifacts.normalized_pdf_path,
-                    "normalized_width_px": scan_artifacts.width_px,
-                    "normalized_height_px": scan_artifacts.height_px,
                     "scan_status": "normalized" if scan_artifacts.scan_ok else "fallback",
                     "scan_error": scan_artifacts.error,
                     "needs_review": needs_review,
                 }
             )
+            if not canonical_locked:
+                payload["normalized_width_px"] = scan_artifacts.width_px
+                payload["normalized_height_px"] = scan_artifacts.height_px
+            elif (
+                abs(float(scan_artifacts.width_px) - float(canonical_w)) > 2.0
+                or abs(float(scan_artifacts.height_px) - float(canonical_h)) > 2.0
+            ):
+                logger.warning(
+                    "ocr_canonical_size_preserved upload_id=%s canonical=(%s,%s) scan=(%s,%s)",
+                    row["id"],
+                    int(round(canonical_w)),
+                    int(round(canonical_h)),
+                    int(scan_artifacts.width_px),
+                    int(scan_artifacts.height_px),
+                )
         elif scan_error:
             payload.update(
                 {

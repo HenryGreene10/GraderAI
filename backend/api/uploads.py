@@ -33,7 +33,8 @@ from ..services.report import (
     render_debug_layout_pdf,
     render_marked_pdf,
 )
-from ..services.scanner import image_bytes_to_pdf
+from ..services.scanner import PDF_DPI, image_bytes_to_pdf
+from ..services.pdf_raster import extract_pdf_page_raster_png
 from ..services.template_align import align_student_to_template
 from ..services.storage import (
     download_submission_bytes,
@@ -172,90 +173,29 @@ def _template_size_px(
     return None
 
 
-def _scale_bbox(bbox: object, sx: float, sy: float) -> object:
-    if not isinstance(bbox, list):
-        return bbox
-    scaled: list[float] = []
-    for i, val in enumerate(bbox):
+def _row_canonical_frame_size(row: dict) -> Optional[Tuple[float, float]]:
+    try:
+        w = float(row.get("normalized_width_px") or 0.0)
+        h = float(row.get("normalized_height_px") or 0.0)
+    except Exception:
+        w, h = 0.0, 0.0
+    if w > 0 and h > 0:
+        return (w, h)
+    page_sizes = row.get("page_sizes_json")
+    if isinstance(page_sizes, list) and page_sizes:
+        first = page_sizes[0] if isinstance(page_sizes[0], dict) else {}
         try:
-            v = float(val)
+            w = float(first.get("width_px") or 0.0)
+            h = float(first.get("height_px") or 0.0)
         except Exception:
-            scaled.append(val)
-            continue
-        scaled.append(v * (sx if i % 2 == 0 else sy))
-    return scaled
+            w, h = 0.0, 0.0
+        if w > 0 and h > 0:
+            return (w, h)
+    return None
 
 
-def _scale_ocr_boxes_to_size(
-    ocr_boxes: object,
-    target_size: Tuple[float, float],
-) -> tuple[object, bool]:
-    if not isinstance(ocr_boxes, dict):
-        return ocr_boxes, False
-    analyze = ocr_boxes.get("analyzeResult")
-    if not isinstance(analyze, dict):
-        return ocr_boxes, False
-    read_results = analyze.get("readResults")
-    if not isinstance(read_results, list):
-        return ocr_boxes, False
-
-    target_w, target_h = target_size
-    scaled_any = False
-    out: dict = {
-        **ocr_boxes,
-        "analyzeResult": {
-            **analyze,
-            "readResults": [],
-        },
-    }
-    out_read_results = out["analyzeResult"]["readResults"]
-    for page in read_results:
-        if not isinstance(page, dict):
-            out_read_results.append(page)
-            continue
-        try:
-            src_w = float(page.get("width") or 0.0)
-            src_h = float(page.get("height") or 0.0)
-        except Exception:
-            src_w = 0.0
-            src_h = 0.0
-        if src_w <= 0 or src_h <= 0:
-            out_read_results.append(page)
-            continue
-        sx = target_w / src_w
-        sy = target_h / src_h
-        scaled_page = {**page, "width": target_w, "height": target_h}
-        scaled_lines = []
-        for line in page.get("lines") or []:
-            if not isinstance(line, dict):
-                scaled_lines.append(line)
-                continue
-            scaled_line = {**line}
-            scaled_line["boundingBox"] = _scale_bbox(line.get("boundingBox"), sx, sy)
-            scaled_words = []
-            for word in line.get("words") or []:
-                if not isinstance(word, dict):
-                    scaled_words.append(word)
-                    continue
-                scaled_word = {**word}
-                scaled_word["boundingBox"] = _scale_bbox(word.get("boundingBox"), sx, sy)
-                scaled_words.append(scaled_word)
-            scaled_line["words"] = scaled_words
-            scaled_lines.append(scaled_line)
-        scaled_page["lines"] = scaled_lines
-        out_read_results.append(scaled_page)
-        scaled_any = True
-    return out, scaled_any
-
-
-def _scale_png_to_size(png_bytes: bytes, target_size: Tuple[float, float]) -> bytes:
-    tw = max(1, int(round(float(target_size[0]))))
-    th = max(1, int(round(float(target_size[1]))))
-    with Image.open(BytesIO(png_bytes)) as img:
-        resized = img.convert("RGB").resize((tw, th), Image.BICUBIC)
-    out = BytesIO()
-    resized.save(out, format="PNG")
-    return out.getvalue()
+def _same_frame_size(a: Tuple[float, float], b: Tuple[float, float], tol_px: float = 2.0) -> bool:
+    return abs(float(a[0]) - float(b[0])) <= tol_px and abs(float(a[1]) - float(b[1])) <= tol_px
 
 
 def _entry_bbox_px(entry: dict, size: Tuple[float, float]) -> Optional[Tuple[float, float, float, float]]:
@@ -636,7 +576,7 @@ async def run_grade_pipeline(
         columns=(
             "id,owner_id,assignment_id,storage_path,ocr_status,ocr_text,ocr_boxes,mime_type,"
             "graded_pdf_path,status,normalized_pdf_path,normalized_width_px,"
-            "normalized_height_px,needs_review,normalized_image_path"
+            "normalized_height_px,needs_review,normalized_image_path,page_sizes_json"
         ),
     )
     status = (row.get("status") or "").strip().lower()
@@ -783,8 +723,6 @@ async def run_grade_pipeline(
                 expected_qids = [q.question_id for q in template_manifest.questions]
             else:
                 expected_qids = sorted((str(qid) for qid in regions_map.keys()), key=_qid_sort_key)
-            allow_frame_fallback = os.getenv("ALLOW_TEMPLATE_FRAME_FALLBACK") == "1"
-            allow_unaligned_fallback = os.getenv("ALLOW_UNALIGNED_REGION_FALLBACK") == "1"
             try:
                 min_alignment_matches = max(1, int(os.getenv("TEMPLATE_ALIGNMENT_MIN_MATCHES", "25")))
             except Exception:
@@ -796,15 +734,47 @@ async def run_grade_pipeline(
             except Exception:
                 min_alignment_inlier_ratio = 0.35
             template_size = _template_size_px(template_width_px, template_height_px, regions_meta)
+            canonical_student_size = _row_canonical_frame_size(row)
+            if canonical_student_size:
+                effective_normalized_size = canonical_student_size
 
             student_png = None
+            student_frame_source: Optional[str] = None
             if row.get("normalized_image_path"):
                 try:
                     student_png = download_submission_bytes(row.get("normalized_image_path"))
                     with Image.open(BytesIO(student_png)) as img:
                         student_size_px = (float(img.width), float(img.height))
+                    student_frame_source = "normalized_image_path"
                 except Exception as exc:
                     region_frame_error = f"student_image_load_failed: {exc}"
+                    student_png = None
+
+            if student_png is None:
+                pdf_source_path = row.get("normalized_pdf_path") or storage_path
+                try:
+                    pdf_source_bytes = download_submission_bytes(pdf_source_path)
+                    student_png, raster_source = extract_pdf_page_raster_png(
+                        pdf_source_bytes,
+                        page_index=0,
+                        dpi=float(PDF_DPI),
+                    )
+                    with Image.open(BytesIO(student_png)) as img:
+                        student_size_px = (float(img.width), float(img.height))
+                    student_frame_source = f"pdf_raster:{raster_source}"
+                except Exception as exc:
+                    region_frame_error = f"student_pdf_raster_failed: {exc}"
+                    student_png = None
+                    student_size_px = None
+
+            if canonical_student_size and student_size_px and not _same_frame_size(canonical_student_size, student_size_px):
+                region_frame_error = (
+                    "student_frame_size_mismatch: "
+                    f"canonical={canonical_student_size[0]:.0f}x{canonical_student_size[1]:.0f} "
+                    f"student={student_size_px[0]:.0f}x{student_size_px[1]:.0f}"
+                )
+                student_png = None
+                student_size_px = None
 
             if template_storage_path:
                 try:
@@ -817,6 +787,14 @@ async def run_grade_pipeline(
             frame_ocr_boxes = None
             frame_png_bytes = None
             has_student_alignment_frame = bool(template_png and student_png)
+            logger.info(
+                "template_frame_contract upload_id=%s canonical_px=%s student_px=%s student_frame_source=%s template_px=%s",
+                row["id"],
+                canonical_student_size,
+                student_size_px,
+                student_frame_source,
+                template_size,
+            )
 
             if has_student_alignment_frame:
                 template_alignment = align_student_to_template(student_png, template_png)
@@ -829,10 +807,7 @@ async def run_grade_pipeline(
                             f"alignment_quality_low: matches={match_count} inliers={inliers} "
                             f"ratio={inlier_ratio:.3f} thresholds=({min_alignment_matches},{min_alignment_inlier_ratio:.3f})"
                         )
-                        needs_review_from_overlay = True
                     else:
-                        frame_png_bytes = template_alignment.aligned_png
-                        debug_image_bytes = frame_png_bytes
                         if template_size and student_size_px and template_alignment.homography:
                             projected_regions = _project_template_regions_for_student_overlay(
                                 regions_payload=template_regions,
@@ -843,88 +818,46 @@ async def run_grade_pipeline(
                             if projected_regions:
                                 overlay_regions_payload = projected_regions
                                 overlay_projected_to_student = True
+                            else:
+                                region_frame_error = "template_projection_failed"
+                        else:
+                            region_frame_error = "template_projection_inputs_missing"
+                        if overlay_projected_to_student:
+                            frame_png_bytes = template_alignment.aligned_png
+                            debug_image_bytes = frame_png_bytes
+                            raw = await ocr_service.extract_text(image_bytes=frame_png_bytes)
+                            norm = normalize_ocr_result(raw)
+                            frame_ocr_boxes = norm.get("boxes") or {}
+                            region_frame_source = "aligned_image_ocr"
+                            template_alignment_used = True
+                            template_ocr_rects = []
+                            if student_png is not None:
                                 debug_image_bytes = student_png
-                        raw = await ocr_service.extract_text(image_bytes=frame_png_bytes)
-                        norm = normalize_ocr_result(raw)
-                        frame_ocr_boxes = norm.get("boxes") or {}
-                        region_frame_source = "aligned_image_ocr"
-                        template_alignment_used = True
-                        template_ocr_rects = []
                 else:
                     region_frame_error = template_alignment.error or "alignment_failed"
-                    needs_review_from_overlay = True
-
-            if frame_ocr_boxes is None and template_size and not student_png:
-                scaled_boxes, scaled_ok = _scale_ocr_boxes_to_size(ocr_boxes, template_size)
-                if scaled_ok:
-                    frame_ocr_boxes = scaled_boxes
-                    region_frame_source = "template_canonical_scaled_ocr_boxes"
-                else:
-                    region_frame_error = "template_canonical_scale_failed"
-
-            if frame_ocr_boxes is None and allow_frame_fallback and student_png and template_size:
-                try:
-                    frame_png_bytes = _scale_png_to_size(student_png, template_size)
-                    debug_image_bytes = frame_png_bytes
-                    raw = await ocr_service.extract_text(image_bytes=frame_png_bytes)
-                    norm = normalize_ocr_result(raw)
-                    frame_ocr_boxes = norm.get("boxes") or {}
-                    region_frame_source = "scaled_image_ocr"
-                    needs_review_from_overlay = True
-                except Exception as exc:
-                    region_frame_error = f"scaled_image_ocr_failed: {exc}"
-
-            if frame_ocr_boxes is None and allow_frame_fallback and template_size:
-                scaled_boxes, scaled_ok = _scale_ocr_boxes_to_size(ocr_boxes, template_size)
-                if scaled_ok:
-                    frame_ocr_boxes = scaled_boxes
-                    region_frame_source = "scaled_ocr_boxes"
-                    needs_review_from_overlay = True
+            elif not region_frame_error:
+                region_frame_error = "student_or_template_frame_missing"
 
             if frame_ocr_boxes is None:
-                if allow_unaligned_fallback and allow_frame_fallback:
-                    frame_ocr_boxes = ocr_boxes
-                    region_frame_source = "explicit_unaligned_fallback"
-                    needs_review_from_overlay = True
-                    logger.warning(
-                        "template_regions_unaligned_fallback upload_id=%s enabled_by_env=1",
-                        row["id"],
-                    )
-                else:
-                    detail = (
-                        "template_frame_unavailable: projected aligned frame required for template grading"
-                    )
-                    if region_frame_error:
-                        detail = f"{detail}; error={region_frame_error}"
-                    update_upload(
-                        row["id"],
-                        {
-                            "status": "error",
-                            "needs_review": True,
-                            "ocr_error": detail,
-                            "updated_at": _utc_iso(),
-                        },
-                    )
-                    raise HTTPException(
-                        status_code=422,
-                        detail=detail,
-                    )
-            if not overlay_projected_to_student and not allow_frame_fallback:
-                if has_student_alignment_frame:
-                    detail = (
-                        "template_overlay_projection_required: homography projection "
-                        "did not produce student-frame anchors"
-                    )
-                    update_upload(
-                        row["id"],
-                        {
-                            "status": "error",
-                            "needs_review": True,
-                            "ocr_error": detail,
-                            "updated_at": _utc_iso(),
-                        },
-                    )
-                    raise HTTPException(status_code=422, detail=detail)
+                detail = (
+                    "template_frame_unavailable: projected aligned frame required for template grading. "
+                    "Upload a scanned PDF and reupload."
+                )
+                if region_frame_error:
+                    detail = f"{detail} error={region_frame_error}"
+                update_upload(
+                    row["id"],
+                    {
+                        "status": "error",
+                        "needs_review": True,
+                        "ocr_error": detail,
+                        "updated_at": _utc_iso(),
+                    },
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=detail,
+                )
 
             student_answers, missing_qids = extract_answers_from_regions(
                 frame_ocr_boxes,
@@ -989,18 +922,50 @@ async def run_grade_pipeline(
                 pdf_mime = "application/pdf" if row.get("normalized_pdf_path") else row.get("mime_type")
             page_sizes = get_page_sizes(pdf_source_bytes, pdf_mime)
             page_size = page_sizes[0] if page_sizes else (612.0, 792.0)
-            normalized_size = effective_normalized_size
+            normalized_size = _row_canonical_frame_size(row) or effective_normalized_size
             if overlay_projected_to_student and student_size_px:
-                normalized_size = (float(student_size_px[0]), float(student_size_px[1]))
-            elif template_size:
-                normalized_size = (float(template_size[0]), float(template_size[1]))
-            elif frame_png_bytes is not None:
+                if normalized_size[0] > 0 and normalized_size[1] > 0:
+                    if not _same_frame_size(normalized_size, student_size_px):
+                        detail = (
+                            "template_frame_unavailable: projected frame size mismatch. "
+                            "Upload a scanned PDF and reupload. "
+                            f"canonical={normalized_size[0]:.0f}x{normalized_size[1]:.0f} "
+                            f"student={student_size_px[0]:.0f}x{student_size_px[1]:.0f}"
+                        )
+                        update_upload(
+                            row["id"],
+                            {
+                                "status": "error",
+                                "needs_review": True,
+                                "ocr_error": detail,
+                                "updated_at": _utc_iso(),
+                            },
+                        )
+                        raise HTTPException(status_code=422, detail=detail)
+                else:
+                    normalized_size = (float(student_size_px[0]), float(student_size_px[1]))
+            elif frame_png_bytes is not None and (normalized_size[0] <= 0 or normalized_size[1] <= 0):
                 try:
                     with Image.open(BytesIO(frame_png_bytes)) as img:
                         normalized_size = (float(img.width), float(img.height))
                 except Exception:
                     pass
             effective_normalized_size = normalized_size
+            page_sizes_json = row.get("page_sizes_json")
+            first_page_json = (
+                page_sizes_json[0]
+                if isinstance(page_sizes_json, list) and page_sizes_json and isinstance(page_sizes_json[0], dict)
+                else None
+            )
+            logger.info(
+                "overlay_frame_contract upload_id=%s normalized_px=%s row_page_size_px=%s rendered_page_pt=%s projected=%s frame_source=%s",
+                row["id"],
+                normalized_size,
+                first_page_json,
+                page_size,
+                overlay_projected_to_student,
+                region_frame_source,
+            )
             overlay, marks_placed, marks_skipped_missing, marks_skipped_needs_review, unplaced_items = build_overlay_from_regions(
                 grade_result,
                 overlay_regions_payload,
