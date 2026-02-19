@@ -1,5 +1,6 @@
 import datetime as dt
 import logging
+import math
 import os
 from io import BytesIO
 import re
@@ -170,6 +171,84 @@ def _template_size_px(
     except Exception:
         pass
     return None
+
+
+def _template_ocr_read_audit(
+    *,
+    expected_qids: list[str],
+    student_answers: dict[str, str],
+    missing_qids: list[str],
+    region_frame_source: str | None,
+    region_frame_error: str | None,
+) -> dict[str, object]:
+    total = len(expected_qids)
+    answered = 0
+    for qid in expected_qids:
+        if str(student_answers.get(qid) or "").strip():
+            answered += 1
+    coverage = (float(answered) / float(total)) if total > 0 else 1.0
+    missing_count = len({str(qid) for qid in (missing_qids or []) if str(qid).strip()})
+    degraded_sources = {"scaled_image_ocr", "scaled_ocr_boxes", "explicit_unaligned_fallback"}
+    degraded_source = str(region_frame_source or "") in degraded_sources
+    try:
+        min_coverage = float(os.getenv("TEMPLATE_OCR_MIN_COVERAGE", "0.8"))
+    except Exception:
+        min_coverage = 0.8
+    min_coverage = max(0.0, min(1.0, min_coverage))
+    missing_threshold = max(2, int(math.ceil(float(total) * 0.25))) if total > 0 else 1
+    low_coverage = coverage < min_coverage
+    missing_many = missing_count >= missing_threshold
+    review_all = (
+        low_coverage
+        or missing_many
+        or (degraded_source and missing_count > 0)
+        or (bool(region_frame_error) and missing_count > 0)
+    )
+    reasons: list[str] = []
+    if low_coverage:
+        reasons.append(f"ocr_coverage_low:{answered}/{total}")
+    if missing_many:
+        reasons.append(f"ocr_missing_many:{missing_count}")
+    if degraded_source:
+        reasons.append(f"ocr_degraded_frame:{region_frame_source}")
+    if region_frame_error:
+        reasons.append("ocr_frame_error")
+    return {
+        "expected_count": total,
+        "answered_count": answered,
+        "missing_count": missing_count,
+        "coverage": round(coverage, 3),
+        "min_coverage": round(min_coverage, 3),
+        "frame_source": region_frame_source,
+        "frame_error": bool(region_frame_error),
+        "review_all": review_all,
+        "review_qids": sorted({str(qid) for qid in (missing_qids or []) if str(qid).strip()}, key=_qid_sort_key),
+        "reasons": reasons,
+    }
+
+
+def _apply_template_review_guard(
+    grade_result: GradeResult,
+    *,
+    review_all: bool,
+    review_qids: set[str],
+    reasons: list[str],
+) -> bool:
+    changed = False
+    reasons_text = ", ".join(reasons) if reasons else "uncertain OCR read"
+    for item in grade_result.items:
+        if not review_all and item.question_id not in review_qids:
+            continue
+        if not item.low_confidence:
+            item.low_confidence = True
+            changed = True
+        rationale = str(item.rationale or "")
+        if not rationale.lower().startswith("needs review:"):
+            item.rationale = f"Needs review: {reasons_text}. {rationale}".strip()
+            changed = True
+    if changed:
+        grade_result.needs_review = True
+    return changed
 
 
 def _scale_bbox(bbox: object, sx: float, sy: float) -> object:
@@ -750,6 +829,7 @@ async def run_grade_pipeline(
         answers_json = None
         answer_rows = []
         answer_prompt_version = None
+        template_ocr_audit: Optional[dict[str, object]] = None
         overlay_regions_payload = template_regions
         overlay_projected_to_student = False
         student_size_px: Optional[Tuple[float, float]] = None
@@ -890,9 +970,25 @@ async def run_grade_pipeline(
             grade_result, answers, answer_rows = score_answer_maps(key_answers, filtered_students)
             grade_result.submission_id = row["id"]
             answers_json = {"key": key_answers, "student": filtered_students}
+            ocr_audit = _template_ocr_read_audit(
+                expected_qids=expected_qids,
+                student_answers=filtered_students,
+                missing_qids=missing,
+                region_frame_source=region_frame_source,
+                region_frame_error=region_frame_error,
+            )
+            template_ocr_audit = ocr_audit
             if missing:
                 needs_review_from_overlay = True
                 template_degraded_reasons.append("missing_region_answers")
+            if _apply_template_review_guard(
+                grade_result,
+                review_all=bool(ocr_audit.get("review_all")),
+                review_qids=set(str(qid) for qid in (ocr_audit.get("review_qids") or [])),
+                reasons=[str(reason) for reason in (ocr_audit.get("reasons") or []) if str(reason).strip()],
+            ):
+                needs_review_from_overlay = True
+                template_degraded_reasons.append("ocr_read_guard_applied")
 
             if debug_enabled(debug) and frame_png_bytes:
                 owner_id = row.get("owner_id") or user_id or "unknown"
@@ -1224,6 +1320,8 @@ async def run_grade_pipeline(
                     "inliers": template_alignment.inliers,
                     "error": template_alignment.error,
                 }
+            if template_ocr_audit:
+                grade_json["template_ocr_audit"] = template_ocr_audit
 
         update_upload(
             row["id"],
